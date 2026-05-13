@@ -1,0 +1,58 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pytype/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment files
+.env
+.env.*
+
+# Build and packaging outputs
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs and experiment outputs
+runs/
+logs/
+tensorboard/
+wandb/
+models/
+checkpoints/
+
+# Donkey/ML data artifacts
+data/
+tub*/
+*.h5
+*.tflite
+*.trt
+*.pt
+*.pth
+*.pkl
+*.npz
+*.npy
+*.mp4
+*.avi
+
+# Simulator and Unity logs
+unitylog.txt
+Player.log
+
+# Local external dependency checkout
+gym-donkeycar/
+
+# Codex/local agent metadata
+.codex/
+.agents/
