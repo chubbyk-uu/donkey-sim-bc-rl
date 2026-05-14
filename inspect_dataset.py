@@ -1,0 +1,108 @@
+import argparse
+import json
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+
+def percentile(values: list[float], q: float) -> float:
+    return float(np.percentile(np.asarray(values, dtype=np.float32), q))
+
+
+def summarize_values(name: str, values: list[float]) -> None:
+    if not values:
+        print(f"{name}: no values")
+        return
+
+    arr = np.asarray(values, dtype=np.float32)
+    print(
+        f"{name}: count={arr.size} min={arr.min():.4f} p05={percentile(values, 5):.4f} "
+        f"mean={arr.mean():.4f} p95={percentile(values, 95):.4f} max={arr.max():.4f}"
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("data_dir", type=Path)
+    parser.add_argument("--sample-images", type=int, default=5)
+    parser.add_argument("--drop-head", type=int, default=0)
+    parser.add_argument("--drop-tail", type=int, default=0)
+    args = parser.parse_args()
+
+    data_dir = args.data_dir.expanduser()
+    if not data_dir.exists():
+        raise SystemExit(f"data dir does not exist: {data_dir}")
+
+    meta_path = data_dir / "meta.json"
+    if meta_path.exists():
+        print(f"meta: {meta_path}")
+        print(meta_path.read_text())
+    else:
+        print("meta: missing")
+
+    all_records = sorted(data_dir.glob("record_*.json"), key=lambda p: int(p.stem.split("_")[1]))
+    images = sorted(data_dir.glob("*_cam-image_array_.jpg"), key=lambda p: int(p.name.split("_")[0]))
+    end = len(all_records) - args.drop_tail if args.drop_tail else len(all_records)
+    records = all_records[args.drop_head : end]
+    print(f"records_total: {len(all_records)}")
+    print(f"records_used:  {len(records)}")
+    print(f"drop_head: {args.drop_head}")
+    print(f"drop_tail: {args.drop_tail}")
+    print(f"images:  {len(images)}")
+
+    missing_images = []
+    bad_records = []
+    angles = []
+    throttles = []
+    modes = Counter()
+    laps = Counter()
+    locs = Counter()
+
+    for record_path in records:
+        try:
+            record = json.loads(record_path.read_text())
+        except Exception as exc:
+            bad_records.append((record_path.name, str(exc)))
+            continue
+
+        image_name = record.get("cam/image_array")
+        if image_name and not (data_dir / image_name).exists():
+            missing_images.append(image_name)
+
+        if "user/angle" in record:
+            angles.append(float(record["user/angle"]))
+        if "user/throttle" in record:
+            throttles.append(float(record["user/throttle"]))
+        if "user/mode" in record:
+            modes[str(record["user/mode"])] += 1
+        if "track/lap" in record:
+            laps[int(record["track/lap"])] += 1
+        if "track/loc" in record:
+            locs[int(record["track/loc"])] += 1
+
+    print(f"bad_records: {len(bad_records)}")
+    print(f"missing_images: {len(missing_images)}")
+    summarize_values("angle", angles)
+    summarize_values("throttle", throttles)
+    print(f"modes: {dict(modes)}")
+    print(f"laps: {dict(laps)}")
+    print(f"track_locs_top10: {locs.most_common(10)}")
+
+    for image_path in images[: args.sample_images]:
+        with Image.open(image_path) as image:
+            print(f"image_sample: {image_path.name} size={image.size} mode={image.mode}")
+
+    if bad_records:
+        print("bad_record_examples:")
+        for name, err in bad_records[:5]:
+            print(f"  {name}: {err}")
+    if missing_images:
+        print("missing_image_examples:")
+        for name in missing_images[:5]:
+            print(f"  {name}")
+
+
+if __name__ == "__main__":
+    main()

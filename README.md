@@ -12,14 +12,14 @@ been verified with `smoke_test.py`.
 
 ## Goals
 
-The project will follow proven Donkey Car workflows before adding custom
-experiments.
+The project starts with behavior cloning because it is the standard Donkey Car
+baseline and gives a useful reference before reinforcement learning.
 
-1. Reproduce the official Donkey Car behavior cloning workflow.
-2. Build reusable Gymnasium/RL environment and evaluation tools.
-3. Implement the stronger RL path used by existing Donkey RL projects:
-   collect images, train an AE/VAE representation model, then train a continuous
-   control policy with SAC or TQC.
+1. Build a reliable behavior cloning dataset from Windows Donkey Simulator.
+2. Train and evaluate PyTorch driving models from WSL2.
+3. Compare single-frame CNN, temporal CNN, and CNN+RNN/GRU behavior cloning.
+4. Prepare the RL path after imitation learning is measurable:
+   collect images, train an AE/VAE representation, then train SAC or TQC.
 
 ## Current Environment
 
@@ -42,6 +42,10 @@ observation: camera image, shape (120, 160, 3)
 action: [steering, throttle]
 info: cte, speed, pos, hit, lap_count, last_lap_time, etc.
 ```
+
+Do not use `donkeycar[pc]` in this environment. It pulled in an older
+TensorFlow/DonkeyCar stack and downgraded packages such as `numpy`, which
+conflicted with the current Gymnasium-based `gym-donkeycar` workflow.
 
 ## Smoke Test
 
@@ -80,38 +84,191 @@ donkey-warren-track-v0 -> warren
 The simulator can load the selected scene automatically as long as the simulator
 process is running and accepting Gym TCP connections.
 
-## Development Plan
+## Data Collection
 
-### Phase 1: Official Behavior Cloning Baseline
-
-This is the Donkey Car official deep learning workflow.
-
-The standard flow is:
+The usable manual recording path found for the current Windows simulator is:
 
 ```text
-human driving -> tub data -> train CNN -> autopilot inference
+Windows Donkey Simulator -> generated_road -> No Rec / w Rec recording
 ```
 
-Donkey records camera images, steering, and throttle while a human drives. The
-trained model then predicts steering and throttle from the camera image.
+Important findings:
 
-Initial tasks:
+- Manual driving through the normal scene menu can drive the car, but does not
+  necessarily record data.
+- In the current simulator build, `generated_road` is the scene that exposes the
+  recording switch and writes `record_*.json` plus camera images.
+- A Gymnasium client from WSL creates its own simulator-controlled car. It is
+  not a passive recorder for the Windows gamepad car.
+- Generated roads are random across loads; even with seed settings they should
+  be treated as different routes.
 
-1. Create or configure a Donkey car app for simulator use.
-2. Drive in the simulator and record tub data.
-3. Clean bad records if needed.
-4. Train a Donkey behavior cloning model.
-5. Evaluate the model in the simulator.
+Recommended recording plan:
 
-Reference commands from the official simulator workflow:
+```text
+D:\WSL\log_001
+D:\WSL\log_002
+D:\WSL\log_003
+D:\WSL\log_004
+D:\WSL\log_005
+```
+
+Record at least 5 different generated roads. Keep speed slow and stable. Include
+some mild recovery driving where the car is slightly off-center and then steered
+back toward the road center. A useful first target is 30k-50k frames total.
+
+Copy a Windows log directory into WSL-local storage before training:
 
 ```bash
-python manage.py drive
-donkey train --tub ./data --model models/mypilot.h5
-python manage.py drive --model models/mypilot.h5
+cp -r /mnt/d/WSL/log_001 data/generated_road_001
 ```
 
-### Phase 2: RL Interface And Evaluation Tools
+Training directly from `/mnt/d/...` works, but many small image files are much
+slower there than on the WSL filesystem.
+
+## Dataset Inspection
+
+Inspect a copied dataset before training:
+
+```bash
+python inspect_dataset.py data/generated_road_001 --sample-images 3
+```
+
+For the current cleaned dataset:
+
+```text
+data/generated_road_bc_002
+records: 11941
+images: 11941
+image shape: (160, 120), RGB
+angle range: about -0.43 to +0.43
+throttle mean: about 0.10
+```
+
+The latest dataset did not need head trimming. Training used `--drop-tail 5`
+because the final frames contained stop/end artifacts.
+
+## Behavior Cloning Baselines
+
+### Single-Frame CNN
+
+The current first baseline is a PyTorch port of the Donkey/PilotNet-style CNN:
+
+```text
+current RGB image -> CNN -> steer, throttle
+```
+
+Train it with CUDA:
+
+```bash
+python train_bc.py \
+  --data-dir data/generated_road_bc_002 \
+  --drop-head 0 \
+  --drop-tail 5 \
+  --output-dir models/bc_nvidia_generated_road_002 \
+  --batch-size 128 \
+  --num-workers 2 \
+  --epochs 100 \
+  --patience 6
+```
+
+Observed result:
+
+```text
+best val_loss: 0.000579
+best epoch: 86
+model: models/bc_nvidia_generated_road_002/best.pt
+```
+
+This model can drive some generated roads, but still fails on harder random
+routes. A 5-route random evaluation saw survival steps from about 641 to 1000.
+
+### Temporal CNN
+
+We tested frame stacking:
+
+```text
+history=10
+frame_stride=2
+input frames: t-18, t-16, ..., t
+RGB channels: 30
+```
+
+From-scratch training with 30 input channels regressed toward predicting the
+mean action. The mean-action baseline MSE was about `0.00725`, and the
+from-scratch 10-frame model did not beat it.
+
+A better variant initialized the 30-channel model from the trained single-frame
+checkpoint:
+
+- copy the single-frame convolution weights into the current-frame channels;
+- initialize older-frame channels to zero;
+- copy the rest of the model weights.
+
+That immediately reached validation loss around `0.00052`, slightly better than
+the single-frame baseline, but this is not yet enough evidence to prefer it.
+
+### CNN+RNN/GRU Plan
+
+The next recommended model is a recurrent behavior cloning model:
+
+```text
+sequence of RGB frames
+-> shared CNN encoder per frame
+-> GRU or LSTM
+-> dense head
+-> steer, throttle
+```
+
+This is based on the DonkeyCar RNN model family. DonkeyCar documents an RNN
+model using a sequence of images, TimeDistributed convolution layers, LSTM
+layers, dense layers, and driving outputs. The official command family also
+includes `--type=rnn`.
+
+Start with a small GRU, not a large LSTM:
+
+```text
+sequence_len: 8
+frame_stride: 1 or 2
+CNN encoder: current PilotNet-style conv stack
+RNN: GRU hidden_size=128, num_layers=1
+head: Linear(128 -> 50 -> 2)
+optimizer: Adam, lr=1e-4 or 3e-4
+batch_size: 64 or 96
+```
+
+Use more data before relying on the GRU result. A recurrent model can overfit
+one route just as easily as a CNN if the demonstrations are narrow.
+
+## Evaluation
+
+Run a trained behavior cloning model in the simulator:
+
+```bash
+python eval_bc.py \
+  --model models/bc_nvidia_generated_road_002/best.pt \
+  --env-id donkey-generated-roads-v0 \
+  --host 127.0.0.1 \
+  --port 9091 \
+  --steps 1000 \
+  --sleep 0.02
+```
+
+Use multiple random generated roads for evaluation, not a single lucky route.
+Track at least:
+
+```text
+survival_steps: how long before failure/reset
+mean_abs_cte: average absolute cross-track error
+max_abs_cte: worst absolute cross-track error
+reward: simulator reward
+```
+
+`CTE` means cross-track error: distance from the road centerline. `cte=0` is
+near the center. Larger `abs(cte)` means the car is closer to leaving the road.
+In this simulator, failures have often appeared near `abs(cte) ~= 8`.
+
+## RL Interface And Evaluation Tools
 
 This phase keeps RL code separate from Donkey's official behavior cloning flow.
 The purpose is to make experiments repeatable.
@@ -131,7 +288,7 @@ This phase should not introduce a custom neural network unless it is required
 for an experiment. It should first provide reliable environment creation,
 logging, saving, and evaluation.
 
-### Phase 3: AE/VAE + Continuous Control RL
+## AE/VAE + Continuous Control RL
 
 Existing Donkey RL projects often avoid training directly from raw images. A
 common pattern is:
@@ -164,6 +321,10 @@ Implementation order:
 
 - Donkey Car official autopilot workflow:
   https://docs.donkeycar.com/guide/train_autopilot/
+- Donkey Car command documentation, including `--type=rnn`:
+  https://docs.donkeycar.com/utility/donkey/
+- Donkey Car Keras RNN model description:
+  https://donkeycar.cn/parts/keras/
 - Donkey Car simulator workflow:
   https://docs.donkeycar.com/guide/deep_learning/simulator/
 - Gymnasium Donkey environment:
