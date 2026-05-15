@@ -10,6 +10,8 @@ from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, Subset
 
+from train_bc import set_seed, split_indices
+
 
 @dataclass
 class TrainConfig:
@@ -18,42 +20,42 @@ class TrainConfig:
     output_dir: str
     drop_head: int
     drop_tail: int
-    history: int
+    sequence_length: int
     frame_stride: int
-    cache_images: bool
-    min_throttle: float | None
-    max_abs_angle: float | None
+    feature_dim: int
+    hidden_size: int
+    num_layers: int
     batch_size: int
     epochs: int
     patience: int
-    learning_rate: float
+    cnn_learning_rate: float
+    rnn_learning_rate: float
+    weight_decay: float
     val_split: float
     seed: int
-    init_from_single_frame: str | None
-    init_from_checkpoint: str | None
+    min_throttle: float | None
+    max_abs_angle: float | None
 
 
-class DonkeyTubDataset(Dataset):
+class DonkeySequenceDataset(Dataset):
     def __init__(
         self,
         data_dirs: list[Path],
         drop_head: int = 0,
         drop_tail: int = 0,
-        history: int = 1,
+        sequence_length: int = 8,
         frame_stride: int = 1,
-        cache_images: bool = False,
         min_throttle: float | None = None,
         max_abs_angle: float | None = None,
     ):
-        if history < 1:
-            raise ValueError("history must be >= 1")
+        if sequence_length < 2:
+            raise ValueError("sequence_length must be >= 2")
         if frame_stride < 1:
             raise ValueError("frame_stride must be >= 1")
-        self.history = history
-        self.frame_stride = frame_stride
-        self.history_span = (history - 1) * frame_stride
 
-        self.records: list[Path] = []
+        self.sequence_length = sequence_length
+        self.frame_stride = frame_stride
+        self.sequence_span = (sequence_length - 1) * frame_stride
         self.records_data: list[dict] = []
         self.sample_indices: list[int] = []
         self.tub_summaries: list[dict] = []
@@ -63,15 +65,19 @@ class DonkeyTubDataset(Dataset):
             records = sorted(data_dir.glob("record_*.json"), key=lambda p: int(p.stem.split("_")[1]))
             end = len(records) - drop_tail if drop_tail else len(records)
             records = records[drop_head:end]
-            if len(records) <= self.history_span:
+            if len(records) <= self.sequence_span:
                 raise ValueError(f"not enough records selected in {data_dir}")
 
-            tub_start = len(self.records)
-            tub_records_data = [json.loads(record_path.read_text()) for record_path in records]
+            tub_start = len(self.records_data)
+            tub_records = [json.loads(record_path.read_text()) for record_path in records]
             samples_before = len(self.sample_indices)
 
-            for local_index, record in enumerate(tub_records_data):
-                if local_index < self.history_span:
+            for record in tub_records:
+                record["_data_dir"] = str(data_dir)
+                self.records_data.append(record)
+
+            for local_index, record in enumerate(tub_records):
+                if local_index < self.sequence_span:
                     continue
                 angle = float(record["user/angle"])
                 throttle = float(record["user/throttle"])
@@ -83,11 +89,6 @@ class DonkeyTubDataset(Dataset):
                     continue
                 self.sample_indices.append(tub_start + local_index)
 
-            self.records.extend(records)
-            for record in tub_records_data:
-                record["_data_dir"] = str(data_dir)
-                self.records_data.append(record)
-
             self.tub_summaries.append(
                 {
                     "data_dir": str(data_dir),
@@ -97,99 +98,73 @@ class DonkeyTubDataset(Dataset):
             )
 
         if not self.sample_indices:
-            raise ValueError("no records selected")
-        self.image_cache = self._load_image_cache() if cache_images else None
+            raise ValueError("no sequence samples selected")
 
-    def _load_image_cache(self) -> list[np.ndarray]:
-        image_cache = []
-        for record in self.records_data:
-            image_cache.append(self._load_image(record))
-        return image_cache
+    def __len__(self) -> int:
+        return len(self.sample_indices)
 
-    def _load_image(self, record: dict) -> np.ndarray:
+    def _load_frame(self, record: dict) -> np.ndarray:
         image_path = Path(record["_data_dir"]) / record["cam/image_array"]
         image = Image.open(image_path).convert("RGB")
         image_arr = np.asarray(image, dtype=np.uint8)
         return np.transpose(image_arr, (2, 0, 1))
 
-    def __len__(self) -> int:
-        return len(self.sample_indices)
-
     def __getitem__(self, index: int):
         record_index = self.sample_indices[index]
-        record = self.records_data[record_index]
-
+        start_index = record_index - self.sequence_span
         frames = []
-        start_index = record_index - self.history_span
         for frame_index in range(start_index, record_index + 1, self.frame_stride):
-            if self.image_cache is None:
-                frame = self._load_image(self.records_data[frame_index])
-            else:
-                frame = self.image_cache[frame_index]
-            frames.append(frame)
+            frames.append(self._load_frame(self.records_data[frame_index]))
 
+        record = self.records_data[record_index]
         action = np.array(
             [float(record["user/angle"]), float(record["user/throttle"])],
             dtype=np.float32,
         )
-        image_stack = np.concatenate(frames, axis=0)
-        return torch.from_numpy(image_stack), torch.from_numpy(action)
+        sequence = np.stack(frames, axis=0)
+        return torch.from_numpy(sequence), torch.from_numpy(action)
 
 
-class NvidiaDonkeyModel(nn.Module):
-    def __init__(self, input_channels: int = 3):
+class CnnGruDonkeyModel(nn.Module):
+    def __init__(self, feature_dim: int = 256, hidden_size: int = 256, num_layers: int = 1):
         super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(input_channels, 24, kernel_size=5, stride=2),
+        self.cnn = nn.Sequential(
+            nn.Conv2d(3, 24, kernel_size=5, stride=2),
             nn.ReLU(inplace=True),
-            nn.Dropout(p=0.2),
             nn.Conv2d(24, 32, kernel_size=5, stride=2),
             nn.ReLU(inplace=True),
-            nn.Dropout(p=0.2),
             nn.Conv2d(32, 64, kernel_size=5, stride=2),
             nn.ReLU(inplace=True),
-            nn.Dropout(p=0.2),
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU(inplace=True),
-            nn.Dropout(p=0.2),
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU(inplace=True),
-            nn.Dropout(p=0.2),
+            nn.Flatten(),
+            nn.Linear(64 * 7 * 13, feature_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.gru = nn.GRU(
+            input_size=feature_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
         )
         self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 7 * 13, 100),
+            nn.Linear(hidden_size, 128),
             nn.ReLU(inplace=True),
-            nn.Dropout(p=0.2),
-            nn.Linear(100, 50),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.2),
-            nn.Linear(50, 2),
+            nn.Dropout(p=0.1),
+            nn.Linear(128, 2),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, channels, height, width = x.shape
+        x = x.reshape(batch_size * sequence_length, channels, height, width)
         x = x[:, :, 10:, :]
         x = x.float() / 255.0
-        x = self.features(x)
-        return self.head(x)
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def split_indices(n: int, val_split: float, seed: int) -> tuple[list[int], list[int]]:
-    indices = list(range(n))
-    rng = random.Random(seed)
-    rng.shuffle(indices)
-    n_val = max(1, int(n * val_split))
-    val_indices = indices[:n_val]
-    train_indices = indices[n_val:]
-    return train_indices, val_indices
+        features = self.cnn(x)
+        features = features.reshape(batch_size, sequence_length, -1)
+        _, hidden = self.gru(features)
+        return self.head(hidden[-1])
 
 
 def run_epoch(model, loader, criterion, optimizer, device, train: bool) -> float:
@@ -197,20 +172,21 @@ def run_epoch(model, loader, criterion, optimizer, device, train: bool) -> float
     total_loss = 0.0
     total_items = 0
 
-    for images, actions in loader:
-        images = images.to(device, non_blocking=True)
+    for sequences, actions in loader:
+        sequences = sequences.to(device, non_blocking=True)
         actions = actions.to(device, non_blocking=True)
 
         with torch.set_grad_enabled(train):
-            preds = model(images)
+            preds = model(sequences)
             loss = criterion(preds, actions)
 
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
 
-        batch_size = images.shape[0]
+        batch_size = sequences.shape[0]
         total_loss += float(loss.item()) * batch_size
         total_items += batch_size
 
@@ -221,59 +197,30 @@ def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def init_from_single_frame_checkpoint(model: NvidiaDonkeyModel, checkpoint_path: Path, history: int, device: torch.device) -> None:
-    if history < 2:
-        raise ValueError("--init-from-single-frame is only useful when history > 1")
-
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    source_state = checkpoint["model_state_dict"]
-    target_state = model.state_dict()
-
-    first_weight_key = "features.0.weight"
-    first_bias_key = "features.0.bias"
-    target_state[first_weight_key].zero_()
-    current_frame_start = (history - 1) * 3
-    target_state[first_weight_key][:, current_frame_start : current_frame_start + 3, :, :] = source_state[first_weight_key]
-    target_state[first_bias_key].copy_(source_state[first_bias_key])
-
-    for key, value in source_state.items():
-        if key in {first_weight_key, first_bias_key}:
-            continue
-        if key in target_state and target_state[key].shape == value.shape:
-            target_state[key].copy_(value)
-
-    model.load_state_dict(target_state)
-
-
-def init_from_checkpoint(model: nn.Module, checkpoint_path: Path, device: torch.device) -> None:
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=Path, nargs="+", default=[Path("/mnt/d/WSL/log")])
+    parser.add_argument("--data-dir", type=Path, nargs="+", required=True)
     parser.add_argument("--val-dir", type=Path, nargs="+")
-    parser.add_argument("--output-dir", type=Path, default=Path("models/bc_nvidia"))
+    parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--drop-head", type=int, default=0)
-    parser.add_argument("--drop-tail", type=int, default=100)
-    parser.add_argument("--history", type=int, default=1)
+    parser.add_argument("--drop-tail", type=int, default=0)
+    parser.add_argument("--sequence-length", type=int, default=8)
     parser.add_argument("--frame-stride", type=int, default=1)
-    parser.add_argument("--cache-images", action="store_true")
-    parser.add_argument("--min-throttle", type=float)
-    parser.add_argument("--max-abs-angle", type=float)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--patience", type=int, default=6)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--feature-dim", type=int, default=256)
+    parser.add_argument("--hidden-size", type=int, default=256)
+    parser.add_argument("--num-layers", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=96)
+    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--patience", type=int, default=12)
+    parser.add_argument("--cnn-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--rnn-learning-rate", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--init-from-single-frame", type=Path)
-    parser.add_argument("--init-from-checkpoint", type=Path)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--min-throttle", type=float)
+    parser.add_argument("--max-abs-angle", type=float)
     args = parser.parse_args()
-    if args.init_from_single_frame and args.init_from_checkpoint:
-        parser.error("--init-from-single-frame and --init-from-checkpoint cannot be used together")
 
     cfg = TrainConfig(
         data_dir=[str(path) for path in args.data_dir],
@@ -281,44 +228,44 @@ def main() -> None:
         output_dir=str(args.output_dir),
         drop_head=args.drop_head,
         drop_tail=args.drop_tail,
-        history=args.history,
+        sequence_length=args.sequence_length,
         frame_stride=args.frame_stride,
-        cache_images=args.cache_images,
-        min_throttle=args.min_throttle,
-        max_abs_angle=args.max_abs_angle,
+        feature_dim=args.feature_dim,
+        hidden_size=args.hidden_size,
+        num_layers=args.num_layers,
         batch_size=args.batch_size,
         epochs=args.epochs,
         patience=args.patience,
-        learning_rate=args.learning_rate,
+        cnn_learning_rate=args.cnn_learning_rate,
+        rnn_learning_rate=args.rnn_learning_rate,
+        weight_decay=args.weight_decay,
         val_split=args.val_split,
         seed=args.seed,
-        init_from_single_frame=str(args.init_from_single_frame) if args.init_from_single_frame else None,
-        init_from_checkpoint=str(args.init_from_checkpoint) if args.init_from_checkpoint else None,
+        min_throttle=args.min_throttle,
+        max_abs_angle=args.max_abs_angle,
     )
 
-    set_seed(cfg.seed)
+    set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
 
-    train_source_dataset = DonkeyTubDataset(
+    train_source_dataset = DonkeySequenceDataset(
         args.data_dir,
         drop_head=args.drop_head,
         drop_tail=args.drop_tail,
-        history=args.history,
+        sequence_length=args.sequence_length,
         frame_stride=args.frame_stride,
-        cache_images=args.cache_images,
         min_throttle=args.min_throttle,
         max_abs_angle=args.max_abs_angle,
     )
     if args.val_dir:
         train_dataset = train_source_dataset
-        val_dataset = DonkeyTubDataset(
+        val_dataset = DonkeySequenceDataset(
             args.val_dir,
             drop_head=args.drop_head,
             drop_tail=args.drop_tail,
-            history=args.history,
+            sequence_length=args.sequence_length,
             frame_stride=args.frame_stride,
-            cache_images=args.cache_images,
             min_throttle=args.min_throttle,
             max_abs_angle=args.max_abs_angle,
         )
@@ -328,13 +275,19 @@ def main() -> None:
         val_dataset = Subset(train_source_dataset, val_indices)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = NvidiaDonkeyModel(input_channels=args.history * 3).to(device)
-    if args.init_from_single_frame:
-        init_from_single_frame_checkpoint(model, args.init_from_single_frame, args.history, device)
-    if args.init_from_checkpoint:
-        init_from_checkpoint(model, args.init_from_checkpoint, device)
+    model = CnnGruDonkeyModel(
+        feature_dim=args.feature_dim,
+        hidden_size=args.hidden_size,
+        num_layers=args.num_layers,
+    ).to(device)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": model.cnn.parameters(), "lr": args.cnn_learning_rate},
+            {"params": list(model.gru.parameters()) + list(model.head.parameters()), "lr": args.rnn_learning_rate},
+        ],
+        weight_decay=args.weight_decay,
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -353,8 +306,8 @@ def main() -> None:
 
     print(f"device: {device}")
     print(
-        f"records used: {len(train_source_dataset)} train={len(train_dataset)} val={len(val_dataset)} "
-        f"history={args.history} stride={args.frame_stride} cache_images={args.cache_images}"
+        f"samples train_source={len(train_source_dataset)} train={len(train_dataset)} val={len(val_dataset)} "
+        f"sequence_length={args.sequence_length} stride={args.frame_stride}"
     )
     print(f"filtered samples: {train_source_dataset.filtered_count}")
     print(f"train tubs: {train_source_dataset.tub_summaries}")

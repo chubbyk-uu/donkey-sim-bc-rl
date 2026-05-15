@@ -17,7 +17,8 @@ baseline and gives a useful reference before reinforcement learning.
 
 1. Build a reliable behavior cloning dataset from Windows Donkey Simulator.
 2. Train and evaluate PyTorch driving models from WSL2.
-3. Compare single-frame CNN, temporal CNN, and CNN+RNN/GRU behavior cloning.
+3. Use a single-frame CNN behavior cloning baseline as the current working
+   policy.
 4. Prepare the RL path after imitation learning is measurable:
    collect images, train an AE/VAE representation, then train SAC or TQC.
 
@@ -117,6 +118,11 @@ Record at least 5 different generated roads. Keep speed slow and stable. Include
 some mild recovery driving where the car is slightly off-center and then steered
 back toward the road center. A useful first target is 30k-50k frames total.
 
+It is acceptable to record a racing-line style dataset that cuts inside corners
+instead of strictly following the yellow centerline. The behavior cloning target
+is the demonstrated driving style, not the simulator centerline. Keep the style
+consistent and avoid very late saves, crashes, and ambiguous recovery actions.
+
 Copy a Windows log directory into WSL-local storage before training:
 
 ```bash
@@ -134,19 +140,25 @@ Inspect a copied dataset before training:
 python inspect_dataset.py data/generated_road_001 --sample-images 3
 ```
 
-For the current cleaned dataset:
+The current working dataset is:
 
 ```text
-data/generated_road_bc_002
-records: 11941
-images: 11941
+data/slow_data_raw/slow_data/road1
+data/slow_data_raw/slow_data/road2
+data/slow_data_raw/slow_data/road3
+data/slow_data_raw/slow_data/road4
+data/slow_data_raw/slow_data/road5
+data/slow_data_raw/slow_data/road6
+records: 72999 total
+images: 72999 total
 image shape: (160, 120), RGB
-angle range: about -0.43 to +0.43
-throttle mean: about 0.10
+overall throttle mean: about 0.095
+overall throttle p95: about 0.17
 ```
 
-The latest dataset did not need head trimming. Training used `--drop-tail 5`
-because the final frames contained stop/end artifacts.
+The current 6-road slow dataset did not use head or tail trimming for the active
+baseline. Older single-route and fast datasets are kept only as historical
+experiments.
 
 ## Behavior Cloning Baselines
 
@@ -158,30 +170,49 @@ The current first baseline is a PyTorch port of the Donkey/PilotNet-style CNN:
 current RGB image -> CNN -> steer, throttle
 ```
 
-Train it with CUDA:
+Train the current working baseline with CUDA:
 
 ```bash
 python train_bc.py \
-  --data-dir data/generated_road_bc_002 \
+  --data-dir \
+    data/slow_data_raw/slow_data/road1 \
+    data/slow_data_raw/slow_data/road2 \
+    data/slow_data_raw/slow_data/road3 \
+    data/slow_data_raw/slow_data/road4 \
+    data/slow_data_raw/slow_data/road5 \
+    data/slow_data_raw/slow_data/road6 \
   --drop-head 0 \
-  --drop-tail 5 \
-  --output-dir models/bc_nvidia_generated_road_002 \
-  --batch-size 128 \
-  --num-workers 2 \
-  --epochs 100 \
-  --patience 6
+  --drop-tail 0 \
+  --min-throttle 0.0 \
+  --max-abs-angle 0.8 \
+  --output-dir models/bc_nvidia_slow_006_random_split \
+  --batch-size 256 \
+  --num-workers 4 \
+  --epochs 140 \
+  --patience 12 \
+  --learning-rate 0.001 \
+  --val-split 0.2
 ```
 
 Observed result:
 
 ```text
-best val_loss: 0.000579
-best epoch: 86
-model: models/bc_nvidia_generated_road_002/best.pt
+best val_loss: 0.001056
+best epoch: 118
+model: models/bc_nvidia_slow_006_random_split/best.pt
 ```
 
-This model can drive some generated roads, but still fails on harder random
-routes. A 5-route random evaluation saw survival steps from about 641 to 1000.
+The raw model output is under-steered in closed-loop driving. A fixed actuator
+calibration is therefore used at evaluation time:
+
+```text
+throttle_max: 0.35
+steering_scale: 2.4
+steering_limit: 0.8
+```
+
+This is a control calibration, not route-specific logic. It does not use CTE,
+position, road geometry, or future route information.
 
 ### Temporal CNN
 
@@ -208,37 +239,38 @@ checkpoint:
 That immediately reached validation loss around `0.00052`, slightly better than
 the single-frame baseline, but this is not yet enough evidence to prefer it.
 
-### CNN+RNN/GRU Plan
+### CNN+RNN/GRU Status
 
-The next recommended model is a recurrent behavior cloning model:
+The GRU path is currently paused. Keep the scripts for reference, but do not use
+them as the active baseline:
+
+```text
+train_bc_gru.py
+eval_bc_gru.py
+models/bc_gru_slow_006_random_split_seq8
+```
+
+The tested GRU model was:
 
 ```text
 sequence of RGB frames
 -> shared CNN encoder per frame
--> GRU or LSTM
+-> GRU
 -> dense head
 -> steer, throttle
 ```
 
-This is based on the DonkeyCar RNN model family. DonkeyCar documents an RNN
-model using a sequence of images, TimeDistributed convolution layers, LSTM
-layers, dense layers, and driving outputs. The official command family also
-includes `--type=rnn`.
+Offline random-split validation loss was low, but simulator testing showed
+unstable closed-loop behavior. In particular, feeding the true recent frame
+history caused large steering spikes on non-sharp turns. Feeding the same GRU
+with the current frame repeated across the sequence removed those spikes and
+improved survival, which indicates that the learned temporal dynamics were the
+problem.
 
-Start with a small GRU, not a large LSTM:
-
-```text
-sequence_len: 8
-frame_stride: 1 or 2
-CNN encoder: current PilotNet-style conv stack
-RNN: GRU hidden_size=128, num_layers=1
-head: Linear(128 -> 50 -> 2)
-optimizer: Adam, lr=1e-4 or 3e-4
-batch_size: 64 or 96
-```
-
-Use more data before relying on the GRU result. A recurrent model can overfit
-one route just as easily as a CNN if the demonstrations are narrow.
+DonkeyCar does document an RNN model family using sequence images,
+TimeDistributed convolution layers, LSTM layers, and dense layers. If temporal
+models are revisited, reproduce that official LSTM-style architecture or a
+bounded/categorical variant instead of continuing the current GRU directly.
 
 ## Evaluation
 
@@ -246,15 +278,27 @@ Run a trained behavior cloning model in the simulator:
 
 ```bash
 python eval_bc.py \
-  --model models/bc_nvidia_generated_road_002/best.pt \
+  --model models/bc_nvidia_slow_006_random_split/best.pt \
   --env-id donkey-generated-roads-v0 \
   --host 127.0.0.1 \
   --port 9091 \
-  --steps 1000 \
-  --sleep 0.02
+  --episodes 1 \
+  --max-episode-steps 3000 \
+  --recreate-env-each-episode \
+  --exit-scene-between-episodes \
+  --scene-reload-delay 3.0 \
+  --sleep 0.02 \
+  --throttle-max 0.35 \
+  --steering-scale 2.4 \
+  --steering-limit 0.8 \
+  --device cuda
 ```
 
-Use multiple random generated roads for evaluation, not a single lucky route.
+Use multiple random generated roads for evaluation, but label generated-road
+crossings and visual flicker separately. The current training data intentionally
+avoids crossing roads, so crossing/flicker failures are out-of-distribution
+failures and should not be mixed into normal-route success rate.
+
 Track at least:
 
 ```text
@@ -267,6 +311,20 @@ reward: simulator reward
 `CTE` means cross-track error: distance from the road centerline. `cte=0` is
 near the center. Larger `abs(cte)` means the car is closer to leaving the road.
 In this simulator, failures have often appeared near `abs(cte) ~= 8`.
+
+Current evaluation notes:
+
+```text
+2.0 / 0.65 / 0.35:
+  conservative, stable, tends to run close to the edge.
+
+2.4 / 0.8 / 0.35:
+  current preferred setting; stronger cornering and better centerline behavior
+  on normal roads, but crossing/flicker scenes remain OOD.
+
+1.8 / 0.8 / 0.4:
+  faster and visually good, but lower safety margin.
+```
 
 ## RL Interface And Evaluation Tools
 
