@@ -287,6 +287,60 @@ max_abs_cte: 最大偏离中心线距离
 3. 尽量减少长时间贴边
 ```
 
+## Categorical steering 实验状态
+
+相关文件：
+
+```text
+train_bc_categorical.py
+eval_bc_categorical.py
+```
+
+设计要点：
+
+```text
+分箱: 21 bins / [-0.7, 0.7]，bin 宽 ≈ 0.0667
+标签: linear soft label（相邻两 bin 线性插值，按 bin centers 计算 pos）
+增强: 水平翻转（image 镜像 + angle 取反），仅训练 split
+头部: 双 head，steer 21-bin 分类 + throttle 标量回归
+损失: 加权 soft CE + 0.1 * MSE(throttle)，class_weight 用 soft label 加权
+推理: 期望解码 sum(softmax * bin_centers)，不要 argmax
+```
+
+已修复的工程 bug：
+
+```text
+- compute_class_weights 现在接收 flip_prob，不再隐式假设 0.5
+- DataLoader 加 worker_init_fn 让 random 模块在多 worker 下正确分叉
+- tub_summaries 的 angle 统计现在和 sample_indices 一致（filter 之后再 append）
+- resume 校验 checkpoint 的 bin_centers 与当前配置一致，不只 num_bins
+```
+
+试训发现的问题：
+
+```text
+- 默认配置（lr=1e-3, class_weight_max=8.0）训 12 epoch 卡在 val_loss ≈ 1.91
+- 关闭 class weight（min=max=1.0）训 10 epoch 仍卡在 ≈ 1.91
+- 经验边际分布 p* 的熵 H(p*) ≈ 1.5~2.0，几乎匹配
+→ 模型坍缩到"输出经验边际分布，忽略图像"
+```
+
+确认可解的两个方向（各 10 epoch 试训均能持续下降）：
+
+```text
+方向 A: 降学习率到 1e-4
+  CNN 有时间从零发育出图像可分特征
+  命令: --learning-rate 1e-4 --class-weight-min 1.0 --class-weight-max 1.0
+
+方向 B: 用 regression baseline 的 best.pt 初始化 CNN encoder + trunk
+  跳过 CNN 冷启动；只随机初始化两个 head
+  命令: --init-from-regression models/bc_nvidia_slow_006_flip/best.pt
+  （脚本里已实现 init_from_regression_checkpoint，映射 features/trunk）
+```
+
+结论：categorical 路线本身可行，CNN 冷启动是当前阶段的真正瓶颈，
+class weight 不是必需。下次继续做完整训练并和 regression baseline 对比。
+
 ## GRU 实验状态
 
 相关文件：
@@ -323,18 +377,29 @@ DonkeyCar 官方 LSTM/RNN 风格模型，或尝试 bounded/categorical 输出，
 
 ## 后续工作
 
+下次继续（categorical 收尾）：
+
+1. 全量训练方向 A（lr=1e-4, 不加 class weight，从零训）到收敛或早停。
+2. 全量训练方向 B（lr=1e-3，加 `--init-from-regression models/bc_nvidia_slow_006_flip/best.pt`，
+   从 regression baseline 初始化 CNN encoder + trunk）到收敛或早停。
+3. 对比两次训练的 best val_loss、收敛 epoch、diagnostics.json：
+   - 关键指标：`pred_abs_percentiles` 是否接近 `true_abs_percentiles`
+   - p99(pred) 接近 0.349 才算尾部学到了
+4. 选其中更优的做实车评估，和 regression + flip baseline 做 A/B 对比。
+
 短期：
 
-1. 训练并评估 categorical steering + flip，不加 class weight，和当前 regression + flip 对比。
-2. 做更多随机路线评估，并人工标注 normal / crossing-flicker / other anomaly。
-3. 继续录制正常非交叉路线，增加轻微恢复驾驶样本。
-4. 如果 categorical 有收益，再尝试温和 class weight 或 bounded steering。
+1. 做更多随机路线评估，并人工标注 normal / crossing-flicker / other anomaly。
+2. 继续录制正常非交叉路线，增加轻微恢复驾驶样本。
+3. 如果 categorical 的 pred 尾部仍被压缩，再考虑温和 class weight（max≈3）
+   或 WeightedRandomSampler；不建议把 class_weight_max 一路调高。
 
 中期：
 
-1. 复现 DonkeyCar 官方 LSTM/RNN 时序模型，而不是当前 GRU。
-2. 做整条路线 holdout 验证，避免随机切分验证集过于乐观。
-3. 尝试更系统的控制校准：不同速度下的 steering gain。
+1. 做整条路线 holdout 验证，避免随机切分验证集过于乐观。
+2. 尝试更系统的控制校准：不同速度下的 steering gain。
+3. GRU 路线暂停，相关脚本保留用于复盘。后续如果重启时序模型，优先复现
+   DonkeyCar 官方 LSTM/RNN 风格，或直接试 categorical 输出的时序模型。
 
 长期：
 

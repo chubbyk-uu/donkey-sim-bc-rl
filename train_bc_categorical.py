@@ -37,6 +37,7 @@ class TrainConfig:
     weight_decay: float
     val_split: float
     seed: int
+    init_from_regression: str | None
 
 
 def make_bins(num_bins: int, steering_min: float, steering_max: float) -> tuple[np.ndarray, np.ndarray]:
@@ -244,6 +245,34 @@ class CategoricalSteeringModel(nn.Module):
         }
 
 
+def init_from_regression_checkpoint(model: CategoricalSteeringModel, checkpoint_path: Path, device: torch.device) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    source_state = checkpoint["model_state_dict"]
+    target_state = model.state_dict()
+    key_map = {}
+    for key in source_state:
+        if key.startswith("features."):
+            key_map[key] = key
+        elif key.startswith("head.1."):
+            key_map[key] = key.replace("head.1.", "trunk.1.")
+        elif key.startswith("head.4."):
+            key_map[key] = key.replace("head.4.", "trunk.4.")
+
+    copied = []
+    skipped = []
+    for source_key, target_key in key_map.items():
+        if target_key in target_state and target_state[target_key].shape == source_state[source_key].shape:
+            target_state[target_key].copy_(source_state[source_key])
+            copied.append(f"{source_key}->{target_key}")
+        else:
+            skipped.append(f"{source_key}->{target_key}")
+    model.load_state_dict(target_state)
+    print(f"initialized from regression checkpoint: {checkpoint_path}")
+    print(f"copied regression tensors: {len(copied)}")
+    if skipped:
+        print(f"skipped regression tensors: {skipped}")
+
+
 def categorical_loss(
     outputs: dict[str, torch.Tensor],
     steer_labels: torch.Tensor,
@@ -393,7 +422,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--init-from-regression", type=Path)
     args = parser.parse_args()
+    if args.resume and args.init_from_regression:
+        parser.error("--resume and --init-from-regression cannot be used together")
 
     set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -421,6 +453,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         val_split=args.val_split,
         seed=args.seed,
+        init_from_regression=str(args.init_from_regression) if args.init_from_regression else None,
     )
     (args.output_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
 
@@ -477,6 +510,8 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = CategoricalSteeringModel(num_bins=args.num_bins).to(device)
+    if args.init_from_regression:
+        init_from_regression_checkpoint(model, args.init_from_regression, device)
     class_weights = torch.tensor(class_weights_np, dtype=torch.float32, device=device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
