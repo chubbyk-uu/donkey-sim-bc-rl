@@ -15,17 +15,18 @@ WSL2 Python -> 127.0.0.1:9091 -> Windows Donkey Simulator
 当前可用 baseline：
 
 ```text
-模型: 单帧 CNN 行为克隆
-权重: models/bc_nvidia_slow_006_random_split/best.pt
+模型: 单帧 CNN 行为克隆 + 水平翻转增强
+权重: models/bc_nvidia_slow_006_flip/best.pt
 数据: 6 条 generated_road 慢速人工驾驶路线
 默认评估参数:
   throttle_max = 0.35
-  steering_scale = 2.4
+  steering_scale = 1.8
   steering_limit = 0.8
 ```
 
-单帧 CNN 原始输出偏保守，闭环驾驶时需要固定的转向/油门控制校准。这不是基于
-路线信息的规则控制，没有使用 CTE、位置、道路几何或未来路线。
+单帧 CNN 原始输出仍需要固定的转向/油门控制校准。这不是基于路线信息的规则控制，
+没有使用 CTE、位置、道路几何或未来路线。加入水平翻转增强后，模型对左右偏移的
+恢复能力更好，当前不再需要旧 baseline 使用的 `steering_scale=2.4`。
 
 GRU 时序路线暂时暂停。它的离线验证 loss 很低，但 simulator 闭环时真实历史帧会
 触发异常大转向；把当前帧重复输入给同一个 GRU 后反而稳定，说明问题在时序动态
@@ -122,11 +123,17 @@ unzip /mnt/d/WSL/slow_data.zip -d data/slow_data_raw
 
 ## 数据检查
 
-检查单个数据目录：
+检查一个或多个数据目录：
 
 ```bash
-python inspect_dataset.py data/slow_data_raw/slow_data/road1 --sample-images 3
+python inspect_dataset.py \
+  data/slow_data_raw/slow_data/road1 \
+  data/slow_data_raw/slow_data/road2 \
+  --sample-images 3
 ```
+
+`inspect_dataset.py` 默认会输出 `21 bins / [-0.7, 0.7]` 的 angle 直方图，用于检查
+categorical steering 的数据分布。
 
 当前工作数据：
 
@@ -146,7 +153,7 @@ overall throttle p95: about 0.17
 
 ## 训练单帧 CNN baseline
 
-当前训练命令：
+当前主力训练命令：
 
 ```bash
 python train_bc.py \
@@ -159,18 +166,28 @@ python train_bc.py \
     data/slow_data_raw/slow_data/road6 \
   --drop-head 0 \
   --drop-tail 0 \
-  --min-throttle 0.0 \
-  --max-abs-angle 0.8 \
-  --output-dir models/bc_nvidia_slow_006_random_split \
-  --batch-size 256 \
+  --output-dir models/bc_nvidia_slow_006_flip \
+  --history 1 \
+  --frame-stride 1 \
+  --flip-prob 0.5 \
+  --batch-size 128 \
   --num-workers 4 \
-  --epochs 140 \
-  --patience 12 \
+  --epochs 160 \
+  --patience 10 \
   --learning-rate 0.001 \
   --val-split 0.2
 ```
 
 当前结果：
+
+```text
+best val_loss: 0.002038
+best epoch: 113
+early stop epoch: 123
+model: models/bc_nvidia_slow_006_flip/best.pt
+```
+
+历史 no-flip baseline：
 
 ```text
 best val_loss: 0.001056
@@ -187,18 +204,18 @@ model: models/bc_nvidia_slow_006_random_split/best.pt
 
 ```bash
 python eval_bc.py \
-  --model models/bc_nvidia_slow_006_random_split/best.pt \
+  --model models/bc_nvidia_slow_006_flip/best.pt \
   --env-id donkey-generated-roads-v0 \
   --host 127.0.0.1 \
   --port 9091 \
-  --episodes 1 \
-  --max-episode-steps 3000 \
+  --episodes 3 \
+  --max-episode-steps 2000 \
   --recreate-env-each-episode \
   --exit-scene-between-episodes \
-  --scene-reload-delay 3.0 \
-  --sleep 0.02 \
+  --scene-reload-delay 2.0 \
+  --sleep 0.0 \
   --throttle-max 0.35 \
-  --steering-scale 2.4 \
+  --steering-scale 1.8 \
   --steering-limit 0.8 \
   --device cuda
 ```
@@ -215,11 +232,25 @@ exit_scene_between_episodes: 每轮结束后退出场景，强制刷新 generate
 当前评估结论：
 
 ```text
+flip model, 1.8 / 0.8 / 0.35:
+  当前默认参数。
+  3 条随机 generated road 都跑满 2000 steps。
+  eval summary:
+    steps_mean = 2000.0
+    reward_mean = 1748.77
+    mean_abs_cte = 2.190
+    max_abs_cte = 5.637
+  人工观察没有明显压两侧白线或冲到白线外。
+
+flip model, 2.4 / 0.8 / 0.35:
+  转向过度，3 条路线分别只坚持 1665 / 991 / 538 steps。
+
+no-flip model:
 2.0 / 0.65 / 0.35:
   更保守，稳定性好，但更容易贴边。
 
 2.4 / 0.8 / 0.35:
-  当前默认参数。正常路线更居中，急弯能力更强。
+  旧默认参数。正常路线更居中，急弯能力更强。
   generated road 交叉/闪烁仍属于 OOD。
 
 1.8 / 0.8 / 0.4:
@@ -294,10 +325,10 @@ DonkeyCar 官方 LSTM/RNN 风格模型，或尝试 bounded/categorical 输出，
 
 短期：
 
-1. 固化单帧 CNN baseline 和当前控制参数。
-2. 做多轮评估，并人工标注 normal / crossing-flicker / other anomaly。
+1. 训练并评估 categorical steering + flip，不加 class weight，和当前 regression + flip 对比。
+2. 做更多随机路线评估，并人工标注 normal / crossing-flicker / other anomaly。
 3. 继续录制正常非交叉路线，增加轻微恢复驾驶样本。
-4. 尝试 bounded steering 或 categorical steering，减少对推理后处理的依赖。
+4. 如果 categorical 有收益，再尝试温和 class weight 或 bounded steering。
 
 中期：
 
@@ -318,6 +349,8 @@ smoke_test.py      检查 Gymnasium 环境连接、图像、遥测和控制
 inspect_dataset.py 检查 Donkey tub 数据质量
 train_bc.py        单帧/帧堆叠 CNN 行为克隆训练
 eval_bc.py         单帧 CNN 闭环评估和控制校准
+train_bc_categorical.py  categorical steering 行为克隆训练
+eval_bc_categorical.py   categorical steering 闭环评估
 train_bc_gru.py    GRU 行为克隆实验训练
 eval_bc_gru.py     GRU 闭环评估和尖峰诊断
 ```

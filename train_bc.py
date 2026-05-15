@@ -21,6 +21,7 @@ class TrainConfig:
     history: int
     frame_stride: int
     cache_images: bool
+    flip_prob: float
     min_throttle: float | None
     max_abs_angle: float | None
     batch_size: int
@@ -42,6 +43,7 @@ class DonkeyTubDataset(Dataset):
         history: int = 1,
         frame_stride: int = 1,
         cache_images: bool = False,
+        flip_prob: float = 0.0,
         min_throttle: float | None = None,
         max_abs_angle: float | None = None,
     ):
@@ -52,6 +54,7 @@ class DonkeyTubDataset(Dataset):
         self.history = history
         self.frame_stride = frame_stride
         self.history_span = (history - 1) * frame_stride
+        self.flip_prob = flip_prob
 
         self.records: list[Path] = []
         self.records_data: list[dict] = []
@@ -109,7 +112,7 @@ class DonkeyTubDataset(Dataset):
     def _load_image(self, record: dict) -> np.ndarray:
         image_path = Path(record["_data_dir"]) / record["cam/image_array"]
         image = Image.open(image_path).convert("RGB")
-        image_arr = np.asarray(image, dtype=np.uint8)
+        image_arr = np.array(image, dtype=np.uint8, copy=True)
         return np.transpose(image_arr, (2, 0, 1))
 
     def __len__(self) -> int:
@@ -132,6 +135,9 @@ class DonkeyTubDataset(Dataset):
             [float(record["user/angle"]), float(record["user/throttle"])],
             dtype=np.float32,
         )
+        if self.flip_prob > 0.0 and random.random() < self.flip_prob:
+            frames = [frame[:, :, ::-1].copy() for frame in frames]
+            action[0] = -action[0]
         image_stack = np.concatenate(frames, axis=0)
         return torch.from_numpy(image_stack), torch.from_numpy(action)
 
@@ -180,6 +186,12 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def worker_init_fn(worker_id: int) -> None:
+    seed = (torch.initial_seed() + worker_id) % (2**32)
+    random.seed(seed)
+    np.random.seed(seed)
 
 
 def split_indices(n: int, val_split: float, seed: int) -> tuple[list[int], list[int]]:
@@ -260,6 +272,7 @@ def main() -> None:
     parser.add_argument("--history", type=int, default=1)
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--cache-images", action="store_true")
+    parser.add_argument("--flip-prob", type=float, default=0.0)
     parser.add_argument("--min-throttle", type=float)
     parser.add_argument("--max-abs-angle", type=float)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -271,9 +284,11 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--init-from-single-frame", type=Path)
     parser.add_argument("--init-from-checkpoint", type=Path)
+    parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
-    if args.init_from_single_frame and args.init_from_checkpoint:
-        parser.error("--init-from-single-frame and --init-from-checkpoint cannot be used together")
+    init_options = [args.init_from_single_frame, args.init_from_checkpoint, args.resume]
+    if sum(option is not None for option in init_options) > 1:
+        parser.error("--init-from-single-frame, --init-from-checkpoint, and --resume are mutually exclusive")
 
     cfg = TrainConfig(
         data_dir=[str(path) for path in args.data_dir],
@@ -284,6 +299,7 @@ def main() -> None:
         history=args.history,
         frame_stride=args.frame_stride,
         cache_images=args.cache_images,
+        flip_prob=args.flip_prob,
         min_throttle=args.min_throttle,
         max_abs_angle=args.max_abs_angle,
         batch_size=args.batch_size,
@@ -307,6 +323,18 @@ def main() -> None:
         history=args.history,
         frame_stride=args.frame_stride,
         cache_images=args.cache_images,
+        flip_prob=args.flip_prob,
+        min_throttle=args.min_throttle,
+        max_abs_angle=args.max_abs_angle,
+    )
+    val_source_dataset = DonkeyTubDataset(
+        args.data_dir,
+        drop_head=args.drop_head,
+        drop_tail=args.drop_tail,
+        history=args.history,
+        frame_stride=args.frame_stride,
+        cache_images=False,
+        flip_prob=0.0,
         min_throttle=args.min_throttle,
         max_abs_angle=args.max_abs_angle,
     )
@@ -319,13 +347,14 @@ def main() -> None:
             history=args.history,
             frame_stride=args.frame_stride,
             cache_images=args.cache_images,
+            flip_prob=0.0,
             min_throttle=args.min_throttle,
             max_abs_angle=args.max_abs_angle,
         )
     else:
         train_indices, val_indices = split_indices(len(train_source_dataset), args.val_split, args.seed)
         train_dataset = Subset(train_source_dataset, train_indices)
-        val_dataset = Subset(train_source_dataset, val_indices)
+        val_dataset = Subset(val_source_dataset, val_indices)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = NvidiaDonkeyModel(input_channels=args.history * 3).to(device)
@@ -336,12 +365,31 @@ def main() -> None:
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
+    start_epoch = 1
+    best_val = float("inf")
+    best_epoch = 0
+    stale_epochs = 0
+    history = []
+    if args.resume:
+        resume_checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(resume_checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in resume_checkpoint:
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+        start_epoch = int(resume_checkpoint.get("epoch", 0)) + 1
+        best_val = float(resume_checkpoint.get("best_val", resume_checkpoint.get("val_loss", best_val)))
+        best_epoch = int(resume_checkpoint.get("best_epoch", resume_checkpoint.get("epoch", 0)))
+        stale_epochs = int(resume_checkpoint.get("stale_epochs", 0))
+        history = resume_checkpoint.get("history", [])
+        if not history and (args.output_dir / "history.json").exists():
+            history = json.loads((args.output_dir / "history.json").read_text())
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=worker_init_fn if args.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -349,12 +397,14 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=worker_init_fn if args.num_workers > 0 else None,
     )
 
     print(f"device: {device}")
     print(
         f"records used: {len(train_source_dataset)} train={len(train_dataset)} val={len(val_dataset)} "
-        f"history={args.history} stride={args.frame_stride} cache_images={args.cache_images}"
+        f"history={args.history} stride={args.frame_stride} cache_images={args.cache_images} "
+        f"flip_prob={args.flip_prob}"
     )
     print(f"filtered samples: {train_source_dataset.filtered_count}")
     print(f"train tubs: {train_source_dataset.tub_summaries}")
@@ -363,12 +413,7 @@ def main() -> None:
     print(f"parameters: {count_parameters(model):,}")
     print(model)
 
-    best_val = float("inf")
-    best_epoch = 0
-    stale_epochs = 0
-    history = []
-
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         train_loss = run_epoch(model, train_loader, criterion, optimizer, device, train=True)
         val_loss = run_epoch(model, val_loader, criterion, optimizer, device, train=False)
         history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
@@ -382,18 +427,37 @@ def main() -> None:
             stale_epochs = 0
             checkpoint = {
                 "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
                 "config": asdict(cfg),
                 "epoch": epoch,
                 "val_loss": val_loss,
+                "best_val": best_val,
+                "best_epoch": best_epoch,
+                "stale_epochs": stale_epochs,
+                "history": history,
             }
             torch.save(checkpoint, args.output_dir / "best.pt")
         else:
             stale_epochs += 1
-            if stale_epochs >= args.patience:
-                print(f"early stopping at epoch {epoch}; best epoch {best_epoch} val_loss={best_val:.6f}")
-                break
 
-    torch.save({"model_state_dict": model.state_dict(), "config": asdict(cfg)}, args.output_dir / "last.pt")
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "config": asdict(cfg),
+                "epoch": epoch,
+                "val_loss": val_loss,
+                "best_val": best_val,
+                "best_epoch": best_epoch,
+                "stale_epochs": stale_epochs,
+                "history": history,
+            },
+            args.output_dir / "last.pt",
+        )
+
+        if stale_epochs >= args.patience:
+            print(f"early stopping at epoch {epoch}; best epoch {best_epoch} val_loss={best_val:.6f}")
+            break
 
 
 if __name__ == "__main__":
