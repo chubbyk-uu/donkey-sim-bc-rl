@@ -1,30 +1,50 @@
-# Donkey Sim Learning Project
+# Donkey Simulator 行为克隆与强化学习实验
 
-This project uses Donkey Simulator on Windows and Python training code in WSL2.
-The current connection path is:
+这个仓库用于在 WSL2 中训练 Donkey Simulator 自动驾驶模型。当前主线是行为克隆
+（Behavior Cloning, BC）：在 Windows 端运行模拟器和录制数据，在 WSL2 端用
+Gymnasium、PyTorch 和 CUDA 训练/评估模型。
+
+当前连接方式：
 
 ```text
-WSL Python -> 127.0.0.1:9091 -> Windows Donkey Simulator
+WSL2 Python -> 127.0.0.1:9091 -> Windows Donkey Simulator
 ```
 
-The simulator connection, image observation, telemetry, and control commands have
-been verified with `smoke_test.py`.
+## 当前状态
 
-## Goals
+当前可用 baseline：
 
-The project starts with behavior cloning because it is the standard Donkey Car
-baseline and gives a useful reference before reinforcement learning.
+```text
+模型: 单帧 CNN 行为克隆
+权重: models/bc_nvidia_slow_006_random_split/best.pt
+数据: 6 条 generated_road 慢速人工驾驶路线
+默认评估参数:
+  throttle_max = 0.35
+  steering_scale = 2.4
+  steering_limit = 0.8
+```
 
-1. Build a reliable behavior cloning dataset from Windows Donkey Simulator.
-2. Train and evaluate PyTorch driving models from WSL2.
-3. Use a single-frame CNN behavior cloning baseline as the current working
-   policy.
-4. Prepare the RL path after imitation learning is measurable:
-   collect images, train an AE/VAE representation, then train SAC or TQC.
+单帧 CNN 原始输出偏保守，闭环驾驶时需要固定的转向/油门控制校准。这不是基于
+路线信息的规则控制，没有使用 CTE、位置、道路几何或未来路线。
 
-## Current Environment
+GRU 时序路线暂时暂停。它的离线验证 loss 很低，但 simulator 闭环时真实历史帧会
+触发异常大转向；把当前帧重复输入给同一个 GRU 后反而稳定，说明问题在时序动态
+学习上。相关脚本保留用于复盘和后续实验。
 
-Verified packages:
+## 环境需求
+
+推荐环境：
+
+```text
+OS: Windows + WSL2
+Python: 3.11
+Conda env: donkey
+GPU: NVIDIA GPU
+CUDA: PyTorch CUDA 12.8 build
+Simulator: SDSandbox / donkey_sim v25.10.06
+```
+
+当前已验证包版本：
 
 ```text
 Python 3.11.15
@@ -32,115 +52,83 @@ gym-donkeycar 1.3.1
 gymnasium 1.2.3
 stable-baselines3 2.8.0
 torch 2.11.0+cu128
-CUDA 12.8 build
 GPU: NVIDIA GeForce RTX 4080 Laptop GPU
 ```
 
-The current Donkey Gymnasium environment uses:
+不要在这个环境里安装 `donkeycar[pc]`。它属于另一套 DonkeyCar/TensorFlow
+工作流，会拉低 `numpy`、`protobuf` 等包版本，和当前 Gymnasium 版本路线冲突。
+
+## 模拟器设置
+
+Windows 端启动 Donkey Simulator，确认端口：
 
 ```text
-observation: camera image, shape (120, 160, 3)
-action: [steering, throttle]
-info: cte, speed, pos, hit, lap_count, last_lap_time, etc.
-```
-
-Do not use `donkeycar[pc]` in this environment. It pulled in an older
-TensorFlow/DonkeyCar stack and downgraded packages such as `numpy`, which
-conflicted with the current Gymnasium-based `gym-donkeycar` workflow.
-
-## Smoke Test
-
-Start Donkey Simulator on Windows, then run:
-
-```bash
-python smoke_test.py
-```
-
-The default target is:
-
-```text
-host: 127.0.0.1
 port: 9091
-env: donkey-warren-track-v0
+portPrivateAPI: 9092
 ```
 
-Use a different track with:
-
-```bash
-python smoke_test.py --env-id donkey-generated-track-v0
-```
-
-Use a different host or port with:
-
-```bash
-python smoke_test.py --host 127.0.0.1 --port 9091
-```
-
-The environment id determines the map. For example:
+当前主要使用：
 
 ```text
-donkey-warren-track-v0 -> warren
+scene: generated_road
+env id: donkey-generated-roads-v0
 ```
 
-The simulator can load the selected scene automatically as long as the simulator
-process is running and accepting Gym TCP connections.
+注意：
 
-## Data Collection
+- `generated_road` 是当前模拟器里能手动录制数据的场景。
+- WSL2 可以通过 `127.0.0.1:9091` 连接 Windows 模拟器。
+- 每次加载 generated road 都可能生成不同路线。
+- 随机路线偶尔会出现跑道交叉和画面闪烁。当前训练数据刻意避开了这种情况，所以
+  交叉/闪烁失败应标记为 OOD，不应混进普通路线成功率。
 
-The usable manual recording path found for the current Windows simulator is:
+## 数据采集
+
+在 Windows simulator 中进入：
 
 ```text
-Windows Donkey Simulator -> generated_road -> No Rec / w Rec recording
+generated_road -> manual driving -> w Rec
 ```
 
-Important findings:
+录制建议：
 
-- Manual driving through the normal scene menu can drive the car, but does not
-  necessarily record data.
-- In the current simulator build, `generated_road` is the scene that exposes the
-  recording switch and writes `record_*.json` plus camera images.
-- A Gymnasium client from WSL creates its own simulator-controlled car. It is
-  not a passive recorder for the Windows gamepad car.
-- Generated roads are random across loads; even with seed settings they should
-  be treated as different routes.
+- 慢速、稳定驾驶。
+- 可以按自己的 racing line 切内线，不必严格沿黄线中心。
+- 风格要一致，不要一会儿沿中心线，一会儿极端切弯。
+- 避免撞车、冲出跑道、停住后大幅乱打方向。
+- 每条路线可以加入少量恢复驾驶，例如轻微偏左/偏右后回到路面。
+- 当前训练数据刻意避开 generated road 的交叉/闪烁路线。
 
-Recommended recording plan:
+Windows 路径示例：
 
 ```text
-D:\WSL\log_001
-D:\WSL\log_002
-D:\WSL\log_003
-D:\WSL\log_004
-D:\WSL\log_005
+D:\WSL\slow_data\road1
+D:\WSL\slow_data\road2
+...
 ```
 
-Record at least 5 different generated roads. Keep speed slow and stable. Include
-some mild recovery driving where the car is slightly off-center and then steered
-back toward the road center. A useful first target is 30k-50k frames total.
-
-It is acceptable to record a racing-line style dataset that cuts inside corners
-instead of strictly following the yellow centerline. The behavior cloning target
-is the demonstrated driving style, not the simulator centerline. Keep the style
-consistent and avoid very late saves, crashes, and ambiguous recovery actions.
-
-Copy a Windows log directory into WSL-local storage before training:
+复制到 WSL 本地后再训练，避免 `/mnt/d/...` 小文件读取过慢：
 
 ```bash
-cp -r /mnt/d/WSL/log_001 data/generated_road_001
+mkdir -p data/slow_data_raw/slow_data
+cp -r /mnt/d/WSL/slow_data/road1 data/slow_data_raw/slow_data/road1
 ```
 
-Training directly from `/mnt/d/...` works, but many small image files are much
-slower there than on the WSL filesystem.
-
-## Dataset Inspection
-
-Inspect a copied dataset before training:
+如果是 zip：
 
 ```bash
-python inspect_dataset.py data/generated_road_001 --sample-images 3
+unzip /mnt/d/WSL/slow_data.zip -d data/slow_data_raw
 ```
 
-The current working dataset is:
+## 数据检查
+
+检查单个数据目录：
+
+```bash
+python inspect_dataset.py data/slow_data_raw/slow_data/road1 --sample-images 3
+```
+
+当前工作数据：
 
 ```text
 data/slow_data_raw/slow_data/road1
@@ -149,28 +137,16 @@ data/slow_data_raw/slow_data/road3
 data/slow_data_raw/slow_data/road4
 data/slow_data_raw/slow_data/road5
 data/slow_data_raw/slow_data/road6
-records: 72999 total
-images: 72999 total
+
+records/images: 72999 total
 image shape: (160, 120), RGB
 overall throttle mean: about 0.095
 overall throttle p95: about 0.17
 ```
 
-The current 6-road slow dataset did not use head or tail trimming for the active
-baseline. Older single-route and fast datasets are kept only as historical
-experiments.
+## 训练单帧 CNN baseline
 
-## Behavior Cloning Baselines
-
-### Single-Frame CNN
-
-The current first baseline is a PyTorch port of the Donkey/PilotNet-style CNN:
-
-```text
-current RGB image -> CNN -> steer, throttle
-```
-
-Train the current working baseline with CUDA:
+当前训练命令：
 
 ```bash
 python train_bc.py \
@@ -194,7 +170,7 @@ python train_bc.py \
   --val-split 0.2
 ```
 
-Observed result:
+当前结果：
 
 ```text
 best val_loss: 0.001056
@@ -202,79 +178,12 @@ best epoch: 118
 model: models/bc_nvidia_slow_006_random_split/best.pt
 ```
 
-The raw model output is under-steered in closed-loop driving. A fixed actuator
-calibration is therefore used at evaluation time:
+说明：这里的验证集是随机切分，不等同于整条路线泛化能力。最终判断仍以 simulator
+闭环评估为准。
 
-```text
-throttle_max: 0.35
-steering_scale: 2.4
-steering_limit: 0.8
-```
+## 评估单帧 CNN
 
-This is a control calibration, not route-specific logic. It does not use CTE,
-position, road geometry, or future route information.
-
-### Temporal CNN
-
-We tested frame stacking:
-
-```text
-history=10
-frame_stride=2
-input frames: t-18, t-16, ..., t
-RGB channels: 30
-```
-
-From-scratch training with 30 input channels regressed toward predicting the
-mean action. The mean-action baseline MSE was about `0.00725`, and the
-from-scratch 10-frame model did not beat it.
-
-A better variant initialized the 30-channel model from the trained single-frame
-checkpoint:
-
-- copy the single-frame convolution weights into the current-frame channels;
-- initialize older-frame channels to zero;
-- copy the rest of the model weights.
-
-That immediately reached validation loss around `0.00052`, slightly better than
-the single-frame baseline, but this is not yet enough evidence to prefer it.
-
-### CNN+RNN/GRU Status
-
-The GRU path is currently paused. Keep the scripts for reference, but do not use
-them as the active baseline:
-
-```text
-train_bc_gru.py
-eval_bc_gru.py
-models/bc_gru_slow_006_random_split_seq8
-```
-
-The tested GRU model was:
-
-```text
-sequence of RGB frames
--> shared CNN encoder per frame
--> GRU
--> dense head
--> steer, throttle
-```
-
-Offline random-split validation loss was low, but simulator testing showed
-unstable closed-loop behavior. In particular, feeding the true recent frame
-history caused large steering spikes on non-sharp turns. Feeding the same GRU
-with the current frame repeated across the sequence removed those spikes and
-improved survival, which indicates that the learned temporal dynamics were the
-problem.
-
-DonkeyCar does document an RNN model family using sequence images,
-TimeDistributed convolution layers, LSTM layers, and dense layers. If temporal
-models are revisited, reproduce that official LSTM-style architecture or a
-bounded/categorical variant instead of continuing the current GRU directly.
-
-## Evaluation
-
-Run a trained behavior cloning model in the simulator:
+启动 Windows simulator 后运行：
 
 ```bash
 python eval_bc.py \
@@ -294,104 +203,149 @@ python eval_bc.py \
   --device cuda
 ```
 
-Use multiple random generated roads for evaluation, but label generated-road
-crossings and visual flicker separately. The current training data intentionally
-avoids crossing roads, so crossing/flicker failures are out-of-distribution
-failures and should not be mixed into normal-route success rate.
-
-Track at least:
+参数含义：
 
 ```text
-survival_steps: how long before failure/reset
-mean_abs_cte: average absolute cross-track error
-max_abs_cte: worst absolute cross-track error
-reward: simulator reward
+throttle_max: 限制最大油门
+steering_scale: 放大模型转向输出，补偿 understeer
+steering_limit: 限制最终发送给模拟器的最大转向
+exit_scene_between_episodes: 每轮结束后退出场景，强制刷新 generated road
 ```
 
-`CTE` means cross-track error: distance from the road centerline. `cte=0` is
-near the center. Larger `abs(cte)` means the car is closer to leaving the road.
-In this simulator, failures have often appeared near `abs(cte) ~= 8`.
-
-Current evaluation notes:
+当前评估结论：
 
 ```text
 2.0 / 0.65 / 0.35:
-  conservative, stable, tends to run close to the edge.
+  更保守，稳定性好，但更容易贴边。
 
 2.4 / 0.8 / 0.35:
-  current preferred setting; stronger cornering and better centerline behavior
-  on normal roads, but crossing/flicker scenes remain OOD.
+  当前默认参数。正常路线更居中，急弯能力更强。
+  generated road 交叉/闪烁仍属于 OOD。
 
 1.8 / 0.8 / 0.4:
-  faster and visually good, but lower safety margin.
+  观感更快，部分路线更居中，但安全裕度略低。
 ```
 
-## RL Interface And Evaluation Tools
-
-This phase keeps RL code separate from Donkey's official behavior cloning flow.
-The purpose is to make experiments repeatable.
-
-Planned files:
+其中格式为：
 
 ```text
-ppo_common.py or rl_common.py   shared environment creation and wrappers
-eval_policy.py                 load a policy and report reward/cte/speed/laps
-record_rollout.py              save observations, actions, rewards, and info
-runs/                          TensorBoard logs
-models/                        saved policies and checkpoints
-data/                          collected images, tubs, rollouts, or AE datasets
+steering_scale / steering_limit / throttle_max
 ```
 
-This phase should not introduce a custom neural network unless it is required
-for an experiment. It should first provide reliable environment creation,
-logging, saving, and evaluation.
+## 评估指标
 
-## AE/VAE + Continuous Control RL
-
-Existing Donkey RL projects often avoid training directly from raw images. A
-common pattern is:
+主要看：
 
 ```text
-collect images -> train AE/VAE -> encode observations -> train SAC/TQC policy
+survival_steps: 每轮坚持了多少 step
+terminated: 是否出界/失败
+reward: simulator reward
+mean_abs_cte: 平均偏离中心线距离
+max_abs_cte: 最大偏离中心线距离
 ```
 
-The AE/VAE compresses camera images into a smaller latent state. The RL policy
-then learns vehicle control from that latent state, which is usually faster and
-more stable than training directly from raw pixels.
+`CTE` 是 cross-track error，表示相对道路中心线的偏移。`cte=0` 接近中心线，
+`abs(cte)` 越大越靠近路边。当前 simulator 里失败通常在 `abs(cte) ~= 8`
+附近出现。
 
-Candidate RL algorithms:
+如果驾驶风格是切内线，CTE 大不一定代表错误。当前目标优先级是：
 
 ```text
-SAC: Soft Actor-Critic, strong off-policy continuous control baseline
-TQC: Truncated Quantile Critics, SAC-style algorithm from sb3-contrib
+1. 不出界
+2. 能通过急弯
+3. 尽量减少长时间贴边
 ```
 
-Implementation order:
+## GRU 实验状态
 
-1. Collect an image dataset from simulator driving.
-2. Train an AE or VAE and inspect reconstruction quality.
-3. Add a Gymnasium wrapper that replaces raw images with latent vectors.
-4. Train SAC as the first continuous control baseline.
-5. Add TQC after SAC is working.
-6. Compare against behavior cloning and optional PPO baselines.
+相关文件：
 
-## References
+```text
+train_bc_gru.py
+eval_bc_gru.py
+```
+
+测试过的 GRU 模型：
+
+```text
+sequence_length = 8
+frame_stride = 1
+CNN encoder + GRU hidden_size 256 + dense head
+```
+
+离线结果：
+
+```text
+best val_loss: 9.41e-05
+best epoch: 114
+```
+
+但闭环测试发现：
+
+- 真实 8 帧历史输入会在轻弯/近直线时触发异常大转向。
+- 把当前帧重复 8 次输入给同一个 GRU，尖峰消失并且 survival steps 提升。
+- 说明当前 GRU 学到的时序动态不可靠。
+
+结论：GRU 路线暂时暂停，不作为当前 baseline。后续如果继续时序模型，应优先复现
+DonkeyCar 官方 LSTM/RNN 风格模型，或尝试 bounded/categorical 输出，而不是继续
+当前 GRU。
+
+## 后续工作
+
+短期：
+
+1. 固化单帧 CNN baseline 和当前控制参数。
+2. 做多轮评估，并人工标注 normal / crossing-flicker / other anomaly。
+3. 继续录制正常非交叉路线，增加轻微恢复驾驶样本。
+4. 尝试 bounded steering 或 categorical steering，减少对推理后处理的依赖。
+
+中期：
+
+1. 复现 DonkeyCar 官方 LSTM/RNN 时序模型，而不是当前 GRU。
+2. 做整条路线 holdout 验证，避免随机切分验证集过于乐观。
+3. 尝试更系统的控制校准：不同速度下的 steering gain。
+
+长期：
+
+1. 收集图像数据训练 AE/VAE。
+2. 用 latent state 训练 SAC 或 TQC。
+3. 将 RL 策略和 BC baseline 做闭环对比。
+
+## 文件说明
+
+```text
+smoke_test.py      检查 Gymnasium 环境连接、图像、遥测和控制
+inspect_dataset.py 检查 Donkey tub 数据质量
+train_bc.py        单帧/帧堆叠 CNN 行为克隆训练
+eval_bc.py         单帧 CNN 闭环评估和控制校准
+train_bc_gru.py    GRU 行为克隆实验训练
+eval_bc_gru.py     GRU 闭环评估和尖峰诊断
+```
+
+## 不上传的数据
+
+以下目录被 `.gitignore` 忽略，不应进入普通 Git 仓库：
+
+```text
+data/
+models/
+runs/
+logs/
+*.pt
+*.pth
+```
+
+数据和模型如果需要共享，建议使用 Git LFS、Release artifact、网盘或单独的数据说明。
+
+## 参考
 
 - Donkey Car official autopilot workflow:
   https://docs.donkeycar.com/guide/train_autopilot/
-- Donkey Car command documentation, including `--type=rnn`:
+- Donkey Car command documentation:
   https://docs.donkeycar.com/utility/donkey/
-- Donkey Car Keras RNN model description:
-  https://donkeycar.cn/parts/keras/
-- Donkey Car simulator workflow:
+- Donkey Car Keras model descriptions:
+  https://docs.donkeycar.com/parts/keras/
+- Donkey Simulator workflow:
   https://docs.donkeycar.com/guide/deep_learning/simulator/
 - Gymnasium Donkey environment:
   https://github.com/tawnkramer/gym-donkeycar
-- Learning to Drive in a Day:
-  https://arxiv.org/abs/1807.00412
-- Donkey RL with AE/VAE and SAC/PPO:
-  https://github.com/ian0/donkeycar-rl
-- DDPG + VAE Donkey implementation:
-  https://github.com/r7vme/learning-to-drive-in-a-day
-- SB3/RL Zoo Donkey TQC model:
-  https://huggingface.co/araffin/tqc-donkey-avc-sparkfun-v0
