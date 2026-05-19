@@ -28,10 +28,19 @@ def init_frame_buffer(obs: np.ndarray) -> deque[np.ndarray]:
     return frame_buffer
 
 
-def decode_action(model, image_tensor: torch.Tensor, bin_centers: torch.Tensor, temperature: float) -> np.ndarray:
+def decode_action(
+    model,
+    image_tensor: torch.Tensor,
+    bin_centers: torch.Tensor,
+    temperature: float,
+    decode_mode: str,
+) -> np.ndarray:
     outputs = model(image_tensor)
     probs = torch.softmax(outputs["steer_logits"] / temperature, dim=-1)
-    steer = (probs * bin_centers).sum(dim=-1)
+    if decode_mode == "argmax":
+        steer = bin_centers[probs.argmax(dim=-1)]
+    else:
+        steer = (probs * bin_centers).sum(dim=-1)
     throttle = outputs["throttle_pred"].squeeze(-1)
     return torch.stack([steer, throttle], dim=-1).detach().cpu().numpy()[0]
 
@@ -47,7 +56,13 @@ def run_episode(env, model, device, bin_centers, args, episode_index: int, globa
 
     for local_step in range(args.max_episode_steps):
         with torch.no_grad():
-            pred = decode_action(model, preprocess(frame_buffer, device), bin_centers, args.temperature)
+            pred = decode_action(
+                model,
+                preprocess(frame_buffer, device),
+                bin_centers,
+                args.temperature,
+                args.decode_mode,
+            )
         action = clamp_action(
             pred,
             args.throttle_scale,
@@ -119,6 +134,7 @@ def main() -> None:
     parser.add_argument("--scene-reload-delay", type=float, default=3.0)
     parser.add_argument("--sleep", type=float, default=0.02)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--decode-mode", choices=["expectation", "argmax"], default="expectation")
     parser.add_argument("--throttle-scale", type=float, default=1.0)
     parser.add_argument("--throttle-min", type=float, default=0.0)
     parser.add_argument("--throttle-max", type=float, default=1.0)
@@ -156,7 +172,7 @@ def main() -> None:
     print(f"model: {args.model}")
     print(f"bin_centers: {bin_centers_np.tolist()}")
     print(
-        f"temperature: {args.temperature} steering_scale: {args.steering_scale} "
+        f"decode_mode: {args.decode_mode} temperature: {args.temperature} steering_scale: {args.steering_scale} "
         f"steering_limit: {args.steering_limit} throttle_max: {args.throttle_max}"
     )
     print(f"env: {args.env_id} {args.host}:{args.port}")
