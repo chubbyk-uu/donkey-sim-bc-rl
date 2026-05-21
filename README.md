@@ -45,32 +45,41 @@ max_cte_error:       2.0
 reward:              alive(1.0) + 0.1 * (thr/max_thr); crash = -10 - 5 * norm_thr
 train_freq:          (1, "episode")
 gradient_steps:      -1               # = episode_timesteps
-max_episode_steps:   3000             # TimeLimit 间接给 gradient_steps 上限
+gradient_steps_cap:  600              # 每次训练 ≤ 600 次 update
+max_episode_steps:   3000             # TimeLimit 截断长 episode
 learning_starts:     300
 buffer_size:         30000
 batch_size:          64
 ent_coef:            auto_0.1
 ```
 
+> **Note**：这次 SAC v1 baseline 实际跑的时候 **没传** `--gradient-steps-cap`（当时默认是
+> `None`，即无 cap）。所以那次跑的有效 cap 是 3000（max_episode_steps），不是 600。
+> 现在脚本默认已改为 600 ，下一次跑就是预期 schedule。两者训练曲线接近，差异在 ~5%
+> n_updates 范围内（28781 vs 22678），不影响这次 baseline 的结论。
+
 #### 训练 schedule 设计（关键）
 
-**核心规则**：更新次数 = 当前 episode 长度，上限由 `max_episode_steps` 间接施加。
+**核心规则**：每次训练的 update 次数 = `min(episode_length, 600)`。
+即 `gradient_steps=-1`（动态取 ep_len）+ `gradient_steps_cap=600`（封顶 600）。
 
 ```text
 ep_len = 36   ->  36 次 update
 ep_len = 300  ->  300 次 update
-ep_len = 1000 ->  1000 次 update
-ep_len = 3000 ->  3000 次 update     (TimeLimit 截断后给上限)
+ep_len = 600  ->  600 次 update
+ep_len = 1500 ->  600 次 update     (capped)
+ep_len = 3000 ->  600 次 update     (capped; ep 同时被 TimeLimit 截断)
 ```
 
-驾驶:训练 wall-time ratio 恒定约 **3:1**（~10Hz sim + ~30ms/update），任何 episode 长度
-下体感节奏接近。
+设计意图：
 
-要紧的上限可加：
+- **早期** ep_len 短 → 少更新，避免在乱开数据上过拟
+- **晚期** ep_len 长 → 600 次封顶，避免单次训练几十秒卡顿
+- 在 ep_len ≤ 600 区间内保持 1:1 ratio，driving:training wall-time 约 **3:1**
+  （~10Hz sim + ~30ms/update）
 
-```bash
---gradient-steps-cap N    # gradient_steps = min(ep_len, N)
-```
+要禁用 cap（纯 1:1）：传 `--gradient-steps-cap 0`。要换成 Raffin 原版固定 600（无论 ep 多长）：
+传 `--gradient-steps 600 --gradient-steps-cap 0`。
 
 #### 调参教训（已写入 memory）
 

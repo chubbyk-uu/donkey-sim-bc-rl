@@ -296,8 +296,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gradient-steps-cap",
         type=int,
-        default=None,
-        help="If set, gradient_steps becomes min(episode_length, cap) per training cycle. Overrides --gradient-steps.",
+        default=600,
+        help="gradient_steps becomes min(episode_length, cap) per training cycle. "
+             "Default 600 matches the intended Raffin-style schedule (proportional updates with a 600 ceiling). "
+             "Pass 0 or a negative value to disable the cap.",
     )
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--ent-coef", default="auto_0.1")
@@ -374,7 +376,7 @@ def main() -> None:
         ),
         DonkeyInfoCallback(),
     ]
-    if args.gradient_steps_cap is not None:
+    if args.gradient_steps_cap is not None and args.gradient_steps_cap > 0:
         callbacks.append(CappedDynamicGradientStepsCallback(cap=args.gradient_steps_cap))
 
     try:
