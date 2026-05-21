@@ -56,3 +56,6 @@ gym-donkeycar/
 # Codex/local agent metadata
 .codex/
 .agents/
+.claude/
+.antigravitycli/
+GEMINI.md

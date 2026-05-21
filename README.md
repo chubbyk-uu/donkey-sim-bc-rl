@@ -1,7 +1,9 @@
 # Donkey Simulator BC/RL 实验
 
-这个仓库用于在 WSL2 中训练和评估 Donkey Simulator 自动驾驶模型。当前主线是
-`generated_road` 场景上的行为克隆（Behavior Cloning, BC），强化学习路线暂未正式开始。
+这个仓库用于在 WSL2 中训练和评估 Donkey Simulator 自动驾驶模型。BC 已经得到一个
+可用的 `generated_road` baseline；当前主线转向强化学习，目标是尽量复现
+Antonin Raffin 的 Donkey/RL 方法：先用图像训练 AE/VAE 得到 latent state，再在
+latent state + 最近动作历史上训练 SAC/TQC。
 
 Windows 端运行 Donkey Simulator，WSL2 端运行训练和评估：
 
@@ -10,6 +12,8 @@ WSL2 Python -> 127.0.0.1:9091 -> Windows Donkey Simulator
 ```
 
 ## 当前结论
+
+### BC baseline
 
 当前最好模型是 official-style categorical steering：
 
@@ -61,6 +65,31 @@ mini_monaco:     508 steps, failed
 
 结论是当前模型主要适配 `generated_road` 的视觉分布。要跑其它固定地图，需要录对应地图数据并微调。
 
+### RL 当前状态
+
+当前 RL 脚本在 `rl/` 下，方向是 Raffin-style SAC：
+
+```text
+rl/donkey_sac_env.py          Donkey Gym wrapper + Raffin-style reward
+rl/train_bc_feature_sac.py    SAC 训练入口，支持 BC CNN feature init
+```
+
+已经尝试过几条 RL 路线：
+
+1. **BC CNN feature init + SAC**：用 regression BC 的 CNN/trunk 初始化 SAC actor/critic 的图像特征提取器。
+2. **直接 pixel feature SAC**：可以学习，但早期探索和 reward shaping 很敏感。
+3. **centerline reward / safe_cte=0 / CTE 连续惩罚**：理论上更像“走中线”，但早期奖励过稀疏，效果不如先学会往前开。
+4. **Raffin-style 简化 reward**：`alive + throttle bonus`，`terminal_cte` 触发失败，失败时按 throttle 加重惩罚。测试中能较快跑远，但仍有明显蛇形。
+
+目前判断：不要一开始就强行优化中线。RL 第一阶段应该先复现 Raffin 的稳定 baseline：
+
+```text
+image -> VAE encoder -> latent state
+latent state + last actions -> SAC/TQC policy
+```
+
+等它能稳定跑远后，再逐步加入 CTE 约束、steering 平滑或恢复驾驶数据。
+
 ## 环境
 
 已验证环境：
@@ -97,6 +126,10 @@ bc/
 tools/
   extract_cornering_segments.py       从原始 tub 抽取大弯片段
   diag_official_categorical.py        official categorical 诊断
+
+rl/
+  donkey_sac_env.py                   Donkey Gym wrapper + RL reward
+  train_bc_feature_sac.py             当前 SAC 训练脚本（过渡版）
 
 data/
   slow_data_raw/slow_data/            当前 6 条正常慢速 generated_road 数据
@@ -279,6 +312,38 @@ GRU 路线暂停。离线 loss 很低，但闭环时会产生异常转向尖峰�
 旧 21-bin soft-label categorical 路线也暂停。它用 expectation 解码时容易压尾；
 argmax 又受软标签和细 bin 影响，最终不如 official-style hard-bin 方案。
 
+## 已尝试且暂不重做
+
+### 9-bin + sampler_weight_max=6
+
+```text
+model: models/bc_official_categorical_9bin_sampler6_300/best.pt
+val_loss = 0.4566 (优于 v1 11-bin 的 0.5338)
+val_steer_acc = 0.8981 (优于 v1 的 0.8733)
+diagnostics: tail bin (±0.622) calibration 接近完美 (diff +0 / -3)
+```
+
+闭环却比 11-bin v1 差：
+
+```text
+scale 1.0: ep0 2000, ep1 fail@636
+scale 1.2: ep0 fail@1147
+scale 1.4: ep0 2000, ep1 2000, ep2 fail@743 (mean 1581)
+```
+
+原因：
+
+1. bin 数减少 → dead zone 拓宽（±0.078 vs ±0.067）+ 决策粒度变粗
+2. sampler clip 把 ±0.4/±0.5/±0.6 当成同档训练，模型把中等角度向激进方向偏
+   （±0.311 over-predict +12%，median |pred| > median |true|）
+3. 视觉 OOD 后恢复变成"晚一点、猛一点"，闭环里更容易甩
+
+更重要的结论：**val_loss / val_steer_acc 不能作为闭环性能的代理**。
+9-bin 全面优于 v1 的 val 指标，但闭环更差。后续超参选择不应再单看 val。
+
+回归 11-bin 主线。如果还想用 sampler 这个 lever，提高 `sampler_weight_max`
+（10 ~ 15）而不是减 bin。
+
 ## 指标解释
 
 评估时主要看：
@@ -304,21 +369,21 @@ max_abs_cte: 最大中心线偏移
 
 短期：
 
-1. 用 `1.4/0.1` 和 `1.5/0.2` 各跑更多随机 generated road，统计失败率。
-2. 对失败路线截图/标注，区分正常急弯、交叉闪烁、视觉 OOD。
-3. 继续补录 generated road 中模型失败类型的数据，尤其偏离恢复和大弯。
+1. 固化当前 RL 过渡脚本，保留 Raffin-style reward 作为对照 baseline。
+2. 清理失败 RL 输出，只提交源码和文档，不提交 `models/`、`data/`。
+3. 准备 VAE 数据集读取脚本，复用现有 generated_road 图像数据。
 
 中期：
 
-1. 如果想跑 `warren`、`mini_monaco`、`generated_track`，需要录这些地图的数据并 fine-tune。
-2. 尝试预测 future steering 或加入 last_action，减少当前单帧策略的滞后。
-3. 做 holdout route 验证，避免随机 val split 过于乐观。
+1. 训练 AE/VAE，确认 reconstruction 质量和 latent 维度。
+2. 用 frozen VAE encoder 输出 latent state，拼接最近动作历史，训练 SAC。
+3. 对比三条路线：BC-only、BC feature init SAC、VAE latent SAC。
 
 长期：
 
-1. 采集图像数据训练 AE/VAE。
-2. 用 latent state 做 SAC 或 TQC。
-3. 用 BC 模型作为 RL warm start 或教师策略，对比闭环表现。
+1. 在 VAE latent 上尝试 TQC。
+2. 尝试多进程/多 simulator 并行采样，提高 RL 采样效率。
+3. 如果要跨地图泛化，再补录 `warren`、`mini_monaco`、`generated_track` 并做 domain randomization。
 
 ## 清理策略
 
@@ -349,6 +414,7 @@ models/bc_official_categorical_curve_aug_balanced_v1/
 ## 参考
 
 - Gymnasium Donkey environment: https://github.com/tawnkramer/gym-donkeycar
+- Raffin Donkey RL article: https://medium.com/data-science/learning-to-drive-smoothly-in-minutes-450a7cdb35f4
 - Donkey Car autopilot workflow: https://docs.donkeycar.com/guide/train_autopilot/
 - Donkey Car Keras model descriptions: https://docs.donkeycar.com/parts/keras/
 - Donkey Simulator workflow: https://docs.donkeycar.com/guide/deep_learning/simulator/
