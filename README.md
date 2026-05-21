@@ -78,10 +78,11 @@ rl/train_bc_feature_sac.py    SAC 训练入口，支持 BC CNN feature init
 
 1. **BC CNN feature init + SAC**：用 regression BC 的 CNN/trunk 初始化 SAC actor/critic 的图像特征提取器。
 2. **直接 pixel feature SAC**：可以学习，但早期探索和 reward shaping 很敏感。
-3. **centerline reward / safe_cte=0 / CTE 连续惩罚**：理论上更像“走中线”，但早期奖励过稀疏，效果不如先学会往前开。
+3. **centerline reward / safe_cte=0 / CTE 连续惩罚**：会强迫策略贴 simulator 的参考轨迹。后续观察确认
+   `cte=0` 不是两车道中间黄线，而是右侧车道中心，因此这不等于“走中线”；同时早期奖励过稀疏，效果不如先学会往前开。
 4. **Raffin-style 简化 reward**：`alive + throttle bonus`，`terminal_cte` 触发失败，失败时按 throttle 加重惩罚。测试中能较快跑远，但仍有明显蛇形。
 
-目前判断：不要一开始就强行优化中线。RL 第一阶段应该先复现 Raffin 的稳定 baseline：
+目前判断：不要一开始就强行优化 `cte -> 0`。RL 第一阶段应该先复现 Raffin 的稳定 baseline：
 
 ```text
 image -> VAE encoder -> latent state
@@ -172,6 +173,7 @@ curated corner frames: 5171
 - 使用 `generated_road -> manual driving -> w Rec`。
 - 慢速、稳定驾驶，避免撞车、停住后乱打方向。
 - 可以按自己的 racing line 切内线，不必严格贴黄线中心。
+- `cte=0` 对应 simulator 的参考轨迹，目前观察是在右侧车道中心，不是两车道中间黄线。
 - 风格要一致。
 - 每条路线可以混入少量恢复驾驶。
 - 普通训练数据尽量避开 generated road 的交叉/闪烁路线；交叉/闪烁先当 OOD。
@@ -356,8 +358,10 @@ mean_abs_cte: 平均中心线偏移
 max_abs_cte: 最大中心线偏移
 ```
 
-`CTE` 是 cross-track error。`abs(cte)` 越大越靠边，当前 simulator 通常在
-`abs(cte) ~= 8` 附近失败。切内线驾驶时 CTE 不必追求 0，优先级是：
+`CTE` 是 cross-track error。当前 `generated_road` 中，`cte=0` 对应 simulator 的参考轨迹，
+目前观察是在右侧车道中心，不是两车道中间黄线。因此 `abs(cte)` 不能简单理解为“离黄线多远”，
+更适合作为“离参考轨迹多远”的软指标。当前 simulator 通常在 `abs(cte) ~= 8` 附近失败。
+切内线驾驶时 CTE 不必追求 0，优先级是：
 
 ```text
 1. 不出界
