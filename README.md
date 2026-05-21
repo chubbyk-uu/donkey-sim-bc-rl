@@ -133,17 +133,25 @@ SAC critic 前 1-2k 步会轻度退化。今后启动**默认就该加**：
 
 ### BC baseline（历史）
 
-历史主线，留作对照。最好模型 `models/bc_official_categorical_curve_aug_balanced_v1/best.pt`，
-decode = argmax，`steering_scale 1.4`，`steer_smoothing 0.1`：
+历史主线，留作对照。**闭环最稳的是 regression CNN baseline** `models/bc_nvidia_slow_006_flip/best.pt`
+（实测比 categorical 路线更稳）：
 
 ```text
-1.4 / 0.1:  steps_mean 2000, mean_abs_cte 1.754   # 推荐
+val_loss = 0.002038
+eval:  steering_scale=1.8, steering_limit=0.8, throttle_max=0.35
+```
+
+categorical 路线 `models/bc_official_categorical_curve_aug_balanced_v1/best.pt`（decode=argmax）
+有完整的闭环 sweep 数据，但实测不如 regression 稳：
+
+```text
+1.4 / 0.1:  steps_mean 2000, mean_abs_cte 1.754   # categorical 内最好的组合
 1.5 / 0.2:  steps_mean 2000, mean_abs_cte 1.901
 1.4 / 0.2:  steps_mean 2000, mean_abs_cte 2.299
 ```
 
-跨地图泛化差（warren / generated_track / mini_monaco 全 fail < 600 步），主要适配
-generated_road 的视觉分布。
+两条路线跨地图泛化都差（warren / generated_track / mini_monaco 全 fail < 600 步），
+主要适配 generated_road 的视觉分布。
 
 ## 环境
 
@@ -301,7 +309,27 @@ python tools/extract_cornering_segments.py \
   --min-trigger-frames 1
 ```
 
-### 训练 categorical（BC 最优）
+### 训练 regression CNN（闭环最稳）
+
+```bash
+python bc/train_bc.py \
+  --data-dir \
+    data/slow_data_raw/slow_data/road1 \
+    data/slow_data_raw/slow_data/road2 \
+    data/slow_data_raw/slow_data/road3 \
+    data/slow_data_raw/slow_data/road4 \
+    data/slow_data_raw/slow_data/road5 \
+    data/slow_data_raw/slow_data/road6 \
+    data/curated_cornering_v1_clean/corner_* \
+    data/curated_cornering_v2_clean/corner_* \
+  --output-dir models/bc_nvidia_slow_006_flip \
+  --flip-prob 0.5 \
+  --epochs 200
+```
+
+结果：`val_loss = 0.002038, best_epoch = 113`。同一份数据也用来初始化 categorical 路线的 CNN encoder。
+
+### 训练 categorical（替代尝试）
 
 ```bash
 python bc/train_bc_official_categorical.py \
@@ -341,7 +369,23 @@ val_steer_acc = 0.8733
 steer_mae     = 0.0330
 ```
 
-### 评估
+### 评估 regression（闭环最稳）
+
+```bash
+python bc/eval_bc.py \
+  --env-id donkey-generated-roads-v0 \
+  --model models/bc_nvidia_slow_006_flip/best.pt \
+  --episodes 3 \
+  --max-episode-steps 2000 \
+  --exit-scene-between-episodes \
+  --scene-reload-delay 3 \
+  --steering-scale 1.8 \
+  --steering-limit 0.8 \
+  --throttle-max 0.35 \
+  --sleep 0.02
+```
+
+### 评估 categorical（替代尝试）
 
 ```bash
 python bc/eval_bc_official_categorical.py \
@@ -358,10 +402,10 @@ python bc/eval_bc_official_categorical.py \
   --sleep 0.02
 ```
 
-参数：
+参数说明：
 
 ```text
-steering_scale: 放大 categorical bin center
+steering_scale: 放大模型输出（categorical 也对 bin center 起作用）
 steer_smoothing: EMA 平滑（小=快、大=稳）
 throttle_max: 评估时允许 throttle head 输出到训练范围外的上限
 exit_scene_between_episodes: 每轮 exit 场景，强制刷新 generated_road
@@ -373,8 +417,6 @@ Unity 侧 generated_road 生成不能被 `--seed` 稳定复现（脚本有 `--se
 
 ### BC 其他历史路线
 
-- **Regression CNN baseline** (`models/bc_nvidia_slow_006_flip/best.pt`)：val_loss 0.002038，
-  保留作为 categorical CNN encoder 初始化用。`bc/train_bc.py` + `bc/eval_bc.py` 仍在仓库。
 - **GRU**（已删脚本）：离线 loss 低但闭环异常转向尖峰。
 - **旧 21-bin soft-label categorical**（已删脚本）：expectation 解码压尾，argmax 受软标签影响，
   不如 11-bin hard-bin。
