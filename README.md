@@ -103,7 +103,13 @@ step 30464:  ep_len 303  rew 316  max episode 1436 步
 
 #### 评估结果
 
-固定训练 track 上最长 episode 1436 步（≈143 秒不撞），跑完整条路约 75% 命中率。
+固定训练 track 是非环形道路。训练后期最后 10 个 episode 的长度为：
+
+```text
+1415, 1306, 1426, 1436, 342, 1402, 1071, 1394, 1421, 1417
+```
+
+其中至少 7 个 episode 达到 1390+ step，确认已跑完整条路；342 step 是明显失败样本。
 
 切到新生成的 procedural road（含交叉口）后 7 次评估：
 
@@ -130,6 +136,75 @@ SAC critic 前 1-2k 步会轻度退化。今后启动**默认就该加**：
 ```bash
 --save-replay-buffer --save-final-replay-buffer
 ```
+
+#### 继续训练实验（2026-05-22）
+
+原 `0.4~0.6 / max_steering_diff=0.15` 模型已经接近当前 generated_road 设置下的局部上限。
+继续训练和单独放宽 steering diff 都没有带来明确提升。
+
+`models/rl_vae_sac_raffin_diff020_v1/`（已删除）：
+
+```text
+resume:              models/rl_vae_sac_raffin_v1/final_model.zip
+throttle:            0.4 / 0.6
+max_steering_diff:   0.2
+train steps:         16169
+train lens:          1453, 1370, 1408, 1413, 1391, 823, 1371, 1383, 1385, 1408, 1360, 1404
+>=1390:              6/12
+>=1000:              11/12
+eval:                202, 1393, 1386
+```
+
+结论：`diff=0.2` 有两集接近跑完，但出现 202 步早崩，不比 `diff=0.15` 主模型稳定。
+
+`models/rl_vae_sac_raffin_resume_010k_v1/`：
+
+```text
+resume:              models/rl_vae_sac_raffin_v1/final_model.zip
+throttle:            0.4 / 0.6
+max_steering_diff:   0.15
+train steps:         10585
+train lens:          1406, 1405, 635, 1387, 1393, 1395, 165, 1405, 1394
+>=1390:              6/9
+>=1000:              7/9
+```
+
+结论：成功率和原模型接近，但仍有 635 / 165 这类短失败；继续同配置训练的边际收益很小。
+当前问题更像是 generated_road 非环形、终点信号缺失、随机交叉/闪烁 OOD、VAE 只覆盖 generated_road
+视觉域共同造成的局部瓶颈，不是单纯训练步数不足。
+
+### 下一条 RL 主线：generated_track 专用 VAE + SAC
+
+generated_track 和 generated_road 视觉环境差异很大，**不要把两个域的图像混在同一个 VAE 里训练**。
+如果 RL 切到 generated_track，应单独采集 generated_track 图像，训练专用 VAE，再从零训练该赛道的 SAC。
+
+采图脚本：
+
+```bash
+python tools/collect_sim_frames.py \
+    --output-dir data/vae_raw/generated_track_pid_kp7_kd20_t012
+```
+
+`tools/collect_sim_frames.py` 的默认采图配置已经设为当前手调可用参数：
+
+```text
+env_id:              donkey-generated-track-v0
+action_mode:         cte-pid
+frames:              30000
+max_episode_steps:   3000
+pid_kp / kd / ki:    7 / 20 / 0
+throttle:            0.12
+steer_limit:         1.0
+```
+
+注意：
+
+- 这个脚本会通过 gym-donkeycar 建立 WSL 客户端车，并用外部 CTE PID 控制车；sim UI 里的内置 PID
+  没有通过 gym TCP API 暴露给 WSL。
+- 采图只用于 VAE，动作质量不需要达到 BC 训练标准；关键是覆盖 generated_track 的道路、弯道、边界和偏离视角。
+- 先录 30000 帧（约 25-30 分钟）。如果 generated_track VAE 重建或 SAC 学习不稳，再追加到 50000 帧。
+- 之后用 `tools/prepare_vae_dataset.py` 和 `tools/build_vae_cache.py` 对该目录单独建 manifest/cache，
+  训练 `models/vae_generated_track_v1/`，再训练 `models/rl_vae_sac_generated_track_v1/`。
 
 ### BC baseline（历史）
 
@@ -189,6 +264,7 @@ bc/                                  BC 历史 baseline
 tools/
   build_vae_cache.py                  uint8 memmap cache 构建
   prepare_vae_dataset.py              扫描图像生成 train/val manifest
+  collect_sim_frames.py               WSL 客户端车自动采集 VAE 图像
   extract_cornering_segments.py       从原始 tub 抽取大弯片段（BC 用）
   diag_official_categorical.py        BC categorical 诊断
 
@@ -450,19 +526,19 @@ cte=0 是右车道中心（非两车道黄线）。simulator 通常在 abs(cte)~
 
 短期：
 
-1. resume 当前 SAC 继续训练（buffer 已丢，前 1-2k 步会轻度退化）。
-2. 加完成检测启发式 / completion reward，看 agent 行为是否往"主动冲终点"偏移。
-3. VAE-SAC vs BC categorical 在固定 generated_road 上的稳定性 / 平滑度对比。
+1. 采集 generated_track 专用 VAE 图像：`tools/collect_sim_frames.py` 默认 PID 参数录 30000 帧。
+2. 用 generated_track 图像单独训练 `vae_generated_track_v1`，不要混 generated_road 图像。
+3. 用新 VAE 从零训练 `rl_vae_sac_generated_track_v1`，优先利用环形道避免 generated_road 的终点/存活奖励冲突。
 
 中期：
 
-1. 解决 intersection OOD：补 VAE 数据 → 重训 VAE → 重训 SAC。
-2. 在 VAE latent 上尝试 TQC。
-3. waypoint / goal conditioning，让 policy 在交叉口能选定方向。
+1. 对比 generated_track SAC 和 generated_road SAC 的稳定性、蛇形程度、速度上限。
+2. 在 generated_track VAE latent 上尝试 TQC。
+3. 如果回到 generated_road，再考虑 completion proxy / waypoint conditioning 解决非环形终点和交叉口问题。
 
 长期：
 
-1. 跨地图泛化（warren / mini_monaco / generated_track 补数据，重训 VAE，domain randomization）。
+1. 跨地图泛化（warren / mini_monaco 等分别采图，按域训练或 domain randomization）。
 2. 多进程并行采样，提高 RL 采样效率。
 3. 闭环 TQC、SAC-fD（demo-augmented）等更高级方案。
 

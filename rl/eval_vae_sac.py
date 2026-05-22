@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import gymnasium as gym
@@ -9,6 +10,9 @@ import numpy as np
 import torch
 from gymnasium.wrappers import TimeLimit
 from stable_baselines3 import SAC
+
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from rl.train_vae_sac import (
     CAMERA_HEIGHT,
@@ -35,6 +39,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--port", type=int, default=9091)
     p.add_argument("--episodes", type=int, default=10)
     p.add_argument("--max-episode-steps", type=int, default=3000)
+    p.add_argument("--min-throttle", type=float, default=MIN_THROTTLE)
+    p.add_argument("--max-throttle", type=float, default=MAX_THROTTLE)
     p.add_argument("--deterministic", action="store_true", default=True)
     return p.parse_args()
 
@@ -49,8 +55,8 @@ def main() -> None:
     env = DonkeyVaeSACEnv(
         base_env,
         vae=vae,
-        min_throttle=MIN_THROTTLE,
-        max_throttle=MAX_THROTTLE,
+        min_throttle=args.min_throttle,
+        max_throttle=args.max_throttle,
         max_steering=MAX_STEERING,
         max_steering_diff=MAX_STEERING_DIFF,
         n_command_history=N_COMMAND_HISTORY,
