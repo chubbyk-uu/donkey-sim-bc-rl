@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -19,8 +20,8 @@ CAMERA_WIDTH = 160
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect camera frames from any gym-donkeycar scene.")
     parser.add_argument("--env-id", default="donkey-generated-track-v0")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=9091)
+    parser.add_argument("--host", default=os.environ.get("DONKEY_SIM_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("DONKEY_SIM_PORT", "9091")))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--frames", type=int, default=30000)
     parser.add_argument("--max-episode-steps", type=int, default=3000)
@@ -37,6 +38,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pid-kp", type=float, default=7.0)
     parser.add_argument("--pid-ki", type=float, default=0.0)
     parser.add_argument("--pid-kd", type=float, default=20.0)
+    parser.add_argument(
+        "--cte-target",
+        type=float,
+        default=0.0,
+        help="Target CTE for cte-pid mode. Non-zero values intentionally bias the car laterally.",
+    )
     parser.add_argument("--step-delay", type=float, default=0.0)
     parser.add_argument("--jpeg-quality", type=int, default=90)
     return parser.parse_args()
@@ -68,6 +75,7 @@ def choose_action(
     cte: float = 0.0,
     last_cte: float = 0.0,
     cte_integral: float = 0.0,
+    cte_target: float = 0.0,
     pid_kp: float = 7.0,
     pid_ki: float = 0.0,
     pid_kd: float = 20.0,
@@ -77,8 +85,10 @@ def choose_action(
     elif mode == "sweep":
         steer = steer_limit * np.sin(step / 45.0)
     elif mode == "cte-pid":
-        cte_delta = cte - last_cte
-        steer = -(pid_kp * cte + pid_ki * cte_integral + pid_kd * cte_delta)
+        cte_error = cte - cte_target
+        last_cte_error = last_cte - cte_target
+        cte_delta = cte_error - last_cte_error
+        steer = -(pid_kp * cte_error + pid_ki * cte_integral + pid_kd * cte_delta)
         steer = float(np.clip(steer, -steer_limit, steer_limit))
     else:
         steer = 0.92 * steer + rng.gauss(0.0, steer_noise)
@@ -116,7 +126,7 @@ def main() -> None:
             terminated = truncated = False
             while frame_count < args.frames and not (terminated or truncated):
                 cte = float(info.get("cte", 0.0))
-                cte_integral += cte
+                cte_integral += cte - args.cte_target
                 action, steer = choose_action(
                     args.action_mode,
                     episode_step,
@@ -128,6 +138,7 @@ def main() -> None:
                     cte=cte,
                     last_cte=last_cte,
                     cte_integral=cte_integral,
+                    cte_target=args.cte_target,
                     pid_kp=args.pid_kp,
                     pid_ki=args.pid_ki,
                     pid_kd=args.pid_kd,

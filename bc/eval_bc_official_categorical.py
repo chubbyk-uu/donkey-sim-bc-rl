@@ -1,6 +1,7 @@
 import argparse
 from collections import deque
 import hashlib
+import os
 import random
 import time
 from pathlib import Path
@@ -143,8 +144,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--env-id", default="donkey-generated-roads-v0")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=9091)
+    parser.add_argument("--host", default=os.environ.get("DONKEY_SIM_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("DONKEY_SIM_PORT", "9091")))
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max-episode-steps", type=int, default=1000)
     parser.add_argument("--exit-scene-between-episodes", action="store_true")

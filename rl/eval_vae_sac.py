@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -35,8 +36,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", type=Path, default=Path("models/rl_vae_sac_raffin_v1/final_model.zip"))
     p.add_argument("--vae-model", type=Path, default=Path("models/vae_raffin_v1/best.pt"))
     p.add_argument("--env-id", default="donkey-generated-roads-v0")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=9091)
+    p.add_argument("--host", default=os.environ.get("DONKEY_SIM_HOST", "127.0.0.1"))
+    p.add_argument("--port", type=int, default=int(os.environ.get("DONKEY_SIM_PORT", "9091")))
     p.add_argument("--episodes", type=int, default=10)
     p.add_argument("--max-episode-steps", type=int, default=3000)
     p.add_argument("--min-throttle", type=float, default=MIN_THROTTLE)
