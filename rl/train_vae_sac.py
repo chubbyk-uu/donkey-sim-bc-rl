@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import math
+import os
 from pathlib import Path
 
 import gymnasium as gym
@@ -36,6 +38,10 @@ MAX_CTE_ERROR = 2.0
 THROTTLE_REWARD_WEIGHT = 0.1
 REWARD_CRASH = -10.0
 CRASH_SPEED_WEIGHT = 5.0
+ALIVE_REWARD = 1.0
+SPEED_REWARD_WEIGHT = 0.0
+MIN_ALIVE_SPEED = 0.0
+PROGRESS_REWARD_WEIGHT = 0.0
 
 
 @dataclass
@@ -44,6 +50,11 @@ class RaffinRewardConfig:
     throttle_reward_weight: float = THROTTLE_REWARD_WEIGHT
     reward_crash: float = REWARD_CRASH
     crash_speed_weight: float = CRASH_SPEED_WEIGHT
+    alive_reward: float = ALIVE_REWARD
+    speed_reward_weight: float = SPEED_REWARD_WEIGHT
+    min_alive_speed: float = MIN_ALIVE_SPEED
+    progress_reward_weight: float = PROGRESS_REWARD_WEIGHT
+    cte_speed_penalty_weight: float = 0.0
 
 
 class FrozenVaeEncoder:
@@ -93,6 +104,7 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         self.n_command_history = n_command_history
         self.reward_config = reward_config or RaffinRewardConfig()
         self.command_history = np.zeros((self.n_command_history, 2), dtype=np.float32)
+        self.last_pos: tuple[float, float, float] | None = None
 
         self.action_space = gym.spaces.Box(
             low=np.array([-self.max_steering, -1.0], dtype=np.float32),
@@ -112,6 +124,7 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         self.command_history.fill(0.0)
         self.last_throttle = self.min_throttle
         obs, info = self.env.reset(**kwargs)
+        self.last_pos = None
         return self._build_obs(obs), info
 
     def step(self, action):
@@ -120,7 +133,8 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         executed = self._map_and_clip_action(raw_action)
         obs, original_reward, terminated, truncated, info = self.env.step(executed)
         terminated = self._is_game_over(terminated, info)
-        reward = self._calculate_reward(terminated, executed[1])
+        progress = self._calculate_progress(info)
+        reward = self._calculate_reward(terminated, executed[1], info, progress)
         self._push_history(executed)
 
         info = dict(info)
@@ -132,6 +146,7 @@ class DonkeyVaeSACEnv(gym.Wrapper):
                 "rl_steer_delta": float(executed[0]) - prev_steer,
                 "rl_throttle": float(executed[1]),
                 "abs_cte": abs(cte),
+                "delta_pos_distance": progress,
                 "vae_reward": reward,
             }
         )
@@ -167,25 +182,56 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         cte = abs(float(info.get("cte", 0.0)))
         return bool(terminated or cte > self.reward_config.max_cte_error)
 
-    def _calculate_reward(self, terminated: bool, throttle: float) -> float:
+    def _calculate_reward(self, terminated: bool, throttle: float, info: dict, progress: float) -> float:
         cfg = self.reward_config
+        speed = float(info.get("speed", 0.0))
         if terminated:
             norm_throttle = (throttle - self.min_throttle) / max(self.max_throttle - self.min_throttle, 1e-6)
-            return float(cfg.reward_crash - cfg.crash_speed_weight * norm_throttle)
+            crash_speed = speed if (cfg.speed_reward_weight > 0.0 or cfg.progress_reward_weight > 0.0) else norm_throttle
+            return float(cfg.reward_crash - cfg.crash_speed_weight * crash_speed)
+        progress_reward = cfg.progress_reward_weight * progress
         throttle_reward = cfg.throttle_reward_weight * (throttle / max(self.max_throttle, 1e-6))
-        return float(1.0 + throttle_reward)
+        speed_reward = cfg.speed_reward_weight * speed
+        abs_cte = abs(float(info.get("cte", 0.0)))
+        cte_speed_penalty = cfg.cte_speed_penalty_weight * abs_cte * speed
+        if cfg.min_alive_speed > 0.0:
+            alive_scale = float(np.clip(speed / cfg.min_alive_speed, 0.0, 1.0))
+        else:
+            alive_scale = 1.0
+        return float(
+            cfg.alive_reward * alive_scale + throttle_reward + speed_reward + progress_reward - cte_speed_penalty
+        )
+
+    def _calculate_progress(self, info: dict) -> float:
+        current_pos = self._extract_pos(info)
+        previous_pos = self.last_pos
+        self.last_pos = current_pos
+        if previous_pos is None or current_pos is None:
+            return 0.0
+        dx = current_pos[0] - previous_pos[0]
+        dz = current_pos[2] - previous_pos[2]
+        return float(math.hypot(dx, dz))
+
+    @staticmethod
+    def _extract_pos(info: dict) -> tuple[float, float, float] | None:
+        pos = info.get("pos")
+        if pos is None or len(pos) < 3:
+            return None
+        return float(pos[0]), float(pos[1]), float(pos[2])
 
 
 class CappedDynamicGradientStepsCallback(BaseCallback):
-    """gradient_steps = clamp(episode_length, [1, cap]).
+    """gradient_steps = clamp(episode_length, [floor, cap]).
 
     Used with train_freq=(1, 'episode'). Each training cycle scales updates with
-    collected data, but capped to prevent runaway compute on long episodes.
+    collected data, capped to prevent runaway compute on long episodes and
+    floored to guarantee a minimum amount of off-policy learning per cycle.
     """
 
-    def __init__(self, cap: int) -> None:
+    def __init__(self, cap: int, floor: int = 1) -> None:
         super().__init__()
         self.cap = cap
+        self.floor = max(1, int(floor))
         self._rollout_start_ts = 0
 
     def _on_rollout_start(self) -> None:
@@ -196,7 +242,7 @@ class CappedDynamicGradientStepsCallback(BaseCallback):
 
     def _on_rollout_end(self) -> None:
         ep_len = max(1, int(self.model.num_timesteps) - self._rollout_start_ts)
-        new_grads = max(1, min(ep_len, self.cap))
+        new_grads = max(self.floor, min(ep_len, self.cap))
         self.model.gradient_steps = new_grads
         self.logger.record("train/gradient_steps_used", new_grads)
         self.logger.record("train/rollout_ep_len", ep_len)
@@ -211,6 +257,7 @@ class DonkeyInfoCallback(BaseCallback):
         speeds = [float(info.get("speed", 0.0)) for info in infos]
         steers = [float(info["rl_steer"]) for info in infos if "rl_steer" in info]
         throttles = [float(info["rl_throttle"]) for info in infos if "rl_throttle" in info]
+        progresses = [float(info["delta_pos_distance"]) for info in infos if "delta_pos_distance" in info]
         if ctes:
             self.logger.record("donkey/abs_cte_mean", float(np.mean(ctes)))
             self.logger.record("donkey/abs_cte_max", float(np.max(ctes)))
@@ -223,6 +270,8 @@ class DonkeyInfoCallback(BaseCallback):
             self.logger.record("donkey/abs_steer_delta_mean", float(np.mean(deltas)))
         if throttles:
             self.logger.record("donkey/throttle_mean", float(np.mean(throttles)))
+        if progresses:
+            self.logger.record("donkey/progress_mean", float(np.mean(progresses)))
         return True
 
 
@@ -246,6 +295,11 @@ def build_env(args: argparse.Namespace, vae: FrozenVaeEncoder) -> gym.Env:
             throttle_reward_weight=args.throttle_reward_weight,
             reward_crash=args.reward_crash,
             crash_speed_weight=args.crash_speed_weight,
+            alive_reward=args.alive_reward,
+            speed_reward_weight=args.speed_reward_weight,
+            min_alive_speed=args.min_alive_speed,
+            progress_reward_weight=args.progress_reward_weight,
+            cte_speed_penalty_weight=getattr(args, "cte_speed_penalty_weight", 0.0),
         ),
     )
     env = TimeLimit(env, max_episode_steps=args.max_episode_steps)
@@ -255,8 +309,8 @@ def build_env(args: argparse.Namespace, vae: FrozenVaeEncoder) -> gym.Env:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Raffin-style SAC on frozen VAE latent observations.")
     parser.add_argument("--env-id", default="donkey-generated-roads-v0")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=9091)
+    parser.add_argument("--host", default=os.environ.get("DONKEY_SIM_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("DONKEY_SIM_PORT", "9091")))
     parser.add_argument("--vae-model", type=Path, default=Path("models/vae_raffin_v1/best.pt"))
     parser.add_argument("--output-dir", type=Path, default=Path("models/rl_vae_sac_raffin_v1"))
     parser.add_argument("--resume-model", type=Path, default=None)
@@ -274,6 +328,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--throttle-reward-weight", type=float, default=THROTTLE_REWARD_WEIGHT)
     parser.add_argument("--reward-crash", type=float, default=REWARD_CRASH)
     parser.add_argument("--crash-speed-weight", type=float, default=CRASH_SPEED_WEIGHT)
+    parser.add_argument("--alive-reward", type=float, default=ALIVE_REWARD)
+    parser.add_argument("--speed-reward-weight", type=float, default=SPEED_REWARD_WEIGHT)
+    parser.add_argument("--min-alive-speed", type=float, default=MIN_ALIVE_SPEED)
+    parser.add_argument("--progress-reward-weight", type=float, default=PROGRESS_REWARD_WEIGHT)
 
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--buffer-size", type=int, default=30_000)
