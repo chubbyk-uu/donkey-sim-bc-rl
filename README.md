@@ -48,15 +48,16 @@ Windows Donkey Simulator  <->  WSL2 Python client
                            TCP 9091
 ```
 
-Set the simulator host in WSL. For WSL2 talking to a Windows-hosted simulator, this is
-usually the Windows host IP visible from WSL:
+Set the simulator host in WSL. The Windows host IP visible from WSL2 changes per
+machine and even per boot, so derive it from the default route rather than hard-coding:
 
 ```bash
-export DONKEY_SIM_HOST=172.25.240.1
+export DONKEY_SIM_HOST="$(ip route | awk '/default/ {print $3}')"
 export DONKEY_SIM_PORT=9091
 ```
 
-Persist those in `~/.bashrc` if needed.
+Persist those in `~/.bashrc` if needed. Sanity check with `echo $DONKEY_SIM_HOST` and
+`nc -vz "$DONKEY_SIM_HOST" "$DONKEY_SIM_PORT"` once the simulator is running.
 
 ### Python
 
@@ -78,19 +79,25 @@ official PyTorch selector. The current experiments used CUDA on an RTX 4080 Lapt
 
 ### gym-donkeycar
 
-Do **not** install the old PyPI package with:
+Do **not** install the PyPI package:
 
 ```bash
-pip install gym-donkeycar
+pip install gym-donkeycar   # WRONG — old Gym API, incompatible
 ```
 
-That package is old and targets the older Gym API. This project uses Gymnasium-style
-training code and needs a compatible/local `gym_donkeycar` source checkout. Use the
-working source version for your simulator and install it editable, for example:
+The PyPI release lags behind upstream and still targets the old `gym` API. This project
+uses Gymnasium-style training code, so install from the upstream `tawnkramer/gym-donkeycar`
+repository as that project's own README recommends:
 
 ```bash
 pip uninstall -y gym-donkeycar
-git clone <compatible gym-donkeycar source> ../gym-donkeycar
+pip install git+https://github.com/tawnkramer/gym-donkeycar
+```
+
+If you want to edit the dependency locally instead, clone and install editable:
+
+```bash
+git clone https://github.com/tawnkramer/gym-donkeycar ../gym-donkeycar
 pip install -e ../gym-donkeycar
 ```
 
@@ -100,7 +107,8 @@ Sanity check:
 python -c "import gym_donkeycar; print(gym_donkeycar.__file__)"
 ```
 
-It should point to the editable source checkout, not an old site-packages PyPI install.
+It should point to the editable clone or the `git+https` install location, not an old
+site-packages PyPI install.
 
 ## Main Commands
 
