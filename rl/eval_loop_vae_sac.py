@@ -19,19 +19,21 @@ from rl.train_vae_sac import (
     CAMERA_HEIGHT,
     CAMERA_WIDTH,
     DonkeyVaeSACEnv,
-    FrozenVaeEncoder,
     MAX_STEERING,
     MAX_STEERING_DIFF,
     N_COMMAND_HISTORY,
     RaffinRewardConfig,
-    Z_SIZE,
+    make_encoder,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate VAE+SAC on the generated_track loop.")
     parser.add_argument("--model", type=Path, default=Path("models/rl_loop_vae_sac_v1/final_model.zip"))
-    parser.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_v1/best.pt"))
+    parser.add_argument("--encoder", choices=["vae", "resnet18", "mobilenet_v3_small"], default="vae",
+                        help="Image encoder. Must match what the SAC model was trained with.")
+    parser.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_v1/best.pt"),
+                        help="Only used when --encoder=vae.")
     parser.add_argument("--env-id", default="donkey-generated-track-v0")
     parser.add_argument("--host", default=os.environ.get("DONKEY_SIM_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("DONKEY_SIM_PORT", "9091")))
@@ -58,7 +60,8 @@ def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    vae = FrozenVaeEncoder(args.vae_model, device=device, z_size=Z_SIZE)
+    vae = make_encoder(args.encoder, device=device, vae_checkpoint=args.vae_model)
+    print(f"Encoder: {args.encoder}  z_size={vae.z_size}")
     conf = {"host": args.host, "port": args.port, "cam_resolution": (CAMERA_HEIGHT, CAMERA_WIDTH, 3)}
     base_env = gym.make(args.env_id, conf=conf)
     env = DonkeyVaeSACEnv(

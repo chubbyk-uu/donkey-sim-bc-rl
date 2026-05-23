@@ -1,10 +1,10 @@
 # Donkey Simulator BC/RL
 
 This repository contains behavioral cloning and reinforcement learning experiments for
-Donkey Simulator. The current working pipeline is a frozen VAE image encoder plus SAC
-policy trained from WSL2 against a Windows Donkey Simulator instance.
+Donkey Simulator. Training and evaluation run from WSL2 against a Windows Donkey
+Simulator instance.
 
-The best current result is on `donkey-generated-track-v0` loop track:
+The best historical result was on `donkey-generated-track-v0` loop track:
 
 ```text
 model:        models/rl_loop_vae_sac_safe_v2/sac_loop_vae_70000_steps.zip
@@ -16,6 +16,13 @@ mean |cte|:    0.333
 max |cte|:     1.715
 ```
 
+Important caveat: that VAE result was trained/evaluated while simulator random lighting
+was not controlled. On `generated_track`, `randomlight` changes the scene color tone
+between launches, so the old VAE checkpoint did not reliably reproduce the original
+eval when lighting changed. The old random-light loop VAE data, encoder, and dependent
+SAC models have therefore been removed. The next VAE loop run should recollect data
+with random lighting disabled.
+
 See [docs/experiment-log.md](docs/experiment-log.md) for the full BC, single-road RL,
 and loop-track RL experiment history.
 
@@ -25,7 +32,7 @@ The project goal is to learn reliable autonomous driving policies in Donkey Simu
 starting from image observations:
 
 ```text
-camera image -> crop top 40 px -> VAE latent -> SAC policy -> steer/throttle
+camera image -> crop top 40 px -> encoder latent/features -> SAC policy -> steer/throttle
 ```
 
 Two RL environments are tracked separately:
@@ -34,10 +41,14 @@ Two RL environments are tracked separately:
   VAE+SAC baseline can drive most of the fixed route, but the route is not a closed
   loop and intersection/generalization behavior is weak.
 - `donkey-generated-track-v0`: a closed loop track. This is the current main branch.
-  It uses a loop-specific VAE and the `safe_v2` SAC reward.
+  The old loop-specific VAE branch is being reset because its data used uncontrolled
+  random lighting. The currently retained loop checkpoint uses a frozen ResNet18
+  encoder; the next VAE branch should be trained from newly collected fixed-light data.
 
-BC models are kept as historical baselines and diagnostics, but the current deployment
-candidate is the loop-track VAE+SAC policy.
+BC models are kept as historical baselines and diagnostics. The historical strongest
+loop result was VAE+SAC under matched lighting, while the retained frozen ResNet encoder
+branch is slower but avoids VAE image collection and appears less sensitive to visual
+setup changes.
 
 ## Environment Setup
 
@@ -112,35 +123,38 @@ site-packages PyPI install.
 
 ## Main Commands
 
-Evaluate the current best loop-track policy:
+Evaluate the retained loop-track ResNet policy:
 
 ```bash
 python rl/eval_loop_vae_sac.py \
-  --model models/rl_loop_vae_sac_safe_v2/sac_loop_vae_70000_steps.zip \
+  --encoder resnet18 \
+  --hidden-size 256 \
+  --model models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip \
   --episodes 5
 ```
 
-Resume loop-track SAC training from the preserved `speed_v1` 20k seed:
+Train a new fixed-light loop VAE branch after recollecting images:
+
+```bash
+python tools/collect_sim_frames.py ...
+python tools/prepare_vae_dataset.py ...
+python tools/build_vae_cache.py ...
+python rl/train_vae.py \
+  --cache-dir data/vae/cache_loop_cones_fixedlight_v1 \
+  --output-dir models/vae_loop_cones_fixedlight_v1 \
+  --epochs 20
+```
+
+Then train SAC on the new VAE:
 
 ```bash
 python rl/train_loop_vae_sac.py \
-  --output-dir models/rl_loop_vae_sac_safe_v2 \
-  --resume-model models/rl_loop_vae_sac_speed_v1/sac_loop_vae_20000_steps.zip \
+  --vae-model models/vae_loop_cones_fixedlight_v1/best.pt \
+  --output-dir models/rl_loop_vae_sac_fixedlight_v1 \
   --timesteps 70000 \
   --save-replay-buffer \
   --save-final-replay-buffer \
   --device cuda
-```
-
-Note: stop at ~70k. Continuing past 70k under this reward reliably degrades — by 80k the
-policy starts crashing on some episodes, by 90k it collapses. See
-[Practical Pitfalls](docs/experiment-log.md#6-practical-pitfalls).
-
-Inspect a saved replay buffer (recent-15 episode picture of policy at that checkpoint):
-
-```bash
-python tools/inspect_loop_replay_throttle.py \
-  --buffer models/rl_loop_vae_sac_safe_v2/sac_loop_vae_replay_buffer_70000_steps.pkl
 ```
 
 Evaluate the original single-road VAE+SAC baseline:
@@ -155,24 +169,23 @@ python rl/eval_vae_sac.py \
 
 ### Loop Track
 
-Current deployment checkpoint:
+Historical best checkpoint, now removed from `models/`:
 
 ```text
 models/rl_loop_vae_sac_safe_v2/sac_loop_vae_70000_steps.zip
 ```
 
-Related preserved artifacts:
+It was removed together with its random-light VAE encoder:
 
 ```text
 models/vae_loop_cones_v1/best.pt
-models/rl_loop_vae_sac_safe_v2/sac_loop_vae_30000_steps.zip
-models/rl_loop_vae_sac_safe_v2/sac_loop_vae_40000_steps.zip
-models/rl_loop_vae_sac_safe_v2/sac_loop_vae_50000_steps.zip
-models/rl_loop_vae_sac_safe_v2/sac_loop_vae_60000_steps.zip
-models/rl_loop_vae_sac_safe_v2/sac_loop_vae_70000_steps.zip
-models/rl_loop_vae_sac_speed_v1/sac_loop_vae_20000_steps.zip
-models/rl_loop_vae_sac_speed_v1/sac_loop_vae_replay_buffer_20000_steps.pkl
+models/rl_loop_vae_sac_safe_v2/
+models/rl_loop_vae_sac_speed_v1/
 ```
+
+The historical result is documented in
+[docs/experiment-log.md](docs/experiment-log.md), but it should be treated as a
+non-current artifact because lighting was not controlled.
 
 `safe_v2` reward defaults:
 
@@ -201,6 +214,18 @@ The matching CLI flags (already the defaults in `rl/train_loop_vae_sac.py`):
 --gradient-steps-cap 1000
 --gradient-steps-min 500
 ```
+
+Newer ResNet encoder branch:
+
+```text
+encoder:       frozen ImageNet ResNet18
+SAC hidden:    256 (VAE safe_v2 used 64)
+best so far:   models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip
+eval:          3/3 truncate, mean speed 2.131, progress 319.5, mean |cte| 0.424
+tradeoff:      no VAE image collection, but about 27% slower than VAE safe_v2 70k
+```
+
+This is the only retained loop-track checkpoint family at the moment.
 
 ### Single Generated Road
 
@@ -240,4 +265,44 @@ tools/build_vae_cache.py
 tools/inspect_loop_replay_throttle.py   per-episode throttle/cte analysis from a saved SAC replay buffer
 logs/                                   saved eval/train logs
 docs/experiment-log.md                  detailed experiment history
+```
+
+## Current Data And Model Inventory
+
+`data/` currently keeps only BC data and compressed raw backups. The old random-light
+loop VAE images and manifests were removed so the next loop VAE run starts clean.
+
+```text
+data/slow_data_raw/
+  Six slow generated-road tubs used by the BC regression/categorical baselines.
+
+data/curated_cornering_v1_clean/
+  First curated cornering subset used to improve BC recovery behavior.
+
+data/curated_cornering_v2_clean/
+  Second curated cornering subset used by the official-style categorical BC branch.
+
+data/Cornering data.zip
+data/cornorraw.zip
+  Compressed backups of raw cornering data. The extracted copies were removed.
+```
+
+`models/` currently contains:
+
+```text
+models/bc_nvidia_slow_006_flip/
+  Best BC regression baseline. Closed-loop steering needs about 1.8x scale.
+
+models/bc_official_categorical_curve_aug_balanced_v1/
+  Best retained BC categorical baseline. Closed-loop steering needs about 1.4x scale.
+
+models/vae_raffin_v1/
+  Generated-road VAE encoder for the original single-road RL baseline.
+
+models/rl_vae_sac_raffin_v1/
+  Generated-road SAC policy using models/vae_raffin_v1.
+
+models/rl_loop_vae_sac_resnet_v4_notrees/
+  Retained loop-track SAC branch using frozen ResNet18 features. Best checkpoint so far:
+  sac_loop_vae_50000_steps.zip.
 ```

@@ -423,6 +423,26 @@ VAE data lessons:
 - Include lateral offsets. Center-only data is too narrow for recovery behavior.
 - Offsets must respect the actual lane geometry. `+1.5` already touches the right white
   line in this track; `+2.5` was too aggressive.
+- **Lighting must be controlled.** In the original loop VAE work, simulator
+  `randomlight` was left enabled. On `generated_track`, that changes color tone between
+  simulator launches. It is therefore unclear whether the VAE training images, RL
+  training run, and later evals used the same lighting distribution. This likely
+  explains why `safe_v2 70k` sometimes fails to reproduce the original 5/5 truncate
+  result in later eval sessions.
+
+Artifact cleanup note:
+
+The random-light loop VAE dataset and manifest were removed from `data/` after this was
+understood. The matching encoder was also removed:
+
+```text
+data/vae_raw/
+data/vae_loop_cones_v1/
+models/vae_loop_cones_v1/
+```
+
+The next loop VAE experiment should recollect images with `randomlight` disabled and
+recreate those directories from scratch.
 
 ## 4. Loop Track RL: Failed Reward Branches
 
@@ -454,8 +474,10 @@ models/rl_loop_vae_sac_speed_v1/sac_loop_vae_20000_steps.zip
 models/rl_loop_vae_sac_speed_v1/sac_loop_vae_replay_buffer_20000_steps.pkl
 ```
 
-The 20k checkpoint is intentionally preserved because `safe_v2` was resumed from it.
-Other `speed_v1` checkpoints were removed.
+The 20k checkpoint was intentionally preserved while `safe_v2` was the active VAE loop
+branch because `safe_v2` was resumed from it. After deciding to discard the random-light
+loop VAE lineage, the whole `models/rl_loop_vae_sac_speed_v1/` directory was removed.
+Other `speed_v1` checkpoints had already been removed.
 
 The branch learned to move and complete laps, but then degraded. Evaluation of later
 checkpoints:
@@ -528,6 +550,10 @@ models/rl_loop_vae_sac_safe_v2/sac_loop_vae_60000_steps.zip
 models/rl_loop_vae_sac_safe_v2/sac_loop_vae_70000_steps.zip
 ```
 
+These artifacts were removed after the random-light issue was identified. The table
+below is kept as the historical result record, not as a list of files currently present
+in `models/`.
+
 Evaluation summary:
 
 | Checkpoint | Trunc | Steps Mean | Speed Mean | Progress Mean | Mean CTE | Max CTE | Reward Mean |
@@ -566,6 +592,87 @@ Lap completion statistics over the 70k of training (357 laps total):
 Fastest single lap during training: **8.63 s**. By contrast `speed_v1` completed only 71
 laps over its ~30k of training before degrading.
 
+Reproducibility caveat:
+
+```text
+randomlight was enabled during the original VAE loop-track experiments
+```
+
+This matters because the loop VAE was trained on simulator images, not on a color
+invariant pretrained representation. If later evaluation starts the simulator with a
+different lighting tone than the VAE data and RL training run, the frozen VAE latent can
+shift enough to degrade the SAC policy. The original 70k checkpoint should therefore be
+treated as "best under the original lighting/domain", not as a lighting-invariant
+deployment model.
+
+## 5.5 Loop Track RL: Frozen ResNet Encoder v4
+
+Claude added an alternative image encoder path to avoid VAE data collection:
+
+```text
+encoder:       frozen ImageNet-pretrained ResNet18
+preprocess:    crop top 40 px, resize to 224x224, ImageNet normalization
+z_size:        512
+policy:        SAC MLP on [ResNet feature; last action history]
+hidden size:   256
+```
+
+The hidden size is an important comparison detail. The VAE `safe_v2` branch used a
+64-unit MLP (`[64, 64]` for pi/qf), while ResNet v4 used 256 (`[256, 256]`) because the
+generic ResNet feature needs a larger projection head. So the v4 comparison is not
+"only encoder changed"; both encoder and SAC MLP capacity changed.
+
+v4 eval:
+
+| Checkpoint | Trunc | Speed | Progress | Mean CTE | Max CTE | Reward |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 50k | 3/3 | 2.131 | 319.5 | 0.424 | 1.65 | 4780 |
+| 60k | 3/3 | 2.050 | 307.4 | 0.414 | 1.54 | 4782 |
+| 70k | 3/3 | 2.052 | 307.8 | 0.551 | 1.49 | 4571 |
+
+Best v4 checkpoint:
+
+```text
+models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip
+```
+
+Comparison with the historical VAE best:
+
+| Metric | safe_v2 70k (VAE) | v4 50k (ResNet) |
+| --- | ---: | ---: |
+| Trunc | 5/5 | 3/3 |
+| Speed | 2.914 | 2.131 |
+| Progress | 437.1 | 319.5 |
+| Mean CTE | 0.333 | 0.424 |
+
+The ResNet branch is stable but conservative. Replay-buffer inspection shows the
+mechanism directly:
+
+```text
+ResNet v4 50k long episodes: throttle mean mostly 0.26-0.33
+VAE safe_v2 70k long episodes: throttle mean mostly 0.38-0.43
+```
+
+Likely causes:
+
+- Frozen ImageNet features are not track-specific. They avoid VAE collection but do not
+  encode lane geometry and lateral offset as directly as a loop-track VAE.
+- ResNet preprocessing resizes the cropped `80x160` simulator view to `224x224`, which
+  changes aspect ratio and may distort road geometry.
+- Under `safe_v2` reward, uncertain high-speed states pay the `abs(cte) * speed`
+  penalty immediately. A less track-specific feature representation naturally learns a
+  lower-throttle, safer policy.
+- Random lighting hurts the VAE branch's reproducibility, but a generic ImageNet
+  encoder can be more color/texture robust. This makes ResNet attractive as a quick
+  stable baseline despite lower speed.
+
+ResNet v4 conclusion:
+
+```text
+advantage: no VAE image collection/training, more robust to visual setup changes
+cost:      about 27% slower than the matched-lighting VAE policy
+```
+
 ## 6. Practical Pitfalls
 
 - Do not install the PyPI `gym-donkeycar` package — it targets the old `gym` API.
@@ -573,6 +680,9 @@ laps over its ~30k of training before degrading.
   or clone that repo and `pip install -e ../gym-donkeycar` for local edits. See the
   README's gym-donkeycar section for details.
 - Do not mix VAE data from visually different simulator tracks.
+- Disable or control simulator `randomlight` before VAE data collection, RL training,
+  and evaluation. Otherwise lighting/domain shift can make VAE checkpoints look
+  non-reproducible.
 - Do not judge SAC only by training reward or SB3 rolling means.
 - Save replay buffers at checkpoints if resume matters.
 - Do not resume SAC with replay buffers generated by a different reward function.
@@ -619,6 +729,93 @@ The practices below are what produced a deployable checkpoint without overtraini
 
 ## 7. Current Recommendation
 
-Use `safe_v2 70k` as the loop-track deployment checkpoint. Treat `speed_v1 20k` as a
-reproducible seed for future reward experiments. Avoid further training past the current
-70k checkpoint unless a new reward or evaluation target is introduced.
+The random-light VAE loop lineage has been retired. The current recommendation is:
+
+- For immediate loop-track evaluation without recollecting VAE data, use ResNet v4 50k.
+- For the next fast loop-track policy, recollect fixed-light loop images, retrain the
+  loop VAE, then retrain SAC with the `safe_v2` reward shape.
+- Do not compare a new fixed-light VAE policy against the old `safe_v2 70k` artifact as
+  a strict reproducibility target; keep it as a historical matched-domain result.
+- Avoid further SAC training past the selected checkpoint unless a new reward or
+  evaluation target is introduced.
+
+## 8. Current Data And Model Inventory
+
+The repository was cleaned so that the remaining local artifacts map directly to active
+or historically useful branches.
+
+Current `data/`:
+
+```text
+data/slow_data_raw/
+  Six slow generated-road tubs. Used by BC regression and categorical training.
+
+data/curated_cornering_v1_clean/
+  First cleaned cornering subset. Used to add high-curvature recovery examples to BC.
+
+data/curated_cornering_v2_clean/
+  Second cleaned cornering subset. Used by the official-style categorical branch.
+
+data/Cornering data.zip
+data/cornorraw.zip
+  Compressed backups of raw cornering captures. The extracted copies were deleted.
+```
+
+Deleted data categories:
+
+```text
+data/vae/
+  Old generated-road VAE manifests/cache leftovers.
+
+data/vae_raw/
+  Random-light loop VAE raw images and older extracted cornering raw images.
+
+data/vae_loop_cones_v1/
+  Manifest for the removed random-light loop VAE dataset.
+```
+
+Current `models/`:
+
+```text
+models/bc_nvidia_slow_006_flip/
+  BC regression baseline. It was the most stable BC route and also initialized the
+  categorical model. Closed-loop evaluation needs about 1.8x steering scale.
+
+models/bc_official_categorical_curve_aug_balanced_v1/
+  Best retained official-style categorical BC model. Closed-loop evaluation needs about
+  1.4x steering scale, but it was generally less stable than regression and much weaker
+  than RL.
+
+models/vae_raffin_v1/
+  VAE encoder for the original generated-road RL baseline.
+
+models/rl_vae_sac_raffin_v1/
+  SAC policy for the original generated-road RL baseline using models/vae_raffin_v1.
+
+models/rl_loop_vae_sac_resnet_v4_notrees/
+  Retained loop-track SAC branch using frozen ImageNet ResNet18 features. It avoids VAE
+  data collection but runs slower than the historical matched-light VAE result.
+```
+
+Deleted model categories:
+
+```text
+models/vae_loop_cones_v1/
+  Random-light loop VAE encoder.
+
+models/rl_loop_vae_sac_safe_v2/
+  SAC policies trained on the removed random-light loop VAE encoder.
+
+models/rl_loop_vae_sac_speed_v1/
+  Early loop VAE seed branch for safe_v2.
+
+models/rl_loop_vae_sac_progress_v*/
+models/rl_loop_vae_sac_v1/
+models/rl_loop_vae_sac_resnet_v1/
+models/rl_loop_vae_sac_resnet_v2/
+models/rl_loop_vae_sac_resnet_v3/
+models/rl_vae_sac_raffin_resume_010k_v1/
+models/vae_raffin_smoke/
+models/bc_official_categorical_9bin_sampler6_300/
+  Failed, exploratory, or superseded experiment branches.
+```

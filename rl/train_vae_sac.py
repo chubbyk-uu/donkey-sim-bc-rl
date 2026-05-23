@@ -80,6 +80,68 @@ class FrozenVaeEncoder:
         return mu.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
 
+class FrozenPretrainedCnnEncoder:
+    """ImageNet-pretrained CNN trunk used as a frozen feature extractor.
+
+    Same encode() contract as FrozenVaeEncoder so DonkeyVaeSACEnv can use either.
+    Output dim is exposed via self.z_size.
+    """
+
+    def __init__(self, model_name: str, device: torch.device) -> None:
+        import torchvision.models as tvm
+
+        if model_name == "resnet18":
+            weights = tvm.ResNet18_Weights.IMAGENET1K_V1
+            model = tvm.resnet18(weights=weights)
+            model.fc = torch.nn.Identity()
+            feature_dim = 512
+        elif model_name == "mobilenet_v3_small":
+            weights = tvm.MobileNet_V3_Small_Weights.IMAGENET1K_V1
+            model = tvm.mobilenet_v3_small(weights=weights)
+            model.classifier = torch.nn.Identity()
+            feature_dim = 576
+        else:
+            raise ValueError(f"unsupported pretrained encoder: {model_name}")
+
+        model.to(device).eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        self.model = model
+        self.device = device
+        self.z_size = feature_dim
+        self.model_name = model_name
+        self._mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        self._std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    @torch.no_grad()
+    def encode(self, obs: np.ndarray) -> np.ndarray:
+        image = np.asarray(obs, dtype=np.uint8)
+        image = image[MARGIN_TOP:, :, :]
+        if image.shape != (IMAGE_HEIGHT, IMAGE_WIDTH, 3):
+            raise ValueError(
+                f"unexpected image shape {image.shape}, expected {(IMAGE_HEIGHT, IMAGE_WIDTH, 3)}"
+            )
+        tensor = torch.from_numpy(np.transpose(image, (2, 0, 1)).copy()).to(self.device)
+        tensor = tensor.unsqueeze(0).float() / 255.0
+        tensor = torch.nn.functional.interpolate(
+            tensor, size=(224, 224), mode="bilinear", align_corners=False
+        )
+        tensor = (tensor - self._mean) / self._std
+        feat = self.model(tensor)
+        return feat.squeeze(0).cpu().numpy().astype(np.float32)
+
+
+def make_encoder(encoder_name: str, device: torch.device, vae_checkpoint: Path | None = None):
+    """Factory: build an encoder by name. Returns object with .encode(obs) and .z_size."""
+    if encoder_name == "vae":
+        if vae_checkpoint is None:
+            raise ValueError("--vae-model is required when --encoder=vae")
+        return FrozenVaeEncoder(vae_checkpoint, device=device, z_size=Z_SIZE)
+    if encoder_name in {"resnet18", "mobilenet_v3_small"}:
+        return FrozenPretrainedCnnEncoder(encoder_name, device=device)
+    raise ValueError(f"unsupported encoder: {encoder_name}")
+
+
 class DonkeyVaeSACEnv(gym.Wrapper):
     """Raffin-style Donkey env: frozen VAE latent + command history."""
 
