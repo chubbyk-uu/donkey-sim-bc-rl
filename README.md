@@ -10,10 +10,10 @@ The best current result is on `donkey-generated-track-v0` loop track:
 model:        models/rl_loop_vae_sac_safe_v2/sac_loop_vae_70000_steps.zip
 vae:          models/vae_loop_cones_v1/best.pt
 eval:         5/5 episodes reached max_episode_steps=3000
-mean speed:   2.914
-mean progress:437.1
-mean |cte|:   0.333
-max |cte|:    1.715
+mean speed:    2.914
+mean progress: 437.1
+mean |cte|:    0.333
+max |cte|:     1.715
 ```
 
 See [docs/experiment-log.md](docs/experiment-log.md) for the full BC, single-road RL,
@@ -217,20 +217,27 @@ useful as a baseline, but not the current main deployment target.
 ### Behavioral Cloning
 
 BC models remain in `models/bc_*` as historical baselines. They are useful for dataset
-inspection and supervised diagnostics, but the current best control result is RL.
+inspection and supervised diagnostics, but the current best control result is RL. The
+two BC routes were regression CNN and official-style categorical. Regression was
+generally more stable in closed-loop driving; both routes needed evaluation-time
+steering amplification because raw steering outputs were too small (`1.8x` for the
+regression baseline, about `1.4x` for the categorical baseline).
 
 ## Repository Map
 
 ```text
-bc/                         BC train/eval scripts
-rl/train_vae.py             VAE training
-rl/train_vae_sac.py         shared VAE+SAC environment/reward code
-rl/train_loop_vae_sac.py    loop-track SAC training entrypoint
-rl/eval_loop_vae_sac.py     loop-track evaluation entrypoint
-tools/collect_sim_frames.py            VAE frame collection from simulator
+bc/train_bc.py                          BC regression CNN training
+bc/eval_bc.py                           BC regression CNN evaluation
+bc/train_bc_official_categorical.py     BC official-style categorical training
+bc/eval_bc_official_categorical.py      BC official-style categorical evaluation
+rl/train_vae.py                         VAE training
+rl/train_vae_sac.py                     shared VAE+SAC environment/reward code
+rl/train_loop_vae_sac.py                loop-track SAC training entrypoint
+rl/eval_loop_vae_sac.py                 loop-track evaluation entrypoint
+tools/collect_sim_frames.py             VAE frame collection from simulator
 tools/prepare_vae_dataset.py
 tools/build_vae_cache.py
-tools/inspect_loop_replay_throttle.py  per-episode throttle/cte analysis from a saved SAC replay buffer
-logs/                        saved eval/train logs
-docs/experiment-log.md       detailed experiment history
+tools/inspect_loop_replay_throttle.py   per-episode throttle/cte analysis from a saved SAC replay buffer
+logs/                                   saved eval/train logs
+docs/experiment-log.md                  detailed experiment history
 ```
