@@ -55,6 +55,10 @@ class RaffinRewardConfig:
     min_alive_speed: float = MIN_ALIVE_SPEED
     progress_reward_weight: float = PROGRESS_REWARD_WEIGHT
     cte_speed_penalty_weight: float = 0.0
+    cte_target: float = 0.0  # offset reference for "lane center" — on generated-track 0
+                              # is right-lane center; on mountain-track right lane is at
+                              # cte=3.5, so set cte_target=3.5 there so abs(cte-target)
+                              # measures how far off the desired line the car is.
 
 
 class FrozenVaeEncoder:
@@ -215,7 +219,7 @@ class DonkeyVaeSACEnv(gym.Wrapper):
                 "rl_steer": float(executed[0]),
                 "rl_steer_delta": float(executed[0]) - prev_steer,
                 "rl_throttle": float(executed[1]),
-                "abs_cte": abs(cte),
+                "abs_cte": abs(cte - self.reward_config.cte_target),
                 "delta_pos_distance": progress,
                 "vae_reward": reward,
             }
@@ -249,8 +253,8 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         return np.concatenate([z, self.command_history.reshape(-1)], dtype=np.float32)
 
     def _is_game_over(self, terminated: bool, info: dict) -> bool:
-        cte = abs(float(info.get("cte", 0.0)))
-        return bool(terminated or cte > self.reward_config.max_cte_error)
+        cte_dev = abs(float(info.get("cte", 0.0)) - self.reward_config.cte_target)
+        return bool(terminated or cte_dev > self.reward_config.max_cte_error)
 
     def _calculate_reward(self, terminated: bool, throttle: float, info: dict, progress: float) -> float:
         cfg = self.reward_config
@@ -262,8 +266,8 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         progress_reward = cfg.progress_reward_weight * progress
         throttle_reward = cfg.throttle_reward_weight * (throttle / max(self.max_throttle, 1e-6))
         speed_reward = cfg.speed_reward_weight * speed
-        abs_cte = abs(float(info.get("cte", 0.0)))
-        cte_speed_penalty = cfg.cte_speed_penalty_weight * abs_cte * speed
+        cte_dev = abs(float(info.get("cte", 0.0)) - cfg.cte_target)
+        cte_speed_penalty = cfg.cte_speed_penalty_weight * cte_dev * speed
         if cfg.min_alive_speed > 0.0:
             alive_scale = float(np.clip(speed / cfg.min_alive_speed, 0.0, 1.0))
         else:
@@ -370,6 +374,7 @@ def build_env(args: argparse.Namespace, vae: FrozenVaeEncoder) -> gym.Env:
             min_alive_speed=args.min_alive_speed,
             progress_reward_weight=args.progress_reward_weight,
             cte_speed_penalty_weight=getattr(args, "cte_speed_penalty_weight", 0.0),
+            cte_target=getattr(args, "cte_target", 0.0),
         ),
     )
     env = TimeLimit(env, max_episode_steps=args.max_episode_steps)

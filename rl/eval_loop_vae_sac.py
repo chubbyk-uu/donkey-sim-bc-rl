@@ -47,7 +47,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-throttle", type=float, default=0.7)
     parser.add_argument("--max-steering", type=float, default=MAX_STEERING)
     parser.add_argument("--max-steering-diff", type=float, default=0.2)
-    parser.add_argument("--max-cte-error", type=float, default=2.0)
+    parser.add_argument("--max-cte-error", type=float, default=2.0,
+                        help="Max allowed |cte - cte_target| before episode terminates.")
+    parser.add_argument("--cte-target", type=float, default=0.0,
+                        help="The cte value treated as 'lane center'. Use 3.5 for "
+                             "mountain-track (right lane spawn) or keep 0 for generated-track.")
     parser.add_argument("--throttle-reward-weight", type=float, default=0.0)
     parser.add_argument("--reward-crash", type=float, default=-10.0)
     parser.add_argument("--crash-speed-weight", type=float, default=5.0)
@@ -87,6 +91,7 @@ def main() -> None:
             min_alive_speed=args.min_alive_speed,
             progress_reward_weight=args.progress_reward_weight,
             cte_speed_penalty_weight=args.cte_speed_penalty_weight,
+            cte_target=args.cte_target,
         ),
     )
     env = TimeLimit(env, max_episode_steps=args.max_episode_steps)

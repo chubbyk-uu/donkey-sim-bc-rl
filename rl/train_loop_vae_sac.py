@@ -58,7 +58,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steering", type=float, default=MAX_STEERING)
     parser.add_argument("--max-steering-diff", type=float, default=0.2)
     parser.add_argument("--n-command-history", type=int, default=N_COMMAND_HISTORY)
-    parser.add_argument("--max-cte-error", type=float, default=2.0)
+    parser.add_argument("--max-cte-error", type=float, default=2.0,
+                        help="Max allowed |cte - cte_target| before episode terminates.")
+    parser.add_argument("--cte-target", type=float, default=0.0,
+                        help="The cte value treated as 'lane center'. On generated-track this "
+                             "is 0 (right-lane center). On mountain-track spawn is at cte~3.54, "
+                             "so set --cte-target 3.5 to make the agent drive in the right lane "
+                             "(termination and cte_speed_penalty both measure |cte - target|).")
     parser.add_argument("--throttle-reward-weight", type=float, default=0.0)
     parser.add_argument("--reward-crash", type=float, default=-10.0)
     parser.add_argument("--crash-speed-weight", type=float, default=5.0)
