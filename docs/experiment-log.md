@@ -673,7 +673,142 @@ advantage: no VAE image collection/training, more robust to visual setup changes
 cost:      about 27% slower than the matched-lighting VAE policy
 ```
 
-## 6. Practical Pitfalls
+## 6. Loop Track RL: Fixed-Light VAE Pipeline
+
+After confirming the random-light issue (see §5 reproducibility caveat), the whole loop
+VAE+SAC lineage was rebuilt from scratch with simulator `randomlight` disabled. This
+means VAE training images, SAC training rollouts, and SAC evaluation all share the same
+fixed lighting tone — eliminating the OOD drift that broke `safe_v2 70k` reproducibility.
+
+### 6.1 New VAE data collection
+
+```text
+encoder:           models/vae_loop_cones_fixedlight_v1/best.pt
+randomlight:       DISABLED in sim before any frame collection
+total frames:      80k (slightly smaller than the 90k random-light v1 set)
+sim setup:         no trees on track (tree ground shadows broke encoder later — see 6.5)
+```
+
+The VAE itself was trained with the same recipe as the previous loop VAE (z=512, top
+40 px crop, 20 epochs). The only material change is the matched-lighting environment.
+
+### 6.2 fixedlight_v1 — hidden=128, eventually deleted
+
+First SAC attempt on the new VAE used hidden=128, batch=256, `gradient_steps_min=500`,
+`gradient_steps_cap=1000`. Trained cold from random init: 50k initial, then resumed
+30k → 80k under same config, then later resumed 80k → 150k with `cap=3000` to see if
+longer training would let it surpass `v2_h64`.
+
+Training trajectory (rollout `ep_len_mean`):
+
+```text
+50k:  411   80k:  440   100k: 582
+110k: 608   130k: 719   150k: 894
+```
+
+Survival kept climbing across the whole 150k. But deterministic eval told a less rosy
+story:
+
+| Checkpoint | Trunc | Speed | Progress | Mean CTE | Notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 110k | 0/3 | 2.71 | 76 | 0.34 | crashes early in deterministic |
+| 130k | 3/3 | 2.59 | 259 | 0.34 | only checkpoint that truncates reliably |
+| 140k | 0/3 | 2.55 | 67 | 0.36 | full regression |
+| 150k | 1/3 | 2.71 | 174 | 0.31 | partial recovery, still unreliable |
+
+Truncation reliability was **1/4 across the tested checkpoints**. The agent had moments
+of strong policy (130k) but the surrounding checkpoints collapsed. Possible cause:
+hidden=128 takes much longer to converge and the policy oscillates more violently in
+the converged region. Either way, the deterministic eval said the branch is not
+deployable.
+
+After this finding the entire `models/rl_loop_vae_sac_fixedlight_v1/` directory was
+deleted (about 4.1 GB freed). The branch is documented here only as a "do not use this
+recipe for the next deployment" data point.
+
+### 6.3 fixedlight_v2_h64 — current deployment
+
+Second attempt switched to the smaller MLP that matched the historical `safe_v2`
+recipe:
+
+```text
+encoder:           VAE (vae_loop_cones_fixedlight_v1/best.pt)
+hidden_size:       64
+batch_size:        64
+gradient_steps_min: 10
+gradient_steps_cap: 2000  (raised from 1000 after the 50k phase)
+all reward / throttle / steering defaults: matched safe_v2
+cold start (no resume)
+```
+
+Training schedule was a three-phase resume to 110k:
+
+```text
+phase 1: 0 → 50k  (cap=1000 default)
+phase 2: 50k → 80k  (resumed, cap raised to 2000)
+phase 3: 80k → 110k  (resumed, same config)
+```
+
+Deterministic eval at every checkpoint (`max_episode_steps=2000`):
+
+| Checkpoint | Trunc | Speed | Progress | Mean CTE | Max CTE | Reward |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 60k | 0/3 | 2.55 | 26 | 0.34 | 2.34 | 310 |
+| 80k | 3/3 | 2.03 | 203 | 0.46 | 1.85 | 3144 |
+| 90k | 3/3 | 2.36 | 236 | 0.32 | 1.40 | 3332 |
+| **100k** | **3/3** | **2.69** | **269** | **0.30** | 1.65 | **3409** |
+| 110k | 3/3 | 2.49 | 249 | 0.33 | 1.73 | 3345 |
+
+100k is the clear best on every metric except `max_cte` (where 90k is 1.40 vs 100k's
+1.65). 110k shows slight regression on speed, progress, and CTE — the early edge of
+SAC late-stage drift. 90k is retained as a backup because its `max_cte` is unusually
+low.
+
+Files kept:
+
+```text
+models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_100000_steps.zip    (deployment)
+models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_90000_steps.zip     (backup)
+```
+
+All other v2_h64 checkpoints and the 110k checkpoint were removed.
+
+### 6.4 fixedlight_v3_h80 — open ablation
+
+A `hidden=80` ablation is in progress (`models/rl_loop_vae_sac_fixedlight_v3_h80/`).
+The aim is to check whether a slightly bigger MLP than 64 gives any improvement over
+v2_h64 100k. Early-window stats (training stdout, not deterministic eval) match the
+expected pattern: roughly similar early progress to v2_h64 but not clearly better. To
+be evaluated and recorded when the run finishes.
+
+### 6.5 Lessons from the fixed-light loop work
+
+- **Random light → mandatory off** before any visual encoder training on `generated_track`.
+  See §3 and §5 reproducibility caveat.
+- **Tree ground shadows are worse than the trees themselves.** During earlier ResNet
+  experiments the agent first failed with trees enabled. Turning trees off restored
+  the agent's behavior. The likely cause is the *patchy ground shadow* cast by tree
+  geometry, which breaks the lane-edge texture the encoder relies on. For the next
+  attempt at a "with trees" policy, the VAE data must include shadowed-ground frames.
+- **hidden=128 with VAE features is worse than hidden=64**, even though it produced
+  some impressive single laps (training-time fastest 9.00 s vs 9.35 s). The
+  deterministic eval was less reliable — only 1/4 tested checkpoints achieved 3/3
+  truncate, compared to 4/5 for hidden=64. VAE features are already task-aligned, so a
+  bigger MLP wastes capacity and amplifies SAC late-stage instability.
+- **Never lead with "fastest single lap"** when comparing policies. That number can come
+  from one optimistic burst before a crash. Use deterministic eval `mean_speed`,
+  median over the last 30 training laps, longest consecutive sub-threshold streak, and
+  the full lap-time distribution instead. The hidden=128 branch repeatedly looked
+  strong by fastest-lap but failed on every other sustained metric.
+- **`gradient_steps_cap=2000` helped v2_h64** by allowing more updates inside long
+  (truncate) episodes, where the default 1000 caps the 1:1 SAC update ratio in
+  half. This was a measurable, controlled change: lap speed and CTE both improved
+  after the cap was raised at 50k.
+- **Cold start is fine if the encoder is good.** v2_h64 started from random init and
+  reached 3/3 truncate by 80k, without the warm seed `safe_v2` had needed. Matching
+  the visual training/eval distribution removed the need for a "policy prior".
+
+## 7. Practical Pitfalls
 
 - Do not install the PyPI `gym-donkeycar` package — it targets the old `gym` API.
   Install upstream instead with `pip install git+https://github.com/tawnkramer/gym-donkeycar`,
@@ -712,7 +847,7 @@ cost:      about 27% slower than the matched-lighting VAE policy
   dominated by older long episodes, so it underreports recent collapses. Deterministic
   evaluation at each checkpoint is the reliable signal.
 
-## 6.5 Monitoring Practices
+## 7.5 Monitoring Practices
 
 The practices below are what produced a deployable checkpoint without overtraining:
 
@@ -727,19 +862,27 @@ The practices below are what produced a deployable checkpoint without overtraini
 - Keep only the best-performing checkpoint plus the immediate seed; delete everything
   else to keep the model directory navigable.
 
-## 7. Current Recommendation
+## 8. Current Recommendation
 
-The random-light VAE loop lineage has been retired. The current recommendation is:
+- **Primary loop-track deployment**:
+  `models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_100000_steps.zip`.
+  Evaluated 3/3 truncate at `max_episode_steps=2000`, `mean_speed=2.689`,
+  `mean |cte|=0.301`. Reproducible across simulator restarts because VAE training, SAC
+  training, and eval all share the same fixed lighting.
+- **Backup loop-track**: `models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip`.
+  About 27% slower (`mean_speed=2.131`) but requires no VAE image collection.
+- **For new loop SAC runs**, copy the v2_h64 100k recipe exactly:
+  `--encoder vae`, `--hidden-size 64`, `--batch-size 64`, `--gradient-steps-min 10`,
+  `--gradient-steps-cap 2000`, safe_v2 reward defaults, cold start, eval at every
+  checkpoint. Do not use hidden=128 — it inflated some single-lap times but produced
+  unreliable truncation (1/4 vs 4/5).
+- **Compare runs by sustained metrics**, not "fastest single lap" (see §6.5).
+- **Always disable simulator `randomlight`** before VAE collection / SAC training /
+  eval. This was the root cause of the historical safe_v2 reproducibility failure.
+- The old `safe_v2 70k` artifact remains a "best ever under matched lighting" reference
+  point but is not a reproducible deployment model.
 
-- For immediate loop-track evaluation without recollecting VAE data, use ResNet v4 50k.
-- For the next fast loop-track policy, recollect fixed-light loop images, retrain the
-  loop VAE, then retrain SAC with the `safe_v2` reward shape.
-- Do not compare a new fixed-light VAE policy against the old `safe_v2 70k` artifact as
-  a strict reproducibility target; keep it as a historical matched-domain result.
-- Avoid further SAC training past the selected checkpoint unless a new reward or
-  evaluation target is introduced.
-
-## 8. Current Data And Model Inventory
+## 9. Current Data And Model Inventory
 
 The repository was cleaned so that the remaining local artifacts map directly to active
 or historically useful branches.
@@ -792,9 +935,24 @@ models/vae_raffin_v1/
 models/rl_vae_sac_raffin_v1/
   SAC policy for the original generated-road RL baseline using models/vae_raffin_v1.
 
+models/vae_loop_cones_fixedlight_v1/
+  Fixed-light loop VAE encoder (80k frames, randomlight disabled). Used by the current
+  loop deployment.
+
+models/rl_loop_vae_sac_fixedlight_v2_h64/
+  Primary loop-track deployment. Best checkpoint sac_loop_vae_100000_steps.zip; backup
+  sac_loop_vae_90000_steps.zip. Hidden=64, batch=64, fixed-light VAE encoder.
+
 models/rl_loop_vae_sac_resnet_v4_notrees/
-  Retained loop-track SAC branch using frozen ImageNet ResNet18 features. It avoids VAE
-  data collection but runs slower than the historical matched-light VAE result.
+  Backup loop-track SAC branch using frozen ImageNet ResNet18 features. Avoids VAE data
+  collection but runs slower than the fixed-light VAE deployment.
+```
+
+Optional in-progress:
+
+```text
+models/rl_loop_vae_sac_fixedlight_v3_h80/
+  Hidden=80 ablation against v2_h64. Not yet evaluated; may be deleted after evaluation.
 ```
 
 Deleted model categories:
@@ -808,6 +966,10 @@ models/rl_loop_vae_sac_safe_v2/
 
 models/rl_loop_vae_sac_speed_v1/
   Early loop VAE seed branch for safe_v2.
+
+models/rl_loop_vae_sac_fixedlight_v1/
+  Hidden=128 attempt on the fixed-light VAE. Deleted because only 1/4 tested
+  checkpoints reached 3/3 truncate; hidden=64 (v2_h64) is the better recipe.
 
 models/rl_loop_vae_sac_progress_v*/
 models/rl_loop_vae_sac_v1/
