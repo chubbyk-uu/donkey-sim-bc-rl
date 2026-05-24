@@ -20,14 +20,14 @@ max |cte|:    1.80
 The earlier `v2_h64 100k` is kept as a secondary (slightly slower 2.689 speed but
 even more centered 0.301 cte). The two reward-weight ablations after v3_h80
 (v4 with s=0.20/c=0.20 and v5 with s=0.20/c=0.25) both lost to v3_h80 in
-deterministic eval and were deleted; safe_v2 weights `s=0.15, c=0.25` remain the
-best-performing reward shape — see
+deterministic eval and were deleted; the original safe_v2 reward weights
+`s=0.15, c=0.25` remain the best-performing reward shape — see
 [experiment log §6.5](docs/experiment-log.md#65-reward-weight-ablations-v4-s20c20-and-v5-s20c25).
 
-This branch was deliberately rebuilt from scratch with `randomlight` disabled in the
-simulator, so the VAE training images, SAC training rollouts, and eval all share the
-same fixed lighting. It is reproducible across simulator restarts, which the older
-`safe_v2` VAE branch was not.
+The whole fixed-light branch was deliberately rebuilt from scratch with `randomlight`
+disabled in the simulator, so the VAE training images, SAC training rollouts, and eval
+all share the same fixed lighting. It is reproducible across simulator restarts, which
+the older `rl_loop_vae_sac_safe_v2` SAC run (trained on a random-light VAE) was not.
 
 A historical "best at peak" result existed under uncontrolled lighting:
 
@@ -51,8 +51,12 @@ The project goal is to learn reliable autonomous driving policies in Donkey Simu
 starting from image observations:
 
 ```text
-camera image -> crop top 40 px -> encoder latent/features -> SAC policy -> steer/throttle
+camera image -> (optional top crop) -> encoder latent/features -> SAC policy -> steer/throttle
 ```
+
+The VAE encoder crops the top 40 px because the VAE was trained on cropped 80x160
+frames. The frozen ResNet encoder defaults to no crop (`--encoder-crop-top 0`) — see
+the "Main Commands" section.
 
 Two RL environments are tracked separately:
 
@@ -65,8 +69,9 @@ Two RL environments are tracked separately:
 
 BC models are kept as historical baselines and diagnostics. Among RL branches, the
 fixed-light VAE pipeline is the recommended deployment; ResNet18 is the
-no-data-collection alternative; the old random-light `safe_v2` VAE branch was the
-former leader but is non-reproducible and was removed.
+no-data-collection alternative; the old random-light `rl_loop_vae_sac_safe_v2` SAC
+run was the former leader but is non-reproducible (its VAE used uncontrolled lighting)
+and was removed.
 
 ## Environment Setup
 
@@ -236,28 +241,26 @@ models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip
 Eval: 3/3 truncate at max=3000, mean_speed 2.131, mean |cte| 0.424. ~32% slower than
 the fixed-light VAE policy but doesn't depend on VAE data collection.
 
-**Cross-track experiment (in progress)** — first attempt to transfer the ResNet
-pipeline to `donkey-mountain-track-v0`. Mountain has different sim conventions:
-spawn cte ≈ 3.54 (yellow centerline is cte=0, right-lane center is at cte=3.5),
-and uphill sections need `max_throttle ≥ 0.5`. The script now exposes
-`--cte-target` to handle that — `--cte-target 3.5` measures `abs(cte - 3.5)` for
-termination and reward. `mountain_v1` (80k cold + 30k resume with widened cte
-wrapper) plateaued at 1/3 deterministic-eval truncate; the next session's
-`mountain_v2` will try a tighter curriculum (`--max-throttle 0.5`,
-`--max-cte-error 3.0` from the start). See [experiment log §6.8](docs/experiment-log.md#68-cross-track-transfer-attempt-resnet-on-mountain-track-v1-in-progress).
+**Cross-track experiment (v1 complete, v2 planned)** — first attempt to transfer the
+ResNet pipeline to `donkey-mountain-track-v0`. Mountain has different sim conventions:
+spawn cte ≈ 3.54 (yellow centerline is cte=0, right-lane center is at cte=3.5), and
+uphill sections need `max_throttle ≥ 0.5`. The script now exposes `--cte-target` to
+handle that — `--cte-target 3.5` measures `abs(cte - 3.5)` for termination and reward.
+`mountain_v1` (80k cold + 30k resume with widened cte wrapper) plateaued at 1/3
+deterministic-eval truncate at the 90k checkpoint; the planned next-session
+`mountain_v2` will try a tighter curriculum (`--max-throttle 0.5`, `--max-cte-error 3.0`
+from the start). See
+[experiment log §6.8](docs/experiment-log.md#68-cross-track-transfer-attempt-resnet-on-mountain-track-v1-complete-v2-planned).
 
-**Reward shape (`safe_v2`, same for both branches above)**:
+**Reward formula (`safe_v2`, used by both VAE branches and the ResNet branch)**:
 
 ```text
-reward = 1.5 + 0.15 * speed - 0.25 * abs(cte) * speed
+reward = 1.5 + 0.15 * speed - 0.25 * abs(cte - cte_target) * speed
 crash  = -10 - 5 * speed
-min/max throttle:      0.2 / 0.7
-max steering diff:     0.2
-max cte error:         2.0
-max episode steps:     3000
 ```
 
-**Training defaults that produced `fixedlight_v3_h80` 90k** (CLI flags):
+The full CLI flags that produced `fixedlight_v3_h80` 90k (which also list throttle /
+steering / cte caps):
 
 ```text
 --encoder vae
@@ -297,10 +300,11 @@ vertically by 2.8x when resizing to 224x224, distorting natural shapes for
 ImageNet-pretrained features. The full 120x160 → 224x224 path only stretches 1.87x
 vertically, which is closer to ImageNet's natural-image aspect.
 
-Schedule: cold start, 50k initial run, then resumed twice (50k→80k cap=2000, 80k→110k
-same config). Best eval was at the 100k checkpoint; 110k showed slight regression. See
-[experiment log §6](docs/experiment-log.md#6-loop-track-rl-fixed-light-vae-pipeline)
-for the full trajectory and the ablations that rejected hidden=128.
+Schedule for `fixedlight_v3_h80`: single 100k cold-start run, no resume needed. Best
+deterministic eval was at the 90k checkpoint; 100k showed sharp regression (0/3
+truncate at 933 mean steps). See
+[experiment log §6.4](docs/experiment-log.md#64-fixedlight_v3_h80--slightly-faster-than-v2_h64)
+for the full eval table.
 
 **Historical (removed)**:
 

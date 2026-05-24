@@ -370,12 +370,16 @@ Single-road lessons:
 --save-replay-buffer --save-final-replay-buffer
 ```
 
-## 3. Loop Track VAE Data
+## 3. Loop Track VAE Data (random-light v1, removed — superseded by §6)
 
 The loop-track work moved to `donkey-generated-track-v0`. This visual domain differs
-enough from `generated_road` that the VAE was trained separately.
+enough from `generated_road` that the VAE was trained separately. The dataset and
+encoder described below were collected with simulator `randomlight` ON and have been
+deleted because they could not reliably reproduce later in eval (see the
+reproducibility note at the end of §5 and the rebuild in §6). They are kept in this
+log only for context — do not try to reuse these paths.
 
-Final loop VAE:
+Final loop VAE (REMOVED):
 
 ```text
 models/vae_loop_cones_v1/best.pt
@@ -919,7 +923,7 @@ These are env-specific calibrations. Always probe a new track with the cte-pid
 collector at `--cte-target 0` first, watch where the car ends up visually, and size
 `--max-cte-error` / throttles accordingly.
 
-### 6.8 Cross-track transfer attempt: ResNet on mountain-track (v1, in progress)
+### 6.8 Cross-track transfer attempt: ResNet on mountain-track (v1 complete, v2 planned)
 
 First test of "does the ResNet encoder pipeline transfer to a different track at all?".
 Mountain-track was chosen because it's geometrically the most different from
