@@ -66,6 +66,9 @@ def parse_args() -> argparse.Namespace:
                              "to bring corner-crash signal forward in time. v2 default 0.25.")
 
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--override-learning-rate", action="store_true",
+                        help="On --resume-model, override the saved LR with --learning-rate. "
+                             "Default behavior on resume is to keep the saved LR.")
     parser.add_argument("--buffer-size", type=int, default=60_000)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--hidden-size", type=int, default=64,
@@ -119,6 +122,17 @@ def main() -> None:
         if args.resume_replay_buffer is not None:
             model.load_replay_buffer(str(args.resume_replay_buffer))
             print(f"Loaded replay buffer from {args.resume_replay_buffer}")
+        if args.override_learning_rate:
+            from stable_baselines3.common.utils import get_schedule_fn
+            new_lr = args.learning_rate
+            model.lr_schedule = get_schedule_fn(new_lr)
+            for opt in [model.actor.optimizer, model.critic.optimizer]:
+                for pg in opt.param_groups:
+                    pg["lr"] = new_lr
+            if model.ent_coef_optimizer is not None:
+                for pg in model.ent_coef_optimizer.param_groups:
+                    pg["lr"] = new_lr
+            print(f"Override learning_rate to {new_lr} on resume")
         print(f"Resumed SAC model from {args.resume_model}")
     else:
         model = SAC(
