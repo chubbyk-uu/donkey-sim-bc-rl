@@ -32,7 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=Path("models/rl_loop_vae_sac_v1/final_model.zip"))
     parser.add_argument("--encoder", choices=["vae", "resnet18", "mobilenet_v3_small"], default="vae",
                         help="Image encoder. Must match what the SAC model was trained with.")
-    parser.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_v1/best.pt"),
+    parser.add_argument("--encoder-crop-top", type=int, default=0,
+                        help="Top-row pixels to crop before encoding (ResNet/MobileNet only). "
+                             "Must match what the model was trained with. Use 40 for the older "
+                             "v4 ResNet checkpoint; use 0 for new-style ResNet runs.")
+    parser.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_fixedlight_v1/best.pt"),
                         help="Only used when --encoder=vae.")
     parser.add_argument("--env-id", default="donkey-generated-track-v0")
     parser.add_argument("--host", default=os.environ.get("DONKEY_SIM_HOST", "127.0.0.1"))
@@ -60,8 +64,9 @@ def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    vae = make_encoder(args.encoder, device=device, vae_checkpoint=args.vae_model)
-    print(f"Encoder: {args.encoder}  z_size={vae.z_size}")
+    vae = make_encoder(args.encoder, device=device, vae_checkpoint=args.vae_model,
+                       crop_top=args.encoder_crop_top)
+    print(f"Encoder: {args.encoder}  z_size={vae.z_size}  crop_top={args.encoder_crop_top}")
     conf = {"host": args.host, "port": args.port, "cam_resolution": (CAMERA_HEIGHT, CAMERA_WIDTH, 3)}
     base_env = gym.make(args.env_id, conf=conf)
     env = DonkeyVaeSACEnv(

@@ -87,7 +87,7 @@ class FrozenPretrainedCnnEncoder:
     Output dim is exposed via self.z_size.
     """
 
-    def __init__(self, model_name: str, device: torch.device) -> None:
+    def __init__(self, model_name: str, device: torch.device, crop_top: int = 0) -> None:
         import torchvision.models as tvm
 
         if model_name == "resnet18":
@@ -110,16 +110,19 @@ class FrozenPretrainedCnnEncoder:
         self.device = device
         self.z_size = feature_dim
         self.model_name = model_name
+        self.crop_top = max(0, int(crop_top))
         self._mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
         self._std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
     @torch.no_grad()
     def encode(self, obs: np.ndarray) -> np.ndarray:
         image = np.asarray(obs, dtype=np.uint8)
-        image = image[MARGIN_TOP:, :, :]
-        if image.shape != (IMAGE_HEIGHT, IMAGE_WIDTH, 3):
+        if self.crop_top > 0:
+            image = image[self.crop_top:, :, :]
+        expected_h = CAMERA_HEIGHT - self.crop_top
+        if image.shape != (expected_h, CAMERA_WIDTH, 3):
             raise ValueError(
-                f"unexpected image shape {image.shape}, expected {(IMAGE_HEIGHT, IMAGE_WIDTH, 3)}"
+                f"unexpected image shape {image.shape}, expected {(expected_h, CAMERA_WIDTH, 3)}"
             )
         tensor = torch.from_numpy(np.transpose(image, (2, 0, 1)).copy()).to(self.device)
         tensor = tensor.unsqueeze(0).float() / 255.0
@@ -131,14 +134,19 @@ class FrozenPretrainedCnnEncoder:
         return feat.squeeze(0).cpu().numpy().astype(np.float32)
 
 
-def make_encoder(encoder_name: str, device: torch.device, vae_checkpoint: Path | None = None):
-    """Factory: build an encoder by name. Returns object with .encode(obs) and .z_size."""
+def make_encoder(encoder_name: str, device: torch.device, vae_checkpoint: Path | None = None,
+                 crop_top: int = 0):
+    """Factory: build an encoder by name. Returns object with .encode(obs) and .z_size.
+
+    `crop_top` only affects pretrained CNN encoders. The VAE encoder always uses its
+    fixed MARGIN_TOP crop (since the VAE was trained on cropped frames).
+    """
     if encoder_name == "vae":
         if vae_checkpoint is None:
             raise ValueError("--vae-model is required when --encoder=vae")
         return FrozenVaeEncoder(vae_checkpoint, device=device, z_size=Z_SIZE)
     if encoder_name in {"resnet18", "mobilenet_v3_small"}:
-        return FrozenPretrainedCnnEncoder(encoder_name, device=device)
+        return FrozenPretrainedCnnEncoder(encoder_name, device=device, crop_top=crop_top)
     raise ValueError(f"unsupported encoder: {encoder_name}")
 
 

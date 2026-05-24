@@ -39,7 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder", choices=["vae", "resnet18", "mobilenet_v3_small"], default="vae",
                         help="Image encoder. 'vae' uses --vae-model checkpoint; "
                              "'resnet18' / 'mobilenet_v3_small' use frozen ImageNet-pretrained weights.")
-    parser.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_v1/best.pt"),
+    parser.add_argument("--encoder-crop-top", type=int, default=0,
+                        help="Top-row pixels to crop before encoding (ResNet/MobileNet only; VAE "
+                             "uses its own fixed crop). Default 0 (no crop) reduces aspect ratio "
+                             "distortion when resizing to 224x224. Set to 40 to reproduce the "
+                             "older v4 ResNet behavior.")
+    parser.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_fixedlight_v1/best.pt"),
                         help="Only used when --encoder=vae.")
     parser.add_argument("--output-dir", type=Path, default=Path("models/rl_loop_vae_sac_v1"))
     parser.add_argument("--resume-model", type=Path, default=None)
@@ -101,8 +106,9 @@ def main() -> None:
     else:
         device = torch.device(args.device)
 
-    vae = make_encoder(args.encoder, device=device, vae_checkpoint=args.vae_model)
-    print(f"Encoder: {args.encoder}  z_size={vae.z_size}")
+    vae = make_encoder(args.encoder, device=device, vae_checkpoint=args.vae_model,
+                       crop_top=args.encoder_crop_top)
+    print(f"Encoder: {args.encoder}  z_size={vae.z_size}  crop_top={args.encoder_crop_top}")
     env = build_env(args, vae)
     env.action_space.seed(args.seed)
 
