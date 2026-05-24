@@ -5,17 +5,24 @@ Donkey Simulator. Training and evaluation run from WSL2 against a Windows Donkey
 Simulator instance.
 
 The current deployment recommendation on `donkey-generated-track-v0` loop track is the
-fixed-light VAE+SAC `v2_h64 100k` checkpoint:
+fixed-light VAE+SAC `v3_h80 90k` checkpoint:
 
 ```text
-model:        models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_100000_steps.zip
+model:        models/rl_loop_vae_sac_fixedlight_v3_h80/sac_loop_vae_90000_steps.zip
 vae:          models/vae_loop_cones_fixedlight_v1/best.pt
 eval:         3/3 episodes reached max_episode_steps=2000
-mean speed:   2.689
-progress:     269 (~1.3 laps per 1000 steps)
-mean |cte|:   0.301
-max |cte|:    1.65
+mean speed:   2.800
+progress:     280
+mean |cte|:   0.315
+max |cte|:    1.80
 ```
+
+The earlier `v2_h64 100k` is kept as a secondary (slightly slower 2.689 speed but
+even more centered 0.301 cte). The two reward-weight ablations after v3_h80
+(v4 with s=0.20/c=0.20 and v5 with s=0.20/c=0.25) both lost to v3_h80 in
+deterministic eval and were deleted; safe_v2 weights `s=0.15, c=0.25` remain the
+best-performing reward shape — see
+[experiment log §6.5](docs/experiment-log.md#65-reward-weight-ablations-v4-s20c20-and-v5-s20c25).
 
 This branch was deliberately rebuilt from scratch with `randomlight` disabled in the
 simulator, so the VAE training images, SAC training rollouts, and eval all share the
@@ -53,7 +60,7 @@ Two RL environments are tracked separately:
   VAE+SAC baseline can drive most of the fixed route, but the route is not a closed
   loop and intersection/generalization behavior is weak.
 - `donkey-generated-track-v0`: a closed loop track. This is the current main branch.
-  Current deployment uses a fixed-light VAE + SAC pipeline (`fixedlight_v2_h64` 100k).
+  Current deployment uses a fixed-light VAE + SAC pipeline (`fixedlight_v3_h80` 90k).
   A frozen-ResNet18 alternative is kept as a backup that needs no VAE data collection.
 
 BC models are kept as historical baselines and diagnostics. Among RL branches, the
@@ -134,14 +141,13 @@ site-packages PyPI install.
 
 ## Main Commands
 
-Evaluate the current best loop-track policy (`fixedlight_v2_h64` 100k):
+Evaluate the current best loop-track policy (`fixedlight_v3_h80` 90k):
 
 ```bash
 python rl/eval_loop_vae_sac.py \
   --encoder vae \
   --vae-model models/vae_loop_cones_fixedlight_v1/best.pt \
-  --hidden-size 64 \
-  --model models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_100000_steps.zip \
+  --model models/rl_loop_vae_sac_fixedlight_v3_h80/sac_loop_vae_90000_steps.zip \
   --episodes 3 \
   --max-episode-steps 2000
 ```
@@ -151,11 +157,17 @@ Evaluate the ResNet18 alternative (no VAE collection needed):
 ```bash
 python rl/eval_loop_vae_sac.py \
   --encoder resnet18 \
-  --hidden-size 256 \
+  --encoder-crop-top 40 \
   --model models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip \
   --episodes 3 \
   --max-episode-steps 2000
 ```
+
+Note: that v4 ResNet checkpoint was trained with the legacy MARGIN_TOP=40 crop, so
+`--encoder-crop-top 40` is required at eval. New ResNet runs should use the default
+`--encoder-crop-top 0` (no crop) — keeping the full 120x160 sim image before resizing
+to 224x224 reduces aspect ratio distortion and gives ResNet's ImageNet filters a
+more natural input.
 
 Train a new fixed-light loop VAE branch from scratch:
 
@@ -171,15 +183,15 @@ python rl/train_vae.py \
   --output-dir models/vae_loop_cones_fixedlight_v1 \
   --epochs 20
 
-# 3. Train SAC on the new VAE (proven safe_v2 reward, hidden=64):
+# 3. Train SAC on the new VAE (proven safe_v2 reward, hidden=80):
 python rl/train_loop_vae_sac.py \
   --vae-model models/vae_loop_cones_fixedlight_v1/best.pt \
-  --output-dir models/rl_loop_vae_sac_fixedlight_v2_h64 \
-  --hidden-size 64 \
+  --output-dir models/rl_loop_vae_sac_fixedlight_v3_h80 \
+  --hidden-size 80 \
   --batch-size 64 \
-  --gradient-steps-min 10 \
+  --gradient-steps-min 50 \
   --gradient-steps-cap 2000 \
-  --timesteps 110000 \
+  --timesteps 100000 \
   --save-replay-buffer \
   --save-final-replay-buffer \
   --device cuda
@@ -197,15 +209,23 @@ python rl/eval_vae_sac.py \
 
 ### Loop Track
 
-**Current deployment** (fixed-light VAE + SAC, cold-started, hidden=64):
+**Primary deployment** (fixed-light VAE + SAC, cold-started, hidden=80):
+
+```text
+models/rl_loop_vae_sac_fixedlight_v3_h80/sac_loop_vae_90000_steps.zip
+models/vae_loop_cones_fixedlight_v1/best.pt                              (encoder)
+```
+
+Eval: 3/3 truncate at max=2000, mean_speed 2.800, mean |cte| 0.315, max |cte| 1.80.
+
+**Secondary** (hidden=64 variant, even more centered but slower):
 
 ```text
 models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_100000_steps.zip
 models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_90000_steps.zip   (backup)
-models/vae_loop_cones_fixedlight_v1/best.pt                              (encoder)
 ```
 
-Eval: 3/3 truncate at max=2000, mean_speed 2.689, mean |cte| 0.301, max |cte| 1.65.
+Eval: 3/3 truncate, mean_speed 2.689, mean |cte| 0.301, max |cte| 1.65.
 
 **Backup** (frozen ResNet18, no VAE collection needed):
 
@@ -213,7 +233,7 @@ Eval: 3/3 truncate at max=2000, mean_speed 2.689, mean |cte| 0.301, max |cte| 1.
 models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip
 ```
 
-Eval: 3/3 truncate at max=3000, mean_speed 2.131, mean |cte| 0.424. ~27% slower than
+Eval: 3/3 truncate at max=3000, mean_speed 2.131, mean |cte| 0.424. ~32% slower than
 the fixed-light VAE policy but doesn't depend on VAE data collection.
 
 **Reward shape (`safe_v2`, same for both branches above)**:
@@ -227,14 +247,14 @@ max cte error:         2.0
 max episode steps:     3000
 ```
 
-**Training defaults that produced `fixedlight_v2_h64` 100k** (CLI flags):
+**Training defaults that produced `fixedlight_v3_h80` 90k** (CLI flags):
 
 ```text
 --encoder vae
 --vae-model models/vae_loop_cones_fixedlight_v1/best.pt
---hidden-size 64
+--hidden-size 80
 --batch-size 64
---gradient-steps-min 10
+--gradient-steps-min 50
 --gradient-steps-cap 2000
 --alive-reward 1.5
 --speed-reward-weight 0.15
@@ -246,8 +266,26 @@ max episode steps:     3000
 --max-steering-diff 0.2
 --max-cte-error 2.0
 --max-episode-steps 3000
---timesteps 110000
+--timesteps 100000
 ```
+
+Two reward-weight ablations after v3_h80 were tested and both lost to v3 in
+deterministic eval:
+- **v4 (s=0.20, c=0.20)**: weakening cte penalty made the actor settle into a
+  "ride brake / wider line" policy that was slower per lap. Deleted.
+- **v5 (s=0.20, c=0.25)**: stronger speed weight only — produced individual fast
+  laps but the policy became fragile (crashed every 1-3 laps in eval). Deleted.
+
+The `safe_v2` weights `(speed=0.15, cte_pen=0.25)` remain the best balance under
+the current encoder. See
+[experiment log §6.5](docs/experiment-log.md#65-reward-weight-ablations-v4-s20c20-and-v5-s20c25).
+
+For new ResNet18 / MobileNet runs, leave `--encoder-crop-top 0` (the default). The
+historical v4 ResNet checkpoint used `--encoder-crop-top 40` (legacy MARGIN_TOP
+carried over from the VAE pipeline); it works but stretches the cropped 80x160
+vertically by 2.8x when resizing to 224x224, distorting natural shapes for
+ImageNet-pretrained features. The full 120x160 → 224x224 path only stretches 1.87x
+vertically, which is closer to ImageNet's natural-image aspect.
 
 Schedule: cold start, 50k initial run, then resumed twice (50k→80k cap=2000, 80k→110k
 same config). Best eval was at the 100k checkpoint; 110k showed slight regression. See
@@ -344,11 +382,17 @@ models/rl_vae_sac_raffin_v1/
 models/vae_loop_cones_fixedlight_v1/
   Fixed-light loop VAE encoder (80k frames, randomlight disabled).
 
+models/rl_loop_vae_sac_fixedlight_v3_h80/
+  PRIMARY loop-track deployment. Best checkpoint sac_loop_vae_90000_steps.zip
+  (3/3 truncate, mean_speed 2.800, mean |cte| 0.315). hidden=80, batch=64,
+  fixed-light VAE encoder, safe_v2 reward.
+
 models/rl_loop_vae_sac_fixedlight_v2_h64/
-  Current loop-track deployment. Best checkpoint sac_loop_vae_100000_steps.zip, with
-  sac_loop_vae_90000_steps.zip kept as a backup.
+  Secondary loop-track checkpoint (older, slower, more centered). Best
+  sac_loop_vae_100000_steps.zip; backup sac_loop_vae_90000_steps.zip.
 
 models/rl_loop_vae_sac_resnet_v4_notrees/
   Backup loop-track SAC branch using frozen ResNet18 features. Best checkpoint is
-  sac_loop_vae_50000_steps.zip.
+  sac_loop_vae_50000_steps.zip. Trained with legacy --encoder-crop-top 40 (must
+  pass that flag at eval time). New ResNet runs should use --encoder-crop-top 0.
 ```

@@ -686,7 +686,7 @@ fixed lighting tone — eliminating the OOD drift that broke `safe_v2 70k` repro
 encoder:           models/vae_loop_cones_fixedlight_v1/best.pt
 randomlight:       DISABLED in sim before any frame collection
 total frames:      80k (slightly smaller than the 90k random-light v1 set)
-sim setup:         no trees on track (tree ground shadows broke encoder later — see 6.5)
+sim setup:         no trees on track (tree ground shadows broke encoder later — see 6.7)
 ```
 
 The VAE itself was trained with the same recipe as the previous loop VAE (z=512, top
@@ -773,15 +773,122 @@ models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_90000_steps.zip     (backu
 
 All other v2_h64 checkpoints and the 110k checkpoint were removed.
 
-### 6.4 fixedlight_v3_h80 — open ablation
+### 6.4 fixedlight_v3_h80 — slightly faster than v2_h64
 
-A `hidden=80` ablation is in progress (`models/rl_loop_vae_sac_fixedlight_v3_h80/`).
-The aim is to check whether a slightly bigger MLP than 64 gives any improvement over
-v2_h64 100k. Early-window stats (training stdout, not deterministic eval) match the
-expected pattern: roughly similar early progress to v2_h64 but not clearly better. To
-be evaluated and recorded when the run finishes.
+`hidden=80` ablation against v2_h64. Same config except hidden width:
+`--hidden-size 80 --batch-size 64 --gradient-steps-min 50 --gradient-steps-cap 2000`.
+Cold start, 100k timesteps.
 
-### 6.5 Lessons from the fixed-light loop work
+Eval at 70k/80k/90k/100k:
+
+| Checkpoint | Trunc | Speed | Progress | Mean CTE | Max CTE | Reward |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 70k | 3/3 | 2.754 | 275 | 0.392 | 1.93 | 3294 |
+| 80k | 3/3 | 2.031 | 203 | 0.460 | 1.85 | 3144 |
+| **90k** | **3/3** | **2.800** | **280** | **0.315** | 1.80 | **3408** |
+| 100k | 0/3 | 933 (mean steps) | — | — | — | 1584 |
+
+**v3_h80 90k beat v2_h64 100k on all metrics**: +4.1% speed, +4.1% progress, same
+mean_cte ~0.31, similar reward. 100k showed sharp regression (0/3 truncate, 933 mean
+steps) — peak was earlier. v3_h80 90k became the new deployment best, replacing
+v2_h64 100k.
+
+### 6.5 Reward weight ablations: v4 (s20c20) and v5 (s20c25)
+
+After v3_h80 hit 9.3s lap territory and stopped improving, two reward-weight
+ablations were tried to see whether a stronger speed incentive could break past 9s.
+
+Reference gradients at typical state (cte=0.30, speed=2.7):
+
+| Config | speed_w | cte_pen | ∂R/∂speed | ∂R/∂cte | switchpoint cte |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| v3 safe_v2 (baseline) | 0.15 | 0.25 | 0.075 | -0.675 | 0.6 |
+| v4 (s20c20) | 0.20 | 0.20 | 0.140 | -0.540 | 1.0 |
+| v5 (s20c25) | 0.20 | 0.25 | 0.125 | -0.675 | 0.8 |
+
+#### v4 — speed up AND cte penalty down
+
+```text
+--speed-reward-weight 0.20  --cte-speed-penalty-weight 0.20
+hidden=80, batch=64, grad-min=50, grad-cap=2000
+80k cold + 30k resume with cap=3000  (failed mid-resume; collapsed)
+80k cold + 20k resume with lr=2e-4 (avoided collapse but truncate rate dropped)
+```
+
+Buffer inspection at 50k showed v4's actor used **min throttle 52.9% of the time**
+during 3000-step truncates, vs v3_h80's 49.5% — the stronger speed weight did
+NOT translate to higher throttle use. Instead the weaker cte penalty let the actor
+settle into a "ride brake / wider lines" policy that was actually slower per lap.
+
+Eval at all v4 checkpoints (60k/70k/80k from cold; 90k/100k from lr=2e-4 resume):
+
+| Checkpoint | Trunc | Speed | Progress | Mean CTE | Reward |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 60k | 3/3 | 2.262 | 226 | 0.463 | 3174 |
+| 70k | 3/3 | 2.291 | 229 | 0.466 | 3175 |
+| **80k** | **3/3** | **2.460** | 246 | 0.432 | 3227 |
+| 90k (lr=2e-4) | 1/3 | 2.613 | 139 | 0.379 | 1713 |
+| 100k (lr=2e-4) | 1/3 | 2.490 | 161 | 0.422 | 2019 |
+
+v4's best (80k) had `speed=2.460` vs v3_h80 90k's `2.800` and `mean_cte=0.432` vs
+v3's `0.315`. **v4 reward was strictly worse than v3 on every deterministic-eval
+metric**. The branch was deleted.
+
+#### v5 — speed up, cte penalty unchanged
+
+```text
+--speed-reward-weight 0.20  --cte-speed-penalty-weight 0.25
+all other params same as v3_h80, cold start, intended for 100k
+stopped at 90k after observing fragile policy (in-sim, agent crashed after 2-3 laps)
+```
+
+Training showed the most aggressive lap times of any branch: sustained median dropped
+to 9.09s by 90k (vs v3's 9.41s eval-mean). But deterministic eval revealed the
+fragility:
+
+| Checkpoint | Trunc | Speed | Progress | Mean CTE | Reward |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **70k** | 2/3 | 2.752 | 256 | 0.421 | 3012 |
+| 80k | 0/3 (mean 202 steps!) | 2.608 | 27 | 0.484 | 295 |
+| 90k | 0/3 | 2.912 (good ep only) | 157 | 0.455 | 1716 |
+
+70k was the best v5 checkpoint but still inferior to v3 (`Trunc 2/3 vs 3/3`,
+`speed 2.752 vs 2.800`, `cte 0.421 vs 0.315`). 80k collapsed completely. 90k could
+produce fast individual laps (`speed 2.91`) but couldn't sustain. The s=0.20 speed
+weight made the actor commit too hard; the unchanged cte=0.25 wasn't enough on its
+own to prevent crashes. Branch deleted.
+
+#### Conclusion across v4 and v5
+
+`safe_v2` weights (s=0.15, c=0.25) — i.e. the v3_h80 90k recipe — remain the best
+balance under this VAE pipeline. Further reward tuning has diminishing returns; the
+gap between current deployment (`speed 2.800`, ~9.3s/lap) and the historical
+`safe_v2 70k` (under uncontrolled lighting, `speed 2.914`, ~8.6s training fastest
+lap) is more likely encoder / SAC / physics ceiling than reward-shape limitation.
+
+### 6.6 Encoder crop-top: legacy v4 ResNet vs new ResNet runs
+
+The original `FrozenPretrainedCnnEncoder` inherited `MARGIN_TOP=40` from the VAE
+pipeline (the VAE was trained on cropped 80x160 frames). For ResNet / MobileNet
+this crop is not a good fit:
+
+- ImageNet-pretrained CNNs were trained on natural images with sky/horizon and
+  near-square aspect ratios.
+- Cropping the sim image to 80x160 (aspect 0.5) then resizing to 224x224 stretches
+  vertically by 2.8x and horizontally by 1.4x — extreme aspect distortion.
+- Keeping the full 120x160 (aspect 0.75) gives 224x224 stretches of 1.87x and 1.4x,
+  closer to natural-image proportions.
+
+A `crop_top` parameter was added to `FrozenPretrainedCnnEncoder` and exposed via
+`--encoder-crop-top` on the train/eval scripts:
+
+- **New ResNet runs**: `--encoder-crop-top 0` (default). No crop; full 120x160 → 224x224.
+- **Legacy v4 ResNet eval**: `--encoder-crop-top 40` (required). The saved policy
+  was trained on cropped 80x160 input, so eval must reproduce the same preprocessing.
+- VAE encoder is unaffected; it still uses its built-in `MARGIN_TOP=40` crop because
+  the VAE was trained on cropped frames and must match.
+
+### 6.7 Lessons from the fixed-light loop work
 
 - **Random light → mandatory off** before any visual encoder training on `generated_track`.
   See §3 and §5 reproducibility caveat.
@@ -865,18 +972,26 @@ The practices below are what produced a deployable checkpoint without overtraini
 ## 8. Current Recommendation
 
 - **Primary loop-track deployment**:
-  `models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_100000_steps.zip`.
-  Evaluated 3/3 truncate at `max_episode_steps=2000`, `mean_speed=2.689`,
-  `mean |cte|=0.301`. Reproducible across simulator restarts because VAE training, SAC
-  training, and eval all share the same fixed lighting.
-- **Backup loop-track**: `models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip`.
-  About 27% slower (`mean_speed=2.131`) but requires no VAE image collection.
-- **For new loop SAC runs**, copy the v2_h64 100k recipe exactly:
-  `--encoder vae`, `--hidden-size 64`, `--batch-size 64`, `--gradient-steps-min 10`,
-  `--gradient-steps-cap 2000`, safe_v2 reward defaults, cold start, eval at every
-  checkpoint. Do not use hidden=128 — it inflated some single-lap times but produced
-  unreliable truncation (1/4 vs 4/5).
-- **Compare runs by sustained metrics**, not "fastest single lap" (see §6.5).
+  `models/rl_loop_vae_sac_fixedlight_v3_h80/sac_loop_vae_90000_steps.zip`.
+  Evaluated 3/3 truncate at `max_episode_steps=2000`, `mean_speed=2.800`,
+  `mean |cte|=0.315`. Beat the earlier v2_h64 100k on speed/progress/reward.
+- **Secondary loop-track**:
+  `models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_100000_steps.zip`. 3/3
+  truncate, slightly slower (`mean_speed=2.689`), most centered (`mean |cte|=0.301`).
+- **Backup loop-track (no VAE collection)**:
+  `models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip`. About 32%
+  slower (`mean_speed=2.131`) than v3_h80 90k.
+- **For new loop SAC runs**, copy the v3_h80 90k recipe exactly:
+  `--encoder vae`, `--hidden-size 80`, `--batch-size 64`, `--gradient-steps-min 50`,
+  `--gradient-steps-cap 2000`, safe_v2 reward defaults (`speed=0.15, cte_pen=0.25`),
+  cold start, eval at every checkpoint. Stop training and use the best checkpoint
+  found in deterministic eval.
+- **Do not retune reward weights blindly.** v4 (`s=0.20, c=0.20`) and v5
+  (`s=0.20, c=0.25`) were both deliberately tested and both produced worse
+  deterministic-eval results than v3 (`s=0.15, c=0.25`). See §6.5 for the full ablation.
+- **Compare runs by sustained metrics**, not "fastest single lap" (see §6.7).
+- **For new ResNet/MobileNet runs use `--encoder-crop-top 0`**, not the legacy 40 that
+  the older v4 ResNet was trained with. See §6.6.
 - **Always disable simulator `randomlight`** before VAE collection / SAC training /
   eval. This was the root cause of the historical safe_v2 reproducibility failure.
 - The old `safe_v2 70k` artifact remains a "best ever under matched lighting" reference
@@ -939,20 +1054,22 @@ models/vae_loop_cones_fixedlight_v1/
   Fixed-light loop VAE encoder (80k frames, randomlight disabled). Used by the current
   loop deployment.
 
+models/rl_loop_vae_sac_fixedlight_v3_h80/
+  Primary loop-track deployment. Best checkpoint sac_loop_vae_90000_steps.zip.
+  hidden=80, batch=64, gradient_steps_min=50, gradient_steps_cap=2000, safe_v2 reward.
+  Eval: 3/3 truncate, mean_speed 2.800, mean |cte| 0.315. Beats v2_h64 100k by 4.1%
+  on speed and progress.
+
 models/rl_loop_vae_sac_fixedlight_v2_h64/
-  Primary loop-track deployment. Best checkpoint sac_loop_vae_100000_steps.zip; backup
-  sac_loop_vae_90000_steps.zip. Hidden=64, batch=64, fixed-light VAE encoder.
+  Secondary loop-track. Best checkpoint sac_loop_vae_100000_steps.zip; backup
+  sac_loop_vae_90000_steps.zip. Hidden=64, batch=64. Eval: 3/3 truncate, mean_speed
+  2.689, mean |cte| 0.301 (most centered of any branch).
 
 models/rl_loop_vae_sac_resnet_v4_notrees/
-  Backup loop-track SAC branch using frozen ImageNet ResNet18 features. Avoids VAE data
-  collection but runs slower than the fixed-light VAE deployment.
-```
-
-Optional in-progress:
-
-```text
-models/rl_loop_vae_sac_fixedlight_v3_h80/
-  Hidden=80 ablation against v2_h64. Not yet evaluated; may be deleted after evaluation.
+  Backup loop-track SAC branch using frozen ImageNet ResNet18 features (legacy
+  --encoder-crop-top 40 baked in). Best checkpoint sac_loop_vae_50000_steps.zip.
+  Eval: 3/3 truncate, mean_speed 2.131. Avoids VAE data collection but runs ~32%
+  slower than the fixed-light VAE deployment.
 ```
 
 Deleted model categories:
@@ -970,6 +1087,15 @@ models/rl_loop_vae_sac_speed_v1/
 models/rl_loop_vae_sac_fixedlight_v1/
   Hidden=128 attempt on the fixed-light VAE. Deleted because only 1/4 tested
   checkpoints reached 3/3 truncate; hidden=64 (v2_h64) is the better recipe.
+
+models/rl_loop_vae_sac_fixedlight_v4_h80_s20c20/
+  Reward weight ablation (speed=0.20, cte_pen=0.20). Deleted: all checkpoints lost
+  to v3_h80 90k by ~12% on speed and ~37% worse on mean_cte. See §6.5.
+
+models/rl_loop_vae_sac_fixedlight_v5_h80_s20/
+  Reward weight ablation (speed=0.20, cte_pen=0.25 unchanged). Deleted: only 70k
+  reached 2/3 truncate; 80k collapsed to 0/3 with mean 202 steps; 90k could produce
+  fast laps but not sustain. See §6.5.
 
 models/rl_loop_vae_sac_progress_v*/
 models/rl_loop_vae_sac_v1/
