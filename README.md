@@ -236,6 +236,16 @@ models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip
 Eval: 3/3 truncate at max=3000, mean_speed 2.131, mean |cte| 0.424. ~32% slower than
 the fixed-light VAE policy but doesn't depend on VAE data collection.
 
+**Cross-track experiment (in progress)** — first attempt to transfer the ResNet
+pipeline to `donkey-mountain-track-v0`. Mountain has different sim conventions:
+spawn cte ≈ 3.54 (yellow centerline is cte=0, right-lane center is at cte=3.5),
+and uphill sections need `max_throttle ≥ 0.5`. The script now exposes
+`--cte-target` to handle that — `--cte-target 3.5` measures `abs(cte - 3.5)` for
+termination and reward. `mountain_v1` (80k cold + 30k resume with widened cte
+wrapper) plateaued at 1/3 deterministic-eval truncate; the next session's
+`mountain_v2` will try a tighter curriculum (`--max-throttle 0.5`,
+`--max-cte-error 3.0` from the start). See [experiment log §6.8](docs/experiment-log.md#68-cross-track-transfer-attempt-resnet-on-mountain-track-v1-in-progress).
+
 **Reward shape (`safe_v2`, same for both branches above)**:
 
 ```text

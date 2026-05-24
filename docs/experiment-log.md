@@ -686,7 +686,7 @@ fixed lighting tone — eliminating the OOD drift that broke `safe_v2 70k` repro
 encoder:           models/vae_loop_cones_fixedlight_v1/best.pt
 randomlight:       DISABLED in sim before any frame collection
 total frames:      80k (slightly smaller than the 90k random-light v1 set)
-sim setup:         no trees on track (tree ground shadows broke encoder later — see 6.7)
+sim setup:         no trees on track (tree ground shadows broke encoder later — see 6.9)
 ```
 
 The VAE itself was trained with the same recipe as the previous loop VAE (z=512, top
@@ -888,7 +888,112 @@ A `crop_top` parameter was added to `FrozenPretrainedCnnEncoder` and exposed via
 - VAE encoder is unaffected; it still uses its built-in `MARGIN_TOP=40` crop because
   the VAE was trained on cropped frames and must match.
 
-### 6.7 Lessons from the fixed-light loop work
+### 6.7 Porting to other tracks: mountain-track cte and uphill quirks
+
+When prepping a ResNet18 transfer test on `donkey-mountain-track-v0`, two sim-side
+differences from `donkey-generated-track-v0` showed up that would silently break
+any "reuse the same config" attempt:
+
+1. **`cte = 0` is the YELLOW CENTERLINE, not the right-lane center.** Verified with
+   `tools/collect_sim_frames.py --action-mode cte-pid --cte-target 0`: the PID drove
+   the car onto the middle yellow line. Default spawn has cte ≈ 3.54 (consistent
+   across resets). Sim's own `max_cte` is 8.0 for this env. The trained loop
+   policies expect cte ≈ 0 to mean "well on the right lane", so a naive port
+   spawns the agent at cte = 3.54, which already exceeds our default
+   `--max-cte-error 2.0` wrapper, so the episode terminates at step 1.
+
+   Required adjustments for mountain-track:
+   - `--max-cte-error 5.0` minimum, 6.0 safer (spawn-margin), 8.0 to match sim.
+   - Any reward shaping that uses `abs(cte)` is now telling the agent to drive on
+     the yellow line. For driving-in-right-lane semantics, shape around
+     `abs(cte - 3.5)` (or relax cte penalty entirely for this track).
+
+2. **Initial uphill stalls at low throttle.** The default `--throttle 0.12` in
+   `tools/collect_sim_frames.py` works on flat generated-track but stalls on the
+   mountain uphill — the PID probe never makes progress on its first try.
+   Practical defaults for mountain-track: probe with `--throttle 0.25+`, SAC training
+   should keep `--max-throttle 0.7` (lowering to 0.5 to be "safe" would also
+   fail the climb).
+
+These are env-specific calibrations. Always probe a new track with the cte-pid
+collector at `--cte-target 0` first, watch where the car ends up visually, and size
+`--max-cte-error` / throttles accordingly.
+
+### 6.8 Cross-track transfer attempt: ResNet on mountain-track (v1, in progress)
+
+First test of "does the ResNet encoder pipeline transfer to a different track at all?".
+Mountain-track was chosen because it's geometrically the most different from
+generated-track (uphill/downhill, real-road textures) while still being a closed loop.
+
+Pre-flight findings (see §6.7) led to:
+- `--cte-target 3.5` (right-lane center, not 0)
+- `--max-cte-error 2.5` initially (later relaxed to 3.5)
+- `--encoder-crop-top 0` (new no-crop default for ResNet)
+- Same hidden=256, batch=256 as v4 loop ResNet
+- `--max-throttle 0.7` (keep default for uphill)
+
+**Phase 1 — cold from scratch, 80k, cte=2.5**
+
+| Checkpoint | Trunc | Steps Mean | Speed | Progress | Mean CTE | Max CTE | Reward |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 80k | 0/3 | 449 | 2.810 | 68 | 0.527 | 2.60 | 664 |
+
+Agent learned to drive (mean_speed 2.81 — actually faster than the loop deployment's
+2.80!) but every episode terminated when max_cte hit the 2.5 wrapper limit. Inspection
+showed max_cte 2.51, 2.52, 2.60 — all clipped by the wrapper, not the policy giving up.
+
+**Phase 2 — resume 80k → 110k with cte=3.5**
+
+| Checkpoint | Trunc | Steps Mean | Speed | Progress | Mean CTE | Max CTE | Reward |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **90k** | **1/3** | **1446** | 3.230 | 233 | 0.539 | 3.59 | 2205 |
+| 100k | 0/3 | 348 | 3.091 | 56 | 0.643 | 3.63 | 475 |
+| 110k | 0/3 | 1302 | 3.366 | 220 | 0.531 | 3.72 | 2001 |
+
+Loosening the cte wrapper from 2.5 to 3.5 immediately bought a 2741-step rollout in
+the first dump after resume, and a clean 3000-truncate by the second dump. But
+deterministic eval shows the policy is still **fast but fragile**: max_cte still
+pushes 3.5+, only 1/3 truncate at the best checkpoint (90k), 100k briefly regressed.
+
+Speed numbers (3.0+) are higher than the loop deployment, almost certainly because
+mountain-track has downhill sections that accelerate the car beyond what the loop
+gives.
+
+**Mountain throttle distribution at 110k (longest 3000-truncate episode)**:
+
+| Throttle bin | Share |
+| --- | ---: |
+| [0.20, 0.25) min | 32.4% |
+| middle 0.25–0.65 | 46.4% |
+| [0.65, 0.70) max | 21.2% |
+
+Less bang-bang than the loop policy (v2_h64 was 40.8% min + 12.1% max). Mountain
+agent uses the middle range more, reflecting more nuanced throttle modulation for
+uphill/downhill rhythm.
+
+**Open questions / next steps** (planned for next session):
+
+- The current v1 plateau at 1/3 truncate suggests it's not just "needs more training" —
+  the agent's fast-but-fragile profile points to the curriculum being too aggressive
+  from the start. Plan a `mountain_v2` run with curriculum mode:
+  - `--max-throttle 0.5` to cap downhill speed during early training
+  - `--max-cte-error 3.0` from the start (no late switching)
+  - Same encoder / hidden / batch
+  - Cold start, 80k initial
+- If v2 still plateaus at 1/3 truncate, the limit is likely ResNet's domain-general
+  features on a track ResNet has never specifically seen.
+
+Kept artifacts for reference / future resume:
+
+```text
+models/rl_loop_resnet_mountain_v1/sac_loop_vae_90000_steps.zip          (v1 best)
+models/rl_loop_resnet_mountain_v1/sac_loop_vae_replay_buffer_90000_steps.pkl
+models/rl_loop_resnet_mountain_v1/sac_loop_vae_80000_steps.zip          (pre-resume)
+```
+
+All other v1 checkpoints + buffers deleted (2.85 GB freed).
+
+### 6.9 Lessons from the fixed-light loop work
 
 - **Random light → mandatory off** before any visual encoder training on `generated_track`.
   See §3 and §5 reproducibility caveat.
@@ -989,7 +1094,7 @@ The practices below are what produced a deployable checkpoint without overtraini
 - **Do not retune reward weights blindly.** v4 (`s=0.20, c=0.20`) and v5
   (`s=0.20, c=0.25`) were both deliberately tested and both produced worse
   deterministic-eval results than v3 (`s=0.15, c=0.25`). See §6.5 for the full ablation.
-- **Compare runs by sustained metrics**, not "fastest single lap" (see §6.7).
+- **Compare runs by sustained metrics**, not "fastest single lap" (see §6.9).
 - **For new ResNet/MobileNet runs use `--encoder-crop-top 0`**, not the legacy 40 that
   the older v4 ResNet was trained with. See §6.6.
 - **Always disable simulator `randomlight`** before VAE collection / SAC training /
@@ -1065,6 +1170,12 @@ models/rl_loop_vae_sac_fixedlight_v2_h64/
   sac_loop_vae_90000_steps.zip. Hidden=64, batch=64. Eval: 3/3 truncate, mean_speed
   2.689, mean |cte| 0.301 (most centered of any branch).
 
+models/rl_loop_resnet_mountain_v1/
+  First mountain-track ResNet branch (v1). Kept sac_loop_vae_80000_steps.zip
+  (pre-resume) and sac_loop_vae_90000_steps.zip + buffer (v1 best, 1/3 truncate
+  on deterministic eval). Plateaued fast-but-fragile. Next session plan: cold-start
+  mountain_v2 with --max-throttle 0.5 + --max-cte-error 3.0 from the start (see §6.8).
+
 models/rl_loop_vae_sac_resnet_v4_notrees/
   Backup loop-track SAC branch using frozen ImageNet ResNet18 features (legacy
   --encoder-crop-top 40 baked in). Best checkpoint sac_loop_vae_50000_steps.zip.
@@ -1107,3 +1218,44 @@ models/vae_raffin_smoke/
 models/bc_official_categorical_9bin_sampler6_300/
   Failed, exploratory, or superseded experiment branches.
 ```
+
+## 10. Open TODOs
+
+### Next session: mountain_v2 curriculum cold start
+
+Run with the lessons from mountain_v1:
+
+```bash
+python rl/train_loop_vae_sac.py \
+    --env-id donkey-mountain-track-v0 \
+    --output-dir models/rl_loop_resnet_mountain_v2 \
+    --encoder resnet18 \
+    --encoder-crop-top 0 \
+    --hidden-size 256 \
+    --batch-size 256 \
+    --cte-target 3.5 \
+    --max-cte-error 3.0 \
+    --max-throttle 0.5 \
+    --timesteps 80000 \
+    --save-replay-buffer --save-final-replay-buffer \
+    --device cuda
+```
+
+Hypothesis being tested: lowering `--max-throttle` and widening `--max-cte-error`
+from the start should let the agent collect more useful experience early
+(no early-spawn terminate, no downhill speed runaway), and the policy should
+converge to a 3/3 deterministic-eval truncate. If v2 still plateaus at 1/3,
+the limit is ResNet's domain-general features on a track ResNet has never
+specifically seen, and the next move would be a mountain-specific VAE
+(or DINOv2 / a self-supervised alternative).
+
+### Other open items
+
+- Mountain v1's 90k checkpoint is kept as a reference. If v2 succeeds, v1
+  artifacts can be removed entirely.
+- Loop deployment v3_h80 90k is still the production model. No work scheduled
+  for it.
+- No further reward-weight ablations planned on loop (§6.5 closed the loop).
+- No further hidden-size ablations planned on loop (h64 → h80 → h128 path
+  fully explored).
+
