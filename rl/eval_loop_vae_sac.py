@@ -30,7 +30,9 @@ from rl.train_vae_sac import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate VAE+SAC on the generated_track loop.")
     parser.add_argument("--model", type=Path, default=Path("models/rl_loop_vae_sac_v1/final_model.zip"))
-    parser.add_argument("--encoder", choices=["vae", "resnet18", "mobilenet_v3_small"], default="vae",
+    parser.add_argument("--encoder",
+                        choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14"],
+                        default="vae",
                         help="Image encoder. Must match what the SAC model was trained with.")
     parser.add_argument("--encoder-crop-top", type=int, default=0,
                         help="Top-row pixels to crop before encoding (ResNet/MobileNet only). "
@@ -52,13 +54,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cte-target", type=float, default=0.0,
                         help="The cte value treated as 'lane center'. Use 3.5 for "
                              "mountain-track (right lane spawn) or keep 0 for generated-track.")
-    parser.add_argument("--throttle-reward-weight", type=float, default=0.0)
     parser.add_argument("--reward-crash", type=float, default=-10.0)
     parser.add_argument("--crash-speed-weight", type=float, default=5.0)
     parser.add_argument("--alive-reward", type=float, default=1.5)
     parser.add_argument("--speed-reward-weight", type=float, default=0.15)
     parser.add_argument("--min-alive-speed", type=float, default=0.0)
-    parser.add_argument("--progress-reward-weight", type=float, default=0.0)
+    parser.add_argument("--alive-scale-floor", type=float, default=0.0,
+                        help="Match training value (only matters if min_alive_speed>0).")
+    parser.add_argument("--lap-completion-bonus", type=float, default=0.0,
+                        help="Match training value (affects reported reward only).")
     parser.add_argument("--cte-speed-penalty-weight", type=float, default=0.25)
     parser.add_argument("--deterministic", action="store_true", default=True)
     return parser.parse_args()
@@ -83,13 +87,13 @@ def main() -> None:
         n_command_history=N_COMMAND_HISTORY,
         reward_config=RaffinRewardConfig(
             max_cte_error=args.max_cte_error,
-            throttle_reward_weight=args.throttle_reward_weight,
             reward_crash=args.reward_crash,
             crash_speed_weight=args.crash_speed_weight,
             alive_reward=args.alive_reward,
             speed_reward_weight=args.speed_reward_weight,
             min_alive_speed=args.min_alive_speed,
-            progress_reward_weight=args.progress_reward_weight,
+            alive_scale_floor=args.alive_scale_floor,
+            lap_completion_bonus=args.lap_completion_bonus,
             cte_speed_penalty_weight=args.cte_speed_penalty_weight,
             cte_target=args.cte_target,
         ),
@@ -100,10 +104,14 @@ def main() -> None:
     print(f"Loaded {args.model}")
 
     results = []
+    all_lap_times: list[float] = []
     for ep in range(1, args.episodes + 1):
         obs, _ = env.reset()
-        total_r, steps, max_cte, cte_sum, speed_sum, progress_sum = 0.0, 0, 0.0, 0.0, 0.0, 0.0
+        total_r, steps, max_cte, cte_sum, speed_sum = 0.0, 0, 0.0, 0.0, 0.0
         terminated = truncated = False
+        ep_lap_times: list[float] = []
+        prev_lap_count = 0
+        last_seen_lap_time = 0.0
         while not (terminated or truncated):
             action, _ = model.predict(obs, deterministic=args.deterministic)
             obs, reward, terminated, truncated, info = env.step(action)
@@ -113,14 +121,24 @@ def main() -> None:
             max_cte = max(max_cte, abs_cte)
             cte_sum += abs_cte
             speed_sum += float(info.get("speed", 0.0))
-            progress_sum += float(info.get("delta_pos_distance", 0.0))
+            cur_lap_count = int(info.get("lap_count", 0))
+            cur_last_lap = float(info.get("last_lap_time", 0.0))
+            if cur_lap_count > prev_lap_count and cur_last_lap > 0 and cur_last_lap != last_seen_lap_time:
+                ep_lap_times.append(cur_last_lap)
+                last_seen_lap_time = cur_last_lap
+            prev_lap_count = cur_lap_count
         outcome = f"TRUNC({args.max_episode_steps})" if (truncated and not terminated) else "OUT"
         mean_cte = cte_sum / max(1, steps)
         mean_speed = speed_sum / max(1, steps)
+        lap_count = prev_lap_count
+        best_lap = min(ep_lap_times) if ep_lap_times else 0.0
+        mean_lap = float(np.mean(ep_lap_times)) if ep_lap_times else 0.0
+        all_lap_times.extend(ep_lap_times)
         print(
             f"ep {ep:2d}: steps={steps:5d} rew={total_r:8.1f} "
-            f"mean_speed={mean_speed:.3f} progress={progress_sum:.1f} "
-            f"mean_cte={mean_cte:.3f} max_cte={max_cte:.2f} {outcome}"
+            f"mean_speed={mean_speed:.3f} "
+            f"mean_cte={mean_cte:.3f} max_cte={max_cte:.2f} "
+            f"laps={lap_count} best_lap={best_lap:.2f}s mean_lap={mean_lap:.2f}s {outcome}"
         )
         results.append(
             {
@@ -129,8 +147,10 @@ def main() -> None:
                 "mean_speed": mean_speed,
                 "mean_cte": mean_cte,
                 "max_cte": max_cte,
-                "progress": progress_sum,
                 "outcome": outcome,
+                "lap_count": lap_count,
+                "best_lap": best_lap,
+                "mean_lap": mean_lap,
             }
         )
 
@@ -139,18 +159,20 @@ def main() -> None:
     speed_arr = np.asarray([r["mean_speed"] for r in results], dtype=np.float32)
     cte_arr = np.asarray([r["mean_cte"] for r in results], dtype=np.float32)
     max_cte_arr = np.asarray([r["max_cte"] for r in results], dtype=np.float32)
-    progress_arr = np.asarray([r["progress"] for r in results], dtype=np.float32)
     truncs = sum(1 for r in results if r["outcome"].startswith("TRUNC"))
+    total_laps = sum(r["lap_count"] for r in results)
+    overall_best = min(all_lap_times) if all_lap_times else 0.0
+    overall_mean_lap = float(np.mean(all_lap_times)) if all_lap_times else 0.0
     print(
         "\n--- summary ---\n"
         f"episodes:       {len(results)}\n"
         f"steps mean:     {steps_arr.mean():.0f}   median: {int(np.median(steps_arr))}   max: {int(steps_arr.max())}   min: {int(steps_arr.min())}\n"
         f"reward mean:    {rew_arr.mean():.1f}\n"
         f"speed mean:     {speed_arr.mean():.3f}\n"
-        f"progress mean:  {progress_arr.mean():.1f}\n"
         f"mean_abs_cte:   {cte_arr.mean():.3f}\n"
         f"max_abs_cte:    {max_cte_arr.max():.3f}\n"
-        f"truncated:      {truncs}/{len(results)}"
+        f"truncated:      {truncs}/{len(results)}\n"
+        f"total_laps:     {total_laps}   best_lap: {overall_best:.2f}s   mean_lap: {overall_mean_lap:.2f}s"
     )
     env.close()
 

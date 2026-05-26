@@ -36,9 +36,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-id", default="donkey-generated-track-v0")
     parser.add_argument("--host", default=os.environ.get("DONKEY_SIM_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("DONKEY_SIM_PORT", "9091")))
-    parser.add_argument("--encoder", choices=["vae", "resnet18", "mobilenet_v3_small"], default="vae",
+    parser.add_argument("--encoder",
+                        choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14"],
+                        default="vae",
                         help="Image encoder. 'vae' uses --vae-model checkpoint; "
-                             "'resnet18' / 'mobilenet_v3_small' use frozen ImageNet-pretrained weights.")
+                             "'resnet18' / 'mobilenet_v3_small' use frozen ImageNet-pretrained weights; "
+                             "'dinov2_vits14' / 'dinov2_vitb14' use frozen DINOv2 ViT-S(384)/B(768).")
     parser.add_argument("--encoder-crop-top", type=int, default=0,
                         help="Top-row pixels to crop before encoding (ResNet/MobileNet only; VAE "
                              "uses its own fixed crop). Default 0 (no crop) reduces aspect ratio "
@@ -65,13 +68,20 @@ def parse_args() -> argparse.Namespace:
                              "is 0 (right-lane center). On mountain-track spawn is at cte~3.54, "
                              "so set --cte-target 3.5 to make the agent drive in the right lane "
                              "(termination and cte_speed_penalty both measure |cte - target|).")
-    parser.add_argument("--throttle-reward-weight", type=float, default=0.0)
     parser.add_argument("--reward-crash", type=float, default=-10.0)
     parser.add_argument("--crash-speed-weight", type=float, default=5.0)
     parser.add_argument("--alive-reward", type=float, default=1.5)
     parser.add_argument("--speed-reward-weight", type=float, default=0.15)
     parser.add_argument("--min-alive-speed", type=float, default=0.0)
-    parser.add_argument("--progress-reward-weight", type=float, default=0.0)
+    parser.add_argument("--alive-scale-floor", type=float, default=0.0,
+                        help="Minimum alive_scale at speed=0 when min_alive_speed>0. "
+                             "Default 0 means alive_scale ramps from 0 to 1 linearly (sharp). "
+                             "Setting 0.5 makes it ramp from 0.5 to 1 (softer), so the agent "
+                             "keeps half its alive reward even when slowing for corners.")
+    parser.add_argument("--lap-completion-bonus", type=float, default=0.0,
+                        help="Discrete reward added when info['lap_count'] increments. "
+                             "0 disables (default). 100 = a completed lap is worth ~67 "
+                             "steps of alive reward at alive=1.5.")
     parser.add_argument("--cte-speed-penalty-weight", type=float, default=0.25,
                         help="Per-step penalty: -w * |cte| * speed. Punishes 'fast while off-line' "
                              "to bring corner-crash signal forward in time. v2 default 0.25.")
@@ -80,17 +90,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--override-learning-rate", action="store_true",
                         help="On --resume-model, override the saved LR with --learning-rate. "
                              "Default behavior on resume is to keep the saved LR.")
-    parser.add_argument("--buffer-size", type=int, default=60_000)
+    parser.add_argument("--buffer-size", type=int, default=30_000)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--hidden-size", type=int, default=64,
                         help="SAC MLP hidden layer size (pi and qf use [h, h]). VAE-trained "
                              "safe_v2 used 64; ResNet/DINO need 256+ to learn projection.")
-    parser.add_argument("--learning-starts", type=int, default=1_000)
+    parser.add_argument("--learning-starts", type=int, default=500)
     parser.add_argument("--train-freq", type=int, default=1)
     parser.add_argument("--train-freq-unit", choices=["step", "episode"], default="episode")
     parser.add_argument("--gradient-steps", type=int, default=-1)
     parser.add_argument("--gradient-steps-cap", type=int, default=1000)
-    parser.add_argument("--gradient-steps-min", type=int, default=500,
+    parser.add_argument("--gradient-steps-min", type=int, default=50,
                         help="Floor on dynamic gradient_steps (used with train_freq=episode). "
                              "Guarantees at least this many off-policy updates per training cycle.")
     parser.add_argument("--gamma", type=float, default=0.99)
