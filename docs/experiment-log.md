@@ -1227,7 +1227,7 @@ fixed-light run. Fixed-light VAE lap count is 5 laps / 1000 steps.)
 - If a speed bonus is too large, late training can regress even after the policy has
   learned to drive.
 
-### Monitoring gotchas (learned during safe_v2)
+### 7.1 Monitoring gotchas (learned during safe_v2)
 
 - **SB3 console dumps every 4 episodes by default.** The `rollout_ep_len` field in the
   printed table is the length of the *last* episode in that batch of four. Intermediate
@@ -1247,7 +1247,7 @@ fixed-light run. Fixed-light VAE lap count is 5 laps / 1000 steps.)
   dominated by older long episodes, so it underreports recent collapses. Deterministic
   evaluation at each checkpoint is the reliable signal.
 
-## 7.5 Monitoring Practices
+### 7.2 Monitoring practices
 
 The practices below are what produced a deployable checkpoint without overtraining:
 
@@ -1262,36 +1262,12 @@ The practices below are what produced a deployable checkpoint without overtraini
 - Keep only the best-performing checkpoint plus the immediate seed; delete everything
   else to keep the model directory navigable.
 
-## 8. Current Recommendation
+## 8. Design Recommendations
 
-- **Primary loop-track deployment**:
-  `models/rl_loop_vae_sac_fixedlight_v3_h80/sac_loop_vae_90000_steps.zip`.
-  Evaluated 3/3 truncate at `max_episode_steps=2000`, `mean_speed=2.800`,
-  `mean |cte|=0.315`. Beat the earlier v2_h64 100k on speed/progress/reward.
-- **Co-primary loop-track deployment (alternative reward recipe)**:
-  `models/rl_loop_vae_v15/sac_loop_vae_112488_steps.zip`.
-  Evaluated **5/5 truncate at `max_episode_steps=3000`**, `mean_speed=2.797`,
-  `mean |cte|=0.356`, mean_lap 9.47s, best_lap 9.11s, 75 laps total.
-  Uses `--lap-completion-bonus 50 --crash-speed-weight 15` on top of the v3_h80
-  base; cold-start at hidden=80 plus two resumes, 112488 the peak. Slightly slower
-  and looser on cte than v3_h80 90k but reaches the same "100% truncate" bar.
-  Useful as a second checkpoint with an independently tuned reward shape. The
-  +20k resume past 112488 was tried and reverted: 122488 = valley, 132488 = 2/5
-  truncate (faster single laps, not deployable). See
-  `docs/session_2026-05-26_log.md` §"Day 2 follow-up".
-- **Secondary loop-track**:
-  `models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_100000_steps.zip`. 3/3
-  truncate, slightly slower (`mean_speed=2.689`), most centered (`mean |cte|=0.301`).
-- **Backup loop-track (no VAE collection)**:
-  `models/rl_loop_vae_sac_resnet_v4_notrees/sac_resnet18_50000_steps.zip`. About 32%
-  slower (`mean_speed=2.131`) than v3_h80 90k.
-- **Primary mountain-track deployment**:
-  `models/rl_dinov2_mountain_v2/sac_dinov2_vits14_40000_steps.zip`.
-  Evaluated **5/5 truncate at `max_episode_steps=2000`**, `mean_speed=2.093`,
-  `mean |cte|=0.577`, `max |cte|=2.112`, best_lap 28.41s, mean_lap 29.88s.
-  Frozen DINOv2-S encoder, hidden=256. Built via v1 cold start → resume from v1 30k
-  with stricter cte (0.25→0.30), heavier crash (-10→-20, crash_speed 5→10), LR
-  override 2e-4. See §6.10 for the full pipeline + v3/v4 failure analysis.
+Current deployments and eval commands: see [README.md](../README.md).
+
+What the experiments established about how to train and evaluate:
+
 - **For new loop SAC runs**, copy the v3_h80 90k recipe exactly:
   `--encoder vae`, `--hidden-size 80`, `--batch-size 64`, `--gradient-steps-min 50`,
   `--gradient-steps-cap 2000`, safe_v2 reward defaults (`speed=0.15, cte_pen=0.25`),
@@ -1343,73 +1319,7 @@ data/vae_loop_cones_v1/
   Manifest for the removed random-light loop VAE dataset.
 ```
 
-Current `models/`:
-
-```text
-models/bc_nvidia_slow_006_flip/
-  BC regression baseline. It was the most stable BC route and also initialized the
-  categorical model. Closed-loop evaluation needs about 1.8x steering scale.
-
-models/bc_official_categorical_curve_aug_balanced_v1/
-  Best retained official-style categorical BC model. Closed-loop evaluation needs about
-  1.4x steering scale, but it was generally less stable than regression and much weaker
-  than RL.
-
-models/vae_raffin_v1/
-  VAE encoder for the original generated-road RL baseline.
-
-models/rl_vae_sac_raffin_v1/
-  SAC policy for the original generated-road RL baseline using models/vae_raffin_v1.
-
-models/vae_loop_cones_fixedlight_v1/
-  Fixed-light loop VAE encoder (80k frames, randomlight disabled). Used by the current
-  loop deployment.
-
-models/rl_loop_vae_sac_fixedlight_v3_h80/
-  Primary loop-track deployment. Best checkpoint sac_loop_vae_90000_steps.zip.
-  hidden=80, batch=64, gradient_steps_min=50, gradient_steps_cap=2000, safe_v2 reward.
-  Eval: 3/3 truncate, mean_speed 2.800, mean |cte| 0.315. Beats v2_h64 100k by 4.1%
-  on speed and progress.
-
-models/rl_loop_vae_v15/
-  Co-primary loop-track deployment using a different reward recipe.
-  Best checkpoint sac_loop_vae_112488_steps.zip (5/5 truncate @5ep,
-  mean_speed 2.797, mean_lap 9.47s, best_lap 9.11s). Recipe: VAE encoder,
-  hidden=80, batch=64, gradient_steps_min=200, gradient_steps_cap=2000,
-  lap_completion_bonus=50, crash_speed_weight=15 (safe_v2 base + new
-  shaping terms). Cold-start 60k + 30k + 20k resume = 112488.
-  Also retained: sac_loop_vae_132488_steps.zip — faster on best_lap
-  (8.83s) but only 2/5 truncate; reference, not deployed. See
-  docs/session_2026-05-26_log.md for the full v15 narrative.
-
-models/rl_loop_vae_sac_fixedlight_v2_h64/
-  Secondary loop-track. Best checkpoint sac_loop_vae_100000_steps.zip; backup
-  sac_loop_vae_90000_steps.zip. Hidden=64, batch=64. Eval: 3/3 truncate, mean_speed
-  2.689, mean |cte| 0.301 (most centered of any branch).
-
-models/rl_loop_resnet_mountain_v1/
-  First mountain-track ResNet branch (v1). Kept sac_resnet18_80000_steps.zip
-  (pre-resume) and sac_resnet18_90000_steps.zip + buffer (v1 best, 1/3 truncate
-  on deterministic eval). Plateaued fast-but-fragile. Superseded by the DINOv2
-  pipeline (§6.10).
-
-models/rl_dinov2_mountain_v1/
-  Mountain-track DINOv2 cold-start branch. Kept all 6 checkpoints (10k/20k/30k
-  /40k/50k/60k) + replay buffers. Best deterministic eval at 30k (5/5 truncate,
-  mean_speed 1.998, mean_lap 31.09s). Superseded by v2 40k as deployment.
-
-models/rl_dinov2_mountain_v2/
-  Primary mountain-track deployment. Resumed from v1 30k with stricter cte (0.30),
-  heavier crash (-20 / crash_speed 10), LR override 2e-4. Kept 40k (5/5 truncate,
-  mean_speed 2.093, mean_lap 29.88s — current deployment) and 50k (still 5/5 but
-  cte rising) as backup. 60k collapsed and was deleted.
-
-models/rl_loop_vae_sac_resnet_v4_notrees/
-  Backup loop-track SAC branch using frozen ImageNet ResNet18 features (legacy
-  --encoder-crop-top 40 baked in). Best checkpoint sac_resnet18_50000_steps.zip.
-  Eval: 3/3 truncate, mean_speed 2.131. Avoids VAE data collection but runs ~32%
-  slower than the fixed-light VAE deployment.
-```
+Active `models/`: see [README — Model Inventory](../README.md#model-inventory).
 
 Deleted model categories:
 
