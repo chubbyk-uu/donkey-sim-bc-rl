@@ -15,12 +15,12 @@ Detailed experiment history and design decisions: [docs/experiment-log.md](docs/
 
 ### Loop Track (`donkey-generated-track-v0`)
 
-| Model | Encoder | Eval | Speed | CTE |
-|---|---|:---:|---:|---:|
-| `rl_loop_vae_sac_fixedlight_v3_h80` 90k | VAE (fixed-light) | 3/3 trunc | 2.800 | 0.315 |
-| `rl_loop_vae_v15` 112k | VAE (fixed-light) | 5/5 trunc | 2.797 | 0.356 |
-| `rl_loop_vae_sac_resnet_v4_notrees` 50k | ResNet18 (frozen) | 3/3 trunc | 2.131 | 0.424 |
-| `rl_loop_dinov2_v8` 30k | DINOv2-S (frozen) | 3/3 trunc | 2.356 | 0.565 |
+| Model | Encoder | Eval | Speed | CTE | Max steps |
+|---|---|:---:|---:|---:|---:|
+| `rl_loop_vae_sac_fixedlight_v3_h80` 90k | VAE (fixed-light) | 3/3 trunc | 2.800 | 0.315 | 2000 |
+| `rl_loop_vae_v15` 112k | VAE (fixed-light) | 5/5 trunc | 2.797 | 0.356 | 3000 |
+| `rl_loop_vae_sac_resnet_v4_notrees` 50k | ResNet18 (frozen) | 3/3 trunc | 2.131 | 0.424 | 3000 |
+| `rl_loop_dinov2_v8` 30k | DINOv2-S (frozen) | 3/3 trunc | 2.414 | 0.565 | 2000 |
 
 Evaluate the primary VAE deployment:
 
@@ -64,6 +64,7 @@ python rl/eval_loop_vae_sac.py \
   --env-id donkey-mountain-track-v0 \
   --encoder dinov2_vits14 \
   --cte-target 3.5 --max-cte-error 2.5 \
+  --max-throttle 0.7 \
   --model models/rl_dinov2_mountain_v2/sac_dinov2_vits14_40000_steps.zip \
   --episodes 5 --max-episode-steps 2000
 ```
@@ -79,8 +80,7 @@ Use `--max-throttle 0.7` for uphill segments.
 ### Single Generated Road (`donkey-generated-roads-v0`)
 
 The original Raffin-style VAE+SAC baseline. Drives a fixed generated road (not a
-closed loop — a good run reaches the end before 3000 steps). Trained with
-random-light VAE data, so results vary slightly across sim restarts. Kept as a
+closed loop — a good run reaches the end before 3000 steps). Kept as a
 starting-point reference; not the current main target.
 
 ```bash

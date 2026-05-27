@@ -1176,7 +1176,7 @@ episode); "Fixed light" = simulator default stable lighting.
 | --- | --- | --- |
 | VAE (task-specific, fixedlight) | rl_loop_vae_fixedlight_v3_h80 | 90k |
 | DINOv2 ViT-S (frozen ImageNet-pretrained) | rl_loop_dinov2_v8 | 30k |
-| ResNet18 (frozen ImageNet-pretrained) | rl_loop_resnet_v4 | 50k |
+| ResNet18 (frozen ImageNet-pretrained) | rl_loop_vae_sac_resnet_v4_notrees | 50k |
 
 **Results**
 
@@ -1270,11 +1270,12 @@ Current deployments and eval commands: see [README.md](../README.md).
 
 What the experiments established about how to train and evaluate:
 
-- **For new loop SAC runs**, copy the v3_h80 90k recipe exactly:
-  `--encoder vae`, `--hidden-size 80`, `--batch-size 64`, `--gradient-steps-min 50`,
-  `--gradient-steps-cap 2000`, safe_v2 reward defaults (`speed=0.15, cte_pen=0.25`),
-  cold start, eval at every checkpoint. Stop training and use the best checkpoint
-  found in deterministic eval.
+- **For new loop SAC runs**, the proven reward recipe is v3_h80 90k:
+  `--encoder vae`, `--hidden-size 80`, safe_v2 reward defaults (`speed=0.15,
+  cte_pen=0.25`), cold start, eval at every checkpoint. Use the best checkpoint
+  from deterministic eval. Note: v3_h80 was trained with `--batch-size 64
+  --gradient-steps-cap 2000`; current defaults are 128/1000 (see §6.11) and
+  have not yet been validated — see README for the up-to-date training command.
 - **Do not retune reward weights blindly.** v4 (`s=0.20, c=0.20`) and v5
   (`s=0.20, c=0.25`) were both deliberately tested and both produced worse
   deterministic-eval results than v3 (`s=0.15, c=0.25`). See §6.5 for the full ablation.
