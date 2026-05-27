@@ -74,6 +74,57 @@ Use `--max-throttle 0.7` for uphill segments.
 
 ---
 
+## Other Baselines
+
+### Single Generated Road (`donkey-generated-roads-v0`)
+
+The original Raffin-style VAE+SAC baseline. Drives a fixed generated road (not a
+closed loop — a good run reaches the end before 3000 steps). Trained with
+random-light VAE data, so results vary slightly across sim restarts. Kept as a
+starting-point reference; not the current main target.
+
+```bash
+python rl/eval_vae_sac.py \
+  --model models/rl_vae_sac_raffin_v1/final_model.zip \
+  --vae-model models/vae_raffin_v1/best.pt \
+  --episodes 3
+```
+
+### Behavioral Cloning
+
+Two BC approaches were trained on slow-driving demonstration data:
+
+**Regression CNN** (`bc_nvidia_slow_006_flip`):
+
+```bash
+python bc/eval_bc.py \
+  --model models/bc_nvidia_slow_006_flip/best.pt \
+  --steering-scale 1.8 \
+  --episodes 3
+```
+
+**Official-style categorical** (`bc_official_categorical_curve_aug_balanced_v1`):
+
+```bash
+python bc/eval_bc_official_categorical.py \
+  --model models/bc_official_categorical_curve_aug_balanced_v1/best.pt \
+  --steering-scale 1.4 \
+  --episodes 3
+```
+
+Both models output steering values that are too small for closed-loop driving —
+the `--steering-scale` flag compensates at eval time (1.8× regression, 1.4×
+categorical). Regression was more stable in closed-loop driving; categorical had
+sharper corner response but was less consistent. Both are clearly outperformed by
+the RL policies.
+
+Training data lives in `data/slow_data_raw/` (6 generated-road tubs) and
+`data/curated_cornering_v*_clean/` (augmented cornering subsets). See
+[experiment log §1](docs/experiment-log.md#1-behavioral-cloning) for the full
+BC experiment history.
+
+---
+
 ## Environment Setup
 
 ### Connecting to the simulator
