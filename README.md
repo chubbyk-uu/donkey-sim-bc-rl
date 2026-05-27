@@ -163,7 +163,7 @@ Evaluate the ResNet18 alternative (no VAE collection needed):
 python rl/eval_loop_vae_sac.py \
   --encoder resnet18 \
   --encoder-crop-top 40 \
-  --model models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip \
+  --model models/rl_loop_vae_sac_resnet_v4_notrees/sac_resnet18_50000_steps.zip \
   --episodes 3 \
   --max-episode-steps 2000
 ```
@@ -235,22 +235,41 @@ Eval: 3/3 truncate, mean_speed 2.689, mean |cte| 0.301, max |cte| 1.65.
 **Backup** (frozen ResNet18, no VAE collection needed):
 
 ```text
-models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip
+models/rl_loop_vae_sac_resnet_v4_notrees/sac_resnet18_50000_steps.zip
 ```
 
 Eval: 3/3 truncate at max=3000, mean_speed 2.131, mean |cte| 0.424. ~32% slower than
 the fixed-light VAE policy but doesn't depend on VAE data collection.
 
-**Cross-track experiment (v1 complete, v2 planned)** — first attempt to transfer the
-ResNet pipeline to `donkey-mountain-track-v0`. Mountain has different sim conventions:
-spawn cte ≈ 3.54 (yellow centerline is cte=0, right-lane center is at cte=3.5), and
-uphill sections need `max_throttle ≥ 0.5`. The script now exposes `--cte-target` to
-handle that — `--cte-target 3.5` measures `abs(cte - 3.5)` for termination and reward.
-`mountain_v1` (80k cold + 30k resume with widened cte wrapper) plateaued at 1/3
-deterministic-eval truncate at the 90k checkpoint; the planned next-session
-`mountain_v2` will try a tighter curriculum (`--max-throttle 0.5`, `--max-cte-error 3.0`
-from the start). See
-[experiment log §6.8](docs/experiment-log.md#68-cross-track-transfer-attempt-resnet-on-mountain-track-v1-complete-v2-planned).
+**Co-deployment (alternative reward recipe, fixed-light VAE)**:
+
+```text
+models/rl_loop_vae_v15/sac_loop_vae_112488_steps.zip
+```
+
+Eval: 5/5 truncate at max=3000, mean_speed 2.797, mean |cte| 0.356, best_lap 9.11s,
+mean_lap 9.47s. Uses `--lap-completion-bonus 50 --crash-speed-weight 15` on top of the
+v3_h80 base. Slightly slower / wider than v3_h80 but reaches the same 100% truncate bar.
+See [experiment log §8](docs/experiment-log.md#8-current-recommendation).
+
+### Mountain Track
+
+**Primary deployment** (DINOv2-S encoder + SAC, resumed from v1 30k with stricter
+cte / heavier crash reward):
+
+```text
+models/rl_dinov2_mountain_v2/sac_dinov2_vits14_40000_steps.zip
+```
+
+Eval: 5/5 truncate at max=2000, mean_speed 2.093, mean |cte| 0.577, max |cte| 2.112,
+best_lap 28.41s, mean_lap 29.88s, 15 laps. Encoder is frozen DINOv2-S (`dinov2_vits14`,
+z=384) — no per-track VAE collection required.
+
+Mountain sim conventions: spawn cte ≈ 3.54 (yellow centerline = cte=0, right-lane
+center = cte=3.5); uphill needs `--max-throttle 0.7`. Use `--cte-target 3.5` so
+termination and reward measure `abs(cte - 3.5)`. See
+[experiment log §6.10](docs/experiment-log.md#610-mountain-track-dinov2-pipeline)
+for the full v1 cold + v2 resume + v3/v4 cold-start failure story.
 
 **Reward formula (`safe_v2`, used by both VAE branches and the ResNet branch)**:
 
@@ -407,6 +426,23 @@ models/rl_loop_vae_sac_fixedlight_v2_h64/
 
 models/rl_loop_vae_sac_resnet_v4_notrees/
   Backup loop-track SAC branch using frozen ResNet18 features. Best checkpoint is
-  sac_loop_vae_50000_steps.zip. Trained with legacy --encoder-crop-top 40 (must
+  sac_resnet18_50000_steps.zip. Trained with legacy --encoder-crop-top 40 (must
   pass that flag at eval time). New ResNet runs should use --encoder-crop-top 0.
+
+models/rl_loop_vae_v15/
+  Co-primary loop-track deployment with alternative reward (lap_bonus=50,
+  crash_speed_weight=15). Best checkpoint sac_loop_vae_112488_steps.zip
+  (5/5 truncate, mean_speed 2.797, mean_lap 9.47s). Also retains
+  sac_loop_vae_132488_steps.zip as a faster-but-not-deployable reference.
+
+models/rl_dinov2_mountain_v1/
+  Mountain-track DINOv2 cold-start branch. Best checkpoint
+  sac_dinov2_vits14_30000_steps.zip (5/5 truncate, mean_speed 1.998, mean_lap 31.09s).
+  Superseded by mountain_v2 40k.
+
+models/rl_dinov2_mountain_v2/
+  Mountain-track deployment. Resumed from mountain_v1 30k with stricter cte
+  penalty (0.25→0.30), heavier crash (-10→-20, crash_speed 5→10), and LR
+  override 2e-4. Best checkpoint sac_dinov2_vits14_40000_steps.zip
+  (5/5 truncate, mean_speed 2.093, mean_lap 29.88s).
 ```

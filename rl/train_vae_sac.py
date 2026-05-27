@@ -289,17 +289,20 @@ class DonkeyVaeSACEnv(gym.Wrapper):
 
 
 class CappedDynamicGradientStepsCallback(BaseCallback):
-    """gradient_steps = clamp(episode_length, [floor, cap]).
+    """gradient_steps = clamp(episode_length * scale, [floor, cap]).
 
     Used with train_freq=(1, 'episode'). Each training cycle scales updates with
     collected data, capped to prevent runaway compute on long episodes and
     floored to guarantee a minimum amount of off-policy learning per cycle.
+    `scale` < 1 reduces updates relative to env steps (useful to dampen
+    late-training overfit on long truncate episodes).
     """
 
-    def __init__(self, cap: int, floor: int = 1) -> None:
+    def __init__(self, cap: int, floor: int = 1, scale: float = 1.0) -> None:
         super().__init__()
         self.cap = cap
         self.floor = max(1, int(floor))
+        self.scale = float(scale)
         self._rollout_start_ts = 0
 
     def _on_rollout_start(self) -> None:
@@ -310,7 +313,8 @@ class CappedDynamicGradientStepsCallback(BaseCallback):
 
     def _on_rollout_end(self) -> None:
         ep_len = max(1, int(self.model.num_timesteps) - self._rollout_start_ts)
-        new_grads = max(self.floor, min(ep_len, self.cap))
+        scaled = int(ep_len * self.scale)
+        new_grads = max(self.floor, min(scaled, self.cap))
         self.model.gradient_steps = new_grads
         # use record_mean: per-rollout values aggregated across dump window
         self.logger.record_mean("train/gradient_steps_used", new_grads)
@@ -425,8 +429,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-alive-speed", type=float, default=MIN_ALIVE_SPEED)
 
     parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--buffer-size", type=int, default=30_000)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--buffer-size", type=int, default=50_000)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--learning-starts", type=int, default=300)
     parser.add_argument(
         "--train-freq",
@@ -445,11 +449,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gradient-steps-cap",
         type=int,
-        default=600,
-        help="gradient_steps becomes min(episode_length, cap) per training cycle. "
-             "Default 600 matches the intended Raffin-style schedule (proportional updates with a 600 ceiling). "
+        default=1000,
+        help="gradient_steps becomes clamp(episode_length * scale, [min, cap]) per cycle. "
              "Pass 0 or a negative value to disable the cap.",
     )
+    parser.add_argument("--gradient-steps-min", type=int, default=50,
+                        help="Floor on dynamic gradient_steps.")
+    parser.add_argument("--gradient-steps-scale", type=float, default=1.0,
+                        help="Multiplier on episode length before clamping. "
+                             "Default 1.0 = 1 update per env step (raffin-style). "
+                             "Set <1 to dampen overfit on long episodes (experimental).")
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--ent-coef", default="auto_0.1")
     parser.add_argument("--tau", type=float, default=0.005)
@@ -519,14 +528,18 @@ def main() -> None:
         CheckpointCallback(
             save_freq=args.checkpoint_freq,
             save_path=str(args.output_dir),
-            name_prefix="sac_vae_raffin",
+            name_prefix=f"sac_{args.encoder}",
             save_replay_buffer=args.save_replay_buffer,
             save_vecnormalize=False,
         ),
         DonkeyInfoCallback(),
     ]
     if args.gradient_steps_cap is not None and args.gradient_steps_cap > 0:
-        callbacks.append(CappedDynamicGradientStepsCallback(cap=args.gradient_steps_cap))
+        callbacks.append(CappedDynamicGradientStepsCallback(
+            cap=args.gradient_steps_cap,
+            floor=args.gradient_steps_min,
+            scale=args.gradient_steps_scale,
+        ))
 
     try:
         model.learn(

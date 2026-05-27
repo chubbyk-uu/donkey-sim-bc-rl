@@ -637,7 +637,7 @@ v4 eval:
 Best v4 checkpoint:
 
 ```text
-models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip
+models/rl_loop_vae_sac_resnet_v4_notrees/sac_resnet18_50000_steps.zip
 ```
 
 Comparison with the historical VAE best:
@@ -923,7 +923,10 @@ These are env-specific calibrations. Always probe a new track with the cte-pid
 collector at `--cte-target 0` first, watch where the car ends up visually, and size
 `--max-cte-error` / throttles accordingly.
 
-### 6.8 Cross-track transfer attempt: ResNet on mountain-track (v1 complete, v2 planned)
+### 6.8 Cross-track transfer attempt: ResNet on mountain-track (v1; superseded)
+
+**Status (2026-05-27)**: superseded by the DINOv2 pipeline in §6.10. The "v2 planned"
+ResNet curriculum below was not executed; mountain DINOv2 v2 became the deployment.
 
 First test of "does the ResNet encoder pipeline transfer to a different track at all?".
 Mountain-track was chosen because it's geometrically the most different from
@@ -990,9 +993,9 @@ uphill/downhill rhythm.
 Kept artifacts for reference / future resume:
 
 ```text
-models/rl_loop_resnet_mountain_v1/sac_loop_vae_90000_steps.zip          (v1 best)
-models/rl_loop_resnet_mountain_v1/sac_loop_vae_replay_buffer_90000_steps.pkl
-models/rl_loop_resnet_mountain_v1/sac_loop_vae_80000_steps.zip          (pre-resume)
+models/rl_loop_resnet_mountain_v1/sac_resnet18_90000_steps.zip          (v1 best)
+models/rl_loop_resnet_mountain_v1/sac_resnet18_replay_buffer_90000_steps.pkl
+models/rl_loop_resnet_mountain_v1/sac_resnet18_80000_steps.zip          (pre-resume)
 ```
 
 All other v1 checkpoints + buffers deleted (2.85 GB freed).
@@ -1023,6 +1026,187 @@ All other v1 checkpoints + buffers deleted (2.85 GB freed).
 - **Cold start is fine if the encoder is good.** v2_h64 started from random init and
   reached 3/3 truncate by 80k, without the warm seed `safe_v2` had needed. Matching
   the visual training/eval distribution removed the need for a "policy prior".
+
+### 6.10 Mountain Track DINOv2 Pipeline
+
+First successful deployment on `donkey-mountain-track-v0`. Built 2026-05-27 after
+the ResNet attempt (§6.8) plateaued.
+
+Encoder: **frozen DINOv2-S** (`dinov2_vits14` via torch.hub, z=384). No per-track
+VAE collection required — DINOv2 is pretrained.
+
+#### v1 — cold start (raffin reward + max_cte 2.5 + cte_target 3.5)
+
+```bash
+python rl/train_loop_vae_sac.py \
+    --env-id donkey-mountain-track-v0 \
+    --output-dir models/rl_dinov2_mountain_v1 \
+    --encoder dinov2_vits14 --encoder-crop-top 0 \
+    --hidden-size 256 \
+    --batch-size 64 --buffer-size 30000 \
+    --learning-starts 500 \
+    --gradient-steps-cap 1000 --gradient-steps-min 200 \
+    --cte-target 3.5 --max-cte-error 2.5 \
+    --min-throttle 0.2 --max-throttle 0.7 \
+    --alive-reward 1.5 --speed-reward-weight 0.15 \
+    --reward-crash -20 --crash-speed-weight 10 \
+    --cte-speed-penalty-weight 0.25 \
+    --timesteps 80000 --seed 42 --device cuda \
+    --save-replay-buffer --save-final-replay-buffer
+```
+
+Stopped at 60k. Deterministic eval (5 ep × 2000 max steps):
+
+| Checkpoint | Trunc | Speed | Mean CTE | Max CTE | Best lap | Mean lap |
+| --- | :---: | ---: | ---: | ---: | ---: | ---: |
+| **30k** | **5/5** | 1.998 | 0.682 | 2.163 | 29.44s | 31.09s |
+| 40k | 3/5 | 2.124 | 0.778 | 2.619 | 28.16s | 29.14s |
+| 50k | 0/5 | 1.747 | 0.874 | 2.748 | — | — |
+| 60k | 4/5 | 1.917 | 0.673 | 2.516 | 30.08s | 31.19s |
+
+30k 5/5 is genuine — first DINOv2 mountain win. 40k+ shows the 10-20k oscillation
+pattern (50k full valley, 60k partial recovery).
+
+#### v2 — resume from v1 30k with stricter reward (current deployment)
+
+Hypothesis: v1 30k learned to drive but with high cte variance. Tighten reward to
+trim it. Resume with smaller LR, slightly stricter cte, heavier crash:
+
+```bash
+python rl/train_loop_vae_sac.py \
+    --env-id donkey-mountain-track-v0 \
+    --output-dir models/rl_dinov2_mountain_v2 \
+    --encoder dinov2_vits14 --encoder-crop-top 0 \
+    --hidden-size 256 \
+    --batch-size 64 --buffer-size 30000 \
+    --gradient-steps-cap 1000 --gradient-steps-min 200 \
+    --cte-target 3.5 --max-cte-error 2.5 \
+    --min-throttle 0.2 --max-throttle 0.7 \
+    --alive-reward 1.5 \
+    --speed-reward-weight 0.12 \
+    --reward-crash -20 --crash-speed-weight 10 \
+    --cte-speed-penalty-weight 0.30 \
+    --learning-rate 2e-4 --override-learning-rate \
+    --resume-model models/rl_dinov2_mountain_v1/sac_dinov2_vits14_30000_steps.zip \
+    --resume-replay-buffer models/rl_dinov2_mountain_v1/sac_dinov2_vits14_replay_buffer_30000_steps.pkl \
+    --timesteps 40000 \
+    --seed 42 --device cuda \
+    --save-replay-buffer --save-final-replay-buffer
+```
+
+Deterministic eval:
+
+| Checkpoint | Trunc | Speed | Mean CTE | Max CTE | Best lap | Mean lap |
+| --- | :---: | ---: | ---: | ---: | ---: | ---: |
+| **40k** | **5/5** | 2.093 | 0.577 | 2.112 | 28.41s | 29.88s |
+| 50k | 5/5 | 2.088 | 0.801 | 2.279 | 28.29s | 29.96s |
+| 60k | 0/5 | 2.520 | 0.746 | 2.742 | — | — |
+
+**v2 40k beats v1 30k on every metric** (speed +5%, mean_cte -15%, max_cte -2%,
+mean_lap -4%) and stays at 5/5 truncate. **Current mountain deployment.**
+50k is 5/5 but mean_cte rising; 60k collapsed (same 10-20k cycle).
+
+#### v3 — cold start with v2-style stricter reward (failed)
+
+Four cold-start attempts trying to learn v2's reward shape from scratch
+(seed=42 / 7, with and without max_cte=3.0, cte_pen 0.25 / 0.30). **All four
+got stuck at the first corner around 130-160 ep_len** with ent_coef collapsing
+to ~0.02 within 5k steps. The stricter cte penalty actively prevented the
+exploration needed to learn corner-taking. Branch deleted.
+
+Key learning: **stricter cte penalty is incompatible with cold start on
+mountain**. Need to learn corners first under permissive reward, then refine.
+
+#### v4 — resume from v1 *20k* with v2 reward (4/5, not deployable)
+
+Tested whether earlier-stage v1 checkpoint (less committed than 30k) would
+respond better to v2 reward. Reached 4/5 truncate at the 60k step but
+deterministic eval shows v2 40k still beats it on every metric. Branch deleted.
+
+| Checkpoint | Trunc | Speed | Mean CTE | Max CTE | Best lap | Mean lap |
+| --- | :---: | ---: | ---: | ---: | ---: | ---: |
+| 60k | 4/5 | 1.988 | 0.728 | 2.503 | 29.58s | 31.25s |
+
+Confirmed that v2's resume-from-30k path is the right recipe; v4 is left as
+documented evidence not as an artifact.
+
+#### Lessons from the mountain DINOv2 series
+
+- **DINOv2-S is a viable encoder on mountain track** — first time we got
+  ≥3/5 truncate there without per-track encoder training.
+- **Stricter cte reward requires a "knows how to drive" baseline.** v3 cold
+  start with stricter reward fails identically across seeds; v2 resume from
+  permissive-reward baseline succeeds.
+- **The 10-20k peak-collapse-recovery cycle persists on mountain**, identical
+  to the loop pattern. Eval every checkpoint, deploy the peak.
+- **Training-time trunc rate dropping ≠ deterministic eval degrading.** v4 60k
+  had its training-time trunc rate fall from 42% → 15% but deterministic eval
+  at 60k was actually the best of the v4 batch (4/5). The training-time drop
+  reflects exploration noise; deterministic policy is more stable.
+
+### 6.11 Training defaults updated 2026-05-27
+
+After the v4 instability analysis, two SAC defaults were raised toward the
+SAC paper's values for late-training stability. A `gradient_steps_scale`
+parameter was also added for future ablation.
+
+| Default | Old | New | Rationale |
+| --- | ---: | ---: | --- |
+| `--batch-size` | 64 | **128** | Reduce critic gradient variance. SAC paper uses 256; 128 is a midpoint. |
+| `--buffer-size` | 30_000 | **50_000** | Slower buffer turnover → less distribution shift during late training. |
+| `--gradient-steps-scale` | (implicit 1.0) | **1.0** (explicit) | New CLI flag. Default keeps existing behavior (1 update per env step). Set <1 (e.g. 0.5) to dampen long-episode overupdate; experimental, not yet validated. |
+| `--gradient-steps-cap` (`train_vae_sac.py`) | 600 | **1000** | Unified with `train_loop_vae_sac.py`. |
+
+`CappedDynamicGradientStepsCallback` formula changed from
+`clamp(ep_len, [floor, cap])` to `clamp(ep_len * scale, [floor, cap])`. With
+default `scale=1.0` this is identical to prior behavior.
+
+Not yet validated in a deterministic-eval run — applies starting from the
+next cold-start training.
+
+### 6.12 Encoder generalization: lighting robustness comparison (2026-05-27)
+
+Single-episode eval on `donkey-generated-track-v0`, 2000-step cap. "Random
+light" = simulator `randomlight` enabled (lighting direction randomised each
+episode); "Fixed light" = simulator default stable lighting.
+
+**Models tested**
+
+| Encoder | Model | Checkpoint |
+| --- | --- | --- |
+| VAE (task-specific, fixedlight) | rl_loop_vae_fixedlight_v3_h80 | 90k |
+| DINOv2 ViT-S (frozen ImageNet-pretrained) | rl_loop_dinov2_v8 | 30k |
+| ResNet18 (frozen ImageNet-pretrained) | rl_loop_resnet_v4 | 50k |
+
+**Results**
+
+| Encoder | Light | Trunc | Speed | Mean CTE | Lap time |
+| --- | --- | :---: | ---: | ---: | ---: |
+| VAE | Fixed | 1/1 | 2.742 | 0.296 | 9.65 s/lap (5 laps) |
+| VAE | Random | 0/1 | — | — | crash at step 269 |
+| DINOv2 | Fixed | 1/1 | 2.356 | 0.565 | 11.03 s/lap (4 laps) |
+| DINOv2 | Random (×3) | 3/3 | 2.38 avg | — | 10.97 s/lap avg |
+| ResNet18 | Random (×3) | 3/3 | 2.09 avg | — | 12.88 s/lap avg |
+
+(ResNet was only tested under random light; VAE was not tested for a second
+fixed-light run. Fixed-light VAE lap count is 5 laps / 1000 steps.)
+
+**Conclusions**
+
+- **VAE is task- and lighting-specific.** Trained on fixed-light data, it
+  crashes immediately when lighting shifts. This is expected: the VAE
+  latent space encodes lighting as part of scene appearance; distribution
+  shift to OOD lighting breaks the encoder's implicit assumptions.
+- **Frozen pretrained encoders (DINOv2, ResNet18) are lighting-robust.** Both
+  survive all three random-light runs without issue. ImageNet pretraining
+  covers a wide distribution of lighting conditions; a few random-light
+  episodes are in-distribution for these encoders.
+- **DINOv2 > ResNet18 in lap time** (10.97 s vs 12.88 s avg) under random
+  light, consistent with DINOv2's stronger perceptual features from
+  self-supervised pretraining.
+- **Practical guidance**: use VAE when lighting is controlled end-to-end
+  (fastest laps, lowest CTE); use DINOv2 when lighting may vary (robust,
+  only ~1.3 s/lap slower). ResNet18 is a reliable fallback but lags DINOv2.
 
 ## 7. Practical Pitfalls
 
@@ -1084,12 +1268,30 @@ The practices below are what produced a deployable checkpoint without overtraini
   `models/rl_loop_vae_sac_fixedlight_v3_h80/sac_loop_vae_90000_steps.zip`.
   Evaluated 3/3 truncate at `max_episode_steps=2000`, `mean_speed=2.800`,
   `mean |cte|=0.315`. Beat the earlier v2_h64 100k on speed/progress/reward.
+- **Co-primary loop-track deployment (alternative reward recipe)**:
+  `models/rl_loop_vae_v15/sac_loop_vae_112488_steps.zip`.
+  Evaluated **5/5 truncate at `max_episode_steps=3000`**, `mean_speed=2.797`,
+  `mean |cte|=0.356`, mean_lap 9.47s, best_lap 9.11s, 75 laps total.
+  Uses `--lap-completion-bonus 50 --crash-speed-weight 15` on top of the v3_h80
+  base; cold-start at hidden=80 plus two resumes, 112488 the peak. Slightly slower
+  and looser on cte than v3_h80 90k but reaches the same "100% truncate" bar.
+  Useful as a second checkpoint with an independently tuned reward shape. The
+  +20k resume past 112488 was tried and reverted: 122488 = valley, 132488 = 2/5
+  truncate (faster single laps, not deployable). See
+  `docs/session_2026-05-26_log.md` §"Day 2 follow-up".
 - **Secondary loop-track**:
   `models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_100000_steps.zip`. 3/3
   truncate, slightly slower (`mean_speed=2.689`), most centered (`mean |cte|=0.301`).
 - **Backup loop-track (no VAE collection)**:
-  `models/rl_loop_vae_sac_resnet_v4_notrees/sac_loop_vae_50000_steps.zip`. About 32%
+  `models/rl_loop_vae_sac_resnet_v4_notrees/sac_resnet18_50000_steps.zip`. About 32%
   slower (`mean_speed=2.131`) than v3_h80 90k.
+- **Primary mountain-track deployment**:
+  `models/rl_dinov2_mountain_v2/sac_dinov2_vits14_40000_steps.zip`.
+  Evaluated **5/5 truncate at `max_episode_steps=2000`**, `mean_speed=2.093`,
+  `mean |cte|=0.577`, `max |cte|=2.112`, best_lap 28.41s, mean_lap 29.88s.
+  Frozen DINOv2-S encoder, hidden=256. Built via v1 cold start → resume from v1 30k
+  with stricter cte (0.25→0.30), heavier crash (-10→-20, crash_speed 5→10), LR
+  override 2e-4. See §6.10 for the full pipeline + v3/v4 failure analysis.
 - **For new loop SAC runs**, copy the v3_h80 90k recipe exactly:
   `--encoder vae`, `--hidden-size 80`, `--batch-size 64`, `--gradient-steps-min 50`,
   `--gradient-steps-cap 2000`, safe_v2 reward defaults (`speed=0.15, cte_pen=0.25`),
@@ -1169,20 +1371,42 @@ models/rl_loop_vae_sac_fixedlight_v3_h80/
   Eval: 3/3 truncate, mean_speed 2.800, mean |cte| 0.315. Beats v2_h64 100k by 4.1%
   on speed and progress.
 
+models/rl_loop_vae_v15/
+  Co-primary loop-track deployment using a different reward recipe.
+  Best checkpoint sac_loop_vae_112488_steps.zip (5/5 truncate @5ep,
+  mean_speed 2.797, mean_lap 9.47s, best_lap 9.11s). Recipe: VAE encoder,
+  hidden=80, batch=64, gradient_steps_min=200, gradient_steps_cap=2000,
+  lap_completion_bonus=50, crash_speed_weight=15 (safe_v2 base + new
+  shaping terms). Cold-start 60k + 30k + 20k resume = 112488.
+  Also retained: sac_loop_vae_132488_steps.zip — faster on best_lap
+  (8.83s) but only 2/5 truncate; reference, not deployed. See
+  docs/session_2026-05-26_log.md for the full v15 narrative.
+
 models/rl_loop_vae_sac_fixedlight_v2_h64/
   Secondary loop-track. Best checkpoint sac_loop_vae_100000_steps.zip; backup
   sac_loop_vae_90000_steps.zip. Hidden=64, batch=64. Eval: 3/3 truncate, mean_speed
   2.689, mean |cte| 0.301 (most centered of any branch).
 
 models/rl_loop_resnet_mountain_v1/
-  First mountain-track ResNet branch (v1). Kept sac_loop_vae_80000_steps.zip
-  (pre-resume) and sac_loop_vae_90000_steps.zip + buffer (v1 best, 1/3 truncate
-  on deterministic eval). Plateaued fast-but-fragile. Next session plan: cold-start
-  mountain_v2 with --max-throttle 0.5 + --max-cte-error 3.0 from the start (see §6.8).
+  First mountain-track ResNet branch (v1). Kept sac_resnet18_80000_steps.zip
+  (pre-resume) and sac_resnet18_90000_steps.zip + buffer (v1 best, 1/3 truncate
+  on deterministic eval). Plateaued fast-but-fragile. Superseded by the DINOv2
+  pipeline (§6.10).
+
+models/rl_dinov2_mountain_v1/
+  Mountain-track DINOv2 cold-start branch. Kept all 6 checkpoints (10k/20k/30k
+  /40k/50k/60k) + replay buffers. Best deterministic eval at 30k (5/5 truncate,
+  mean_speed 1.998, mean_lap 31.09s). Superseded by v2 40k as deployment.
+
+models/rl_dinov2_mountain_v2/
+  Primary mountain-track deployment. Resumed from v1 30k with stricter cte (0.30),
+  heavier crash (-20 / crash_speed 10), LR override 2e-4. Kept 40k (5/5 truncate,
+  mean_speed 2.093, mean_lap 29.88s — current deployment) and 50k (still 5/5 but
+  cte rising) as backup. 60k collapsed and was deleted.
 
 models/rl_loop_vae_sac_resnet_v4_notrees/
   Backup loop-track SAC branch using frozen ImageNet ResNet18 features (legacy
-  --encoder-crop-top 40 baked in). Best checkpoint sac_loop_vae_50000_steps.zip.
+  --encoder-crop-top 40 baked in). Best checkpoint sac_resnet18_50000_steps.zip.
   Eval: 3/3 truncate, mean_speed 2.131. Avoids VAE data collection but runs ~32%
   slower than the fixed-light VAE deployment.
 ```
@@ -1225,40 +1449,29 @@ models/bc_official_categorical_9bin_sampler6_300/
 
 ## 10. Open TODOs
 
-### Next session: mountain_v2 curriculum cold start
+### Validate new training defaults
 
-Run with the lessons from mountain_v1:
+`--batch-size 128` and `--buffer-size 50_000` (raised 2026-05-27, see §6.11)
+have not been tested in a deterministic-eval run. The next cold-start training
+should compare:
+- training-time `ep_len` / `critic_loss` curves vs prior runs
+- whether the late-stage 10-20k peak-collapse-recovery cycle dampens
+- whether sweet-spot checkpoint shifts later than before (slower convergence
+  is the expected cost of larger batch + buffer)
 
-```bash
-python rl/train_loop_vae_sac.py \
-    --env-id donkey-mountain-track-v0 \
-    --output-dir models/rl_loop_resnet_mountain_v2 \
-    --encoder resnet18 \
-    --encoder-crop-top 0 \
-    --hidden-size 256 \
-    --batch-size 256 \
-    --cte-target 3.5 \
-    --max-cte-error 3.0 \
-    --max-throttle 0.5 \
-    --timesteps 80000 \
-    --save-replay-buffer --save-final-replay-buffer \
-    --device cuda
-```
+### `--gradient-steps-scale` ablation
 
-Hypothesis being tested: lowering `--max-throttle` and widening `--max-cte-error`
-from the start should let the agent collect more useful experience early
-(no early-spawn terminate, no downhill speed runaway), and the policy should
-converge to a 3/3 deterministic-eval truncate. If v2 still plateaus at 1/3,
-the limit is ResNet's domain-general features on a track ResNet has never
-specifically seen, and the next move would be a mountain-specific VAE
-(or DINOv2 / a self-supervised alternative).
+New CLI flag (default 1.0). Try a single 60k cold-start with `0.5` to see if
+halving the update-to-data ratio reduces late-stage drift. Compare against a
+1.0 baseline on the same env / seed.
 
 ### Other open items
 
-- Mountain v1's 90k checkpoint is kept as a reference. If v2 succeeds, v1
-  artifacts can be removed entirely.
-- Loop deployment v3_h80 90k is still the production model. No work scheduled
-  for it.
+- Mountain v1's full checkpoint set is kept for now because v2 derives from
+  v1 30k. If v2 stays stable across future work, v1 can be reduced to just
+  the 30k zip + buffer.
+- Loop deployment v3_h80 90k and v15 112488 remain the production models.
+- Resnet mountain v1 (§6.8) is superseded but kept as historical reference.
 - No further reward-weight ablations planned on loop (§6.5 closed the loop).
 - No further hidden-size ablations planned on loop (h64 → h80 → h128 path
   fully explored).

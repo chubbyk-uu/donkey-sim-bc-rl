@@ -90,8 +90,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--override-learning-rate", action="store_true",
                         help="On --resume-model, override the saved LR with --learning-rate. "
                              "Default behavior on resume is to keep the saved LR.")
-    parser.add_argument("--buffer-size", type=int, default=30_000)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--buffer-size", type=int, default=50_000)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-size", type=int, default=64,
                         help="SAC MLP hidden layer size (pi and qf use [h, h]). VAE-trained "
                              "safe_v2 used 64; ResNet/DINO need 256+ to learn projection.")
@@ -103,6 +103,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-steps-min", type=int, default=50,
                         help="Floor on dynamic gradient_steps (used with train_freq=episode). "
                              "Guarantees at least this many off-policy updates per training cycle.")
+    parser.add_argument("--gradient-steps-scale", type=float, default=1.0,
+                        help="Multiplier on episode length before clamping to [min, cap]. "
+                             "Default 1.0 = 1 update per env step (raffin-style). "
+                             "Set <1 (e.g. 0.5) to dampen overfit on long truncate episodes; "
+                             "experimental — not yet validated in deterministic eval.")
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--ent-coef", default="auto_0.1")
     parser.add_argument("--tau", type=float, default=0.005)
@@ -180,7 +185,7 @@ def main() -> None:
         CheckpointCallback(
             save_freq=args.checkpoint_freq,
             save_path=str(args.output_dir),
-            name_prefix="sac_loop_vae",
+            name_prefix=f"sac_{args.encoder}",
             save_replay_buffer=args.save_replay_buffer,
             save_vecnormalize=False,
         ),
@@ -190,6 +195,7 @@ def main() -> None:
         callbacks.append(CappedDynamicGradientStepsCallback(
             cap=args.gradient_steps_cap,
             floor=args.gradient_steps_min,
+            scale=args.gradient_steps_scale,
         ))
 
     try:
