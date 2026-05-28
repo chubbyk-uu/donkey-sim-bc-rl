@@ -1,4 +1,4 @@
-# Session Log: 2026-05-28 — New-defaults validation on mountain DINOv2
+# Session Log: 2026-05-28 — Mountain new-defaults + loop domain randomization
 
 Goal for the day: take the SAC defaults raised on 2026-05-27 (§6.11) for a test
 drive. Instead of re-running the loop h80 recipe, we used mountain DINOv2 (faster
@@ -121,3 +121,70 @@ The well-formed version of "reward sustained progress" already exists:
 observable milestone, bounded. v15 used it successfully on loop. The real lever
 for escaping early-crash basins is exploration (ent_coef floor / noise /
 curriculum), not reward-slope steepening.
+
+## 7. Loop domain randomization: surviving random light + trees
+
+Motivation: with the sim's `randomlight` + random trees enabled, the plain loop
+DINOv2 model (`rl_loop_dinov2_v8`) crashed at step 242 (0/1). Goal: train DINOv2
+to stay robust to random trees/shadows too (it was already lighting-robust,
+§6.12), via domain randomization.
+
+### 7.1 Building scene-reload domain randomization
+
+The sim only regenerates trees/lighting when the **scene is reloaded**; an
+episode `reset_car` keeps the same layout. Built `reload_scene()` in
+`train_vae_sac.py` and a probe `tools/test_scene_reload.py`. Findings while
+getting it to work:
+- Re-sending `load_scene` mid-scene is **ignored**; must `exit_scene` to the menu
+  first, then `load_scene`.
+- The sim sends no reliable "exited" signal, so: `exit_scene` → fixed settle →
+  re-send `load_scene` and poll `handler.loaded` until it re-handshakes. A
+  too-eager retry (zero settle) re-enters before the exit completes and the scene
+  never changes; ~1s settle fixed it. Confirmed visually that trees + shadows +
+  light all change on reload.
+
+### 7.2 Reload cadence — episode-based → adaptive step-based
+
+- **v1** (episode-based `--scene-reload-every`): cold start, reload every N
+  episodes. Worked early (short episodes → frequent reloads), but once episodes
+  lengthened, N episodes = many thousands of steps on one layout → the replay
+  buffer filled with easy-scene data (easy layouts truncate at 2000; hard ones
+  crash in ~100), biasing learning toward easy layouts.
+- Fix: **adaptive step-based reload** (`--scene-reload-alpha`,
+  `--scene-reload-kmin`): reload after `K = clamp(alpha × recent_ep_len, [kmin,
+  max_ep-1])` steps on a scene, checked only at episode boundaries.
+  `_steps_on_scene` accumulates across crashes, resets on reload → each layout
+  contributes ~equal steps. Design insight: with the no-mid-episode-truncate
+  rule, a *small* fixed K worsens balance (an easy scene still spends a full
+  episode before the check), so K≈max_ep balances best; tying K to ep_len gives
+  early variety + late balance.
+
+### 7.3 Runs
+
+- **v2** — resumed from v1 10k with adaptive reload; the keeper. Paired eval (6
+  same layouts): 30k 3/6, 50k 3/6 (best, lowest cte), 40k/60k 2/6. Independent
+  5-ep eval: 30k/50k 4/5. ⇒ ~50% truncate on unseen random layouts; "failures"
+  are 4-6 lap drives that drift to cte≈2.0.
+- **v3** — cold start, cte 0.25→0.30 + min-throttle 0.18: no clear gain, still
+  weaves.
+- **v4 / v5** — steering-change penalty to kill the weave: v4 (linear w=0.5,
+  resume) and v5 (squared w=2.0, cold start). Both left `abs_steer_delta_mean`
+  **dead flat at ~0.30** — zero effect. Removed the reward term.
+- **ViT-B/14** (z=768, hidden=384): same weave (~0.30), trunc no better, ~2×
+  slower (fps 9 vs 15). Deleted.
+
+### 7.4 Findings + cleanup
+
+- The left-right **weave is a SAC control artifact** — identical across encoders,
+  unmoved by linear/squared steer penalties.
+- The ~50% random-layout ceiling is **not broken by a bigger frozen encoder** →
+  next lever is a task-adapted encoder (fine-tune / depth / segmentation). Full
+  analysis in experiment-log §6.14.
+- New tooling kept: `rl/eval_paired_randomized.py` (compare checkpoints on the
+  same random layouts — removes the layout-luck confound of independent eval),
+  `tools/test_scene_reload.py`.
+- Cleanup: kept only `rl_loop_dinov2_randomtree_v2`; deleted v1/v3/v4/v5 and the
+  ViT-B run (freed ~5 GB).
+- Gotcha noted: an early monitor-loop helper used `grep -oE "[0-9]+$"` on SB3
+  table lines that end in `|`, so it never matched and looped forever. Don't
+  build polling watchers that way.

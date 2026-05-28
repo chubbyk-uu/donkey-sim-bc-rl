@@ -113,6 +113,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--checkpoint-freq", type=int, default=10_000)
     parser.add_argument("--max-episode-steps", type=int, default=3000)
+    parser.add_argument("--scene-reload-every", type=int, default=0,
+                        help="Episode-based scene reload: reload every N episodes. "
+                             "0 = off (default). Superseded by --scene-reload-alpha "
+                             "if that is set.")
+    parser.add_argument("--scene-reload-alpha", type=float, default=0.0,
+                        help="Adaptive step-based scene reload for domain "
+                             "randomization. Reload after ~K steps on a scene, "
+                             "K = clamp(alpha * recent_ep_len, [kmin, max_episode_steps-1]). "
+                             "alpha is roughly 'episodes per scene'. 0 = off (default).")
+    parser.add_argument("--scene-reload-kmin", type=int, default=200,
+                        help="Lower bound on K for --scene-reload-alpha (min steps "
+                             "per scene before a reload).")
     parser.add_argument("--save-replay-buffer", action="store_true")
     parser.add_argument("--save-final-replay-buffer", action="store_true")
     return parser.parse_args()

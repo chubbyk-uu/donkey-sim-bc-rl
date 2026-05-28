@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import os
+import time
 from pathlib import Path
 
 import gymnasium as gym
@@ -164,6 +165,37 @@ def make_encoder(encoder_name: str, device: torch.device, vae_checkpoint: Path |
     raise ValueError(f"unsupported encoder: {encoder_name}")
 
 
+def reload_scene(
+    controller,
+    scene: str,
+    timeout: float = 30.0,
+    exit_settle: float = 1.0,
+    retry_every: float = 1.5,
+) -> bool:
+    """Reload the sim scene, regenerating per-scene randomization (trees,
+    shadows, lighting). Used for domain randomization during training.
+
+    The handshake is asymmetric: load completion has a state signal
+    (`handler.loaded`, set by on_car_loaded / on_need_car_config), but the
+    exit→menu transition has no reliable incoming message. So after exit_scene
+    we wait a fixed `exit_settle` before the first load (sending load_scene too
+    soon steps on the exit and the sim never leaves the scene), then re-send
+    load_scene every `retry_every` until `loaded` flips True — so a slow exit
+    self-corrects. Returns True on confirmed reload, False on timeout.
+    """
+    handler = controller.handler
+    handler.loaded = False
+    handler.send_exit_scene()
+    time.sleep(exit_settle)  # no exit signal exists — let the exit complete first
+    deadline = time.time() + timeout
+    while not handler.loaded:
+        if time.time() > deadline:
+            return False
+        handler.send_load_scene(scene)
+        time.sleep(retry_every)
+    return True
+
+
 class DonkeyVaeSACEnv(gym.Wrapper):
     """Raffin-style Donkey env: frozen VAE latent + command history."""
 
@@ -178,6 +210,10 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         max_steering_diff: float = MAX_STEERING_DIFF,
         n_command_history: int = N_COMMAND_HISTORY,
         reward_config: RaffinRewardConfig | None = None,
+        scene_reload_every: int = 0,
+        scene_reload_alpha: float = 0.0,
+        scene_reload_kmin: int = 200,
+        scene_reload_kmax: int = 2000,
     ) -> None:
         super().__init__(env)
         self.vae = vae
@@ -189,6 +225,25 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         self.reward_config = reward_config or RaffinRewardConfig()
         self.command_history = np.zeros((self.n_command_history, 2), dtype=np.float32)
         self._prev_lap_count = 0
+        # Scene-reload (domain randomization). Two mutually exclusive modes:
+        #   adaptive step-based (scene_reload_alpha > 0): reload after the car has
+        #     spent ~K steps on the current scene, K = clamp(alpha * recent_ep_len,
+        #     [kmin, kmax]). Reload is decided only at episode boundaries (never
+        #     force-truncates), so max_episode_steps stays reachable and SAC's
+        #     truncation handling is untouched. _steps_on_scene accumulates across
+        #     crashes on the same scene and only resets on an actual reload, so
+        #     easy (long-episode) and hard (short-episode) scenes contribute
+        #     roughly equal steps to the buffer.
+        #   episode-based (scene_reload_every > 0): reload every N episodes (used
+        #     by eval with N=1 to randomize every episode).
+        self.scene_reload_every = scene_reload_every
+        self.scene_reload_alpha = scene_reload_alpha
+        self.scene_reload_kmin = scene_reload_kmin
+        self.scene_reload_kmax = scene_reload_kmax
+        self._reset_count = 0
+        self._episode_steps = 0
+        self._steps_on_scene = 0
+        self._ep_len_ema: float | None = None
 
         self.action_space = gym.spaces.Box(
             low=np.array([-self.max_steering, -1.0], dtype=np.float32),
@@ -208,10 +263,44 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         self.command_history.fill(0.0)
         self.last_throttle = self.min_throttle
         self._prev_lap_count = 0
+        self._reset_count += 1
+        # update episode-length EMA from the episode that just ended
+        if self._episode_steps > 0:
+            if self._ep_len_ema is None:
+                self._ep_len_ema = float(self._episode_steps)
+            else:
+                self._ep_len_ema = 0.9 * self._ep_len_ema + 0.1 * self._episode_steps
+        self._episode_steps = 0
+
+        do_reload, reason = False, ""
+        if self.scene_reload_alpha > 0.0:  # adaptive step-based
+            ema = self._ep_len_ema if self._ep_len_ema is not None else float(self.scene_reload_kmin)
+            k = int(min(self.scene_reload_kmax,
+                        max(self.scene_reload_kmin, self.scene_reload_alpha * ema)))
+            if self._steps_on_scene >= k:
+                do_reload = True
+                reason = f"steps_on_scene={self._steps_on_scene} >= K={k} (ema_eplen={ema:.0f})"
+        elif self.scene_reload_every > 0:  # episode-based (eval / legacy)
+            if self._reset_count % self.scene_reload_every == 0:
+                do_reload = True
+                reason = f"every {self.scene_reload_every} episodes"
+
+        if do_reload:
+            controller = self.env.unwrapped.viewer
+            scene = controller.handler.SceneToLoad
+            print(f"[scene-reload] reset #{self._reset_count}: reloading {scene} ({reason})",
+                  flush=True)
+            if not reload_scene(controller, scene):
+                print(f"[scene-reload] WARNING: reload timed out at reset "
+                      f"#{self._reset_count}; continuing on current scene", flush=True)
+            self._steps_on_scene = 0  # reset whether or not reload succeeded (avoid retry spam)
+
         obs, info = self.env.reset(**kwargs)
         return self._build_obs(obs), info
 
     def step(self, action):
+        self._episode_steps += 1
+        self._steps_on_scene += 1
         raw_action = np.asarray(action, dtype=np.float32).reshape(-1)
         prev_steer = float(self.command_history[-1, 0]) if self.n_command_history > 0 else 0.0
         executed = self._map_and_clip_action(raw_action)
@@ -398,6 +487,10 @@ def build_env(args: argparse.Namespace, vae: FrozenVaeEncoder) -> gym.Env:
             cte_speed_penalty_weight=getattr(args, "cte_speed_penalty_weight", 0.0),
             cte_target=getattr(args, "cte_target", 0.0),
         ),
+        scene_reload_every=getattr(args, "scene_reload_every", 0),
+        scene_reload_alpha=getattr(args, "scene_reload_alpha", 0.0),
+        scene_reload_kmin=getattr(args, "scene_reload_kmin", 200),
+        scene_reload_kmax=max(1, args.max_episode_steps - 1),
     )
     env = TimeLimit(env, max_episode_steps=args.max_episode_steps)
     return Monitor(env, filename=str(args.output_dir / "monitor.csv"))

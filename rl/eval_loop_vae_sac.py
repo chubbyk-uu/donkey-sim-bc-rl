@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=int(os.environ.get("DONKEY_SIM_PORT", "9091")))
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--max-episode-steps", type=int, default=3000)
+    parser.add_argument("--scene-reload-every", type=int, default=0,
+                        help="Reload the sim scene every N episodes so each episode "
+                             "gets a fresh per-scene randomization (trees/shadows/"
+                             "lighting). Use 1 to randomize every eval episode. "
+                             "0 = off (default).")
     parser.add_argument("--min-throttle", type=float, default=0.2)
     parser.add_argument("--max-throttle", type=float, default=0.7)
     parser.add_argument("--max-steering", type=float, default=MAX_STEERING)
@@ -97,6 +102,7 @@ def main() -> None:
             cte_speed_penalty_weight=args.cte_speed_penalty_weight,
             cte_target=args.cte_target,
         ),
+        scene_reload_every=args.scene_reload_every,
     )
     env = TimeLimit(env, max_episode_steps=args.max_episode_steps)
 

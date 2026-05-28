@@ -1260,6 +1260,85 @@ resume that overshot to 90k — see session log 2026-05-28 §3):
 as a new-defaults validation artifact and a faster single-stage cold-start
 alternative — see README Model Inventory.
 
+### 6.14 Domain randomization: random light + tree shadows on loop (2026-05-28)
+
+**Headline: DINOv2 keeps its generalization under randomized appearance.** With
+domain randomization the frozen DINOv2-S policy adapts to *both* randomized
+lighting *and* randomly-placed trees and their cast shadows — completing full
+laps on layouts it never trained on. §6.12 already showed DINOv2 was robust to
+random lighting; this extends it to random trees/shadows, which are a harder
+distractor (shadows fall on the road and mimic lane edges).
+
+**Baseline without DR fails.** The plain loop DINOv2 model (`rl_loop_dinov2_v8`),
+trained on a single fixed scene, crashes at step 242 (0/1, max_cte 2.10) the
+moment random light + trees are enabled. So robustness is not free from the
+encoder alone — it has to be trained in.
+
+**Scene-reload domain randomization (the mechanism).** The sim only regenerates
+trees/lighting/shadows when the scene is *reloaded*; a normal episode reset
+(`reset_car`) keeps the same layout. New code in `train_vae_sac.py`:
+
+- `reload_scene()` — `exit_scene` → settle → re-send `load_scene` until the sim
+  re-handshakes (`handler.loaded`). `load_scene` is ignored mid-scene, so the
+  exit-to-menu step is required. (Probe tool: `tools/test_scene_reload.py`.)
+- **Adaptive step-based reload** (`--scene-reload-alpha`, `--scene-reload-kmin`):
+  reload after the car has spent `K = clamp(alpha × recent_ep_len, [kmin,
+  max_ep-1])` steps on the current scene, decided only at episode boundaries
+  (never force-truncates). `_steps_on_scene` accumulates across crashes and
+  resets only on reload, so easy (long-episode) and hard (short-episode) layouts
+  contribute roughly equal *steps* to the replay buffer. This fixed a real bias:
+  episode-count-based reload let easy scenes (long truncate episodes) dominate
+  the buffer. Counter-intuitively, a *smaller* fixed step budget worsens balance
+  (an easy scene still spends a full episode before the boundary check), so K
+  near `max_ep` balances best; adaptive K gives early-training variety and
+  late-training balance. Episode-based `--scene-reload-every N` is retained for
+  **eval** (use `N=1` so each eval episode is a fresh random layout).
+
+**Result — `rl_loop_dinov2_randomtree_v2`** (DINOv2-S, hidden=256, batch=256,
+`gradient-steps-scale=0.5`, adaptive reload `alpha=3 kmin=200`, raffin reward
+`speed=0.15 cte=0.25`, `reward_crash=-20`, `max_ep=2000`). Paired eval — every
+checkpoint on the **same** 6 freshly-reloaded random layouts (the fair way to
+compare; see `rl/eval_paired_randomized.py`):
+
+| Checkpoint | Trunc | Mean steps | Mean CTE | Mean speed |
+| --- | :---: | ---: | ---: | ---: |
+| 30k | 3/6 | 1418 | 0.460 | 1.771 |
+| 40k | 2/6 | 1106 | 0.457 | 1.795 |
+| **50k** | **3/6** | 1262 | **0.405** | 1.842 |
+| 60k | 2/6 | 1168 | 0.429 | 1.843 |
+
+Independent per-checkpoint eval (5 ep, fresh layout each) agreed: 30k 4/5, 40k
+3/5, 50k 4/5, 60k 3/5. So **~50% truncate on unseen random layouts** — and the
+"failures" are long drives (4-6 laps) that eventually drift to cte≈2.0, not early
+crashes. Best checkpoint **50k**.
+
+**Three attempts to push past ~50% — all failed (documented so they aren't
+re-tried):**
+
+1. **Tighter cte penalty** (0.25→0.30) + lower min-throttle: no clear trunc gain.
+   Note the cte penalty is `weight × |cte| × speed`, so lowering speed weakens it
+   — raising the weight is partly cancelled by the slower driving it induces.
+2. **Steering-change penalty** to damp the persistent left-right weave
+   (`abs_steer_delta_mean ≈ 0.30` throughout, ~15% of full range per step). Both
+   linear (`w=0.5`) and squared (`w=2.0`) penalties left steer_delta **dead flat
+   at ~0.30** over tens of thousands of steps — zero effect. Removed.
+3. **Bigger frozen encoder** (DINOv2 ViT-B/14, z=768, hidden=384): steer_delta
+   identical (~0.30) and trunc no better, at ~2× the per-step cost (fps ~9 vs
+   ~15). Deleted.
+
+**Conclusions (where the limits actually are):**
+
+- **The weave is a SAC control artifact (bang-bang), not a perception or reward
+  problem.** It is identical across encoders (ViT-S vs ViT-B) and unmoved by
+  direct reward penalties. Fixing it would need a different control formulation,
+  not reward/encoder tuning.
+- **The ~50% trunc ceiling on random layouts is not broken by a bigger *frozen*
+  encoder.** The remaining hard layouts are heavy-shadow cases where the frozen
+  latent likely entangles road-shadow edges with lane edges. The next real lever
+  is a **task-adapted encoder** — fine-tuning DINOv2, or a depth / driving-
+  segmentation model that is inherently shadow/lighting-invariant — not more RL
+  reward tuning (see §8).
+
 ## 7. Practical Pitfalls
 
 - Do not install the PyPI `gym-donkeycar` package — it targets the old `gym` API.
@@ -1343,6 +1422,14 @@ What the experiments established about how to train and evaluate:
   by this; DINOv2/ResNet encoders are lighting-robust regardless of track.
 - The old `safe_v2 70k` artifact remains a "best ever under matched lighting" reference
   point but is not a reproducible deployment model.
+- **For robustness to randomized appearance (random light + trees/shadows), train with
+  scene-reload domain randomization** (`--scene-reload-alpha 3 --scene-reload-kmin 200`),
+  and eval with `--scene-reload-every 1` (fresh layout per episode). This gets DINOv2 to
+  ~50% truncate on unseen random layouts (§6.14). **Do not chase higher robustness with
+  reward tuning or a bigger frozen encoder** — both were shown not to help (§6.14); the
+  next lever is a task-adapted encoder (fine-tune / depth / segmentation).
+- **The left-right steering weave is a SAC control artifact**, not fixable by reward
+  penalties or a bigger encoder (§6.14). Don't spend reward-tuning effort on it.
 
 ## 9. Current Data And Model Inventory
 
@@ -1433,6 +1520,17 @@ pending.
 New CLI flag (default 1.0). `0.5` was run once on 2026-05-28 (§6.13) but
 confounded with batch=256, so its effect can't be isolated. A clean 1.0-vs-0.5
 A/B at the same batch on the same env / seed is still pending.
+
+### Task-adapted encoder for randomized-environment robustness
+
+§6.14 capped DINOv2's random-layout truncate rate at ~50% with a frozen encoder,
+and showed neither reward tuning nor a bigger frozen encoder (ViT-B) helps. The
+identified next lever: a **task-adapted encoder** — fine-tune DINOv2 (warm-start
+from a competent policy, low LR, partial unfreeze; needs storing raw images in
+the buffer + encoding in the SB3 features_extractor), or swap in a depth /
+driving-segmentation model that is inherently shadow/lighting-invariant. Verify
+the depth/seg output quality on the cartoonish sim frames first (real-world
+pretraining may not transfer).
 
 ### Other open items
 
