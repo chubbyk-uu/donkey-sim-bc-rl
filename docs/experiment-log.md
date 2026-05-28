@@ -1208,6 +1208,58 @@ fixed-light run. Fixed-light VAE lap count is 5 laps / 1000 steps.)
   (fastest laps, lowest CTE); use DINOv2 when lighting may vary (robust,
   only ~1.3 s/lap slower). ResNet18 is a reliable fallback but lags DINOv2.
 
+### 6.13 New-defaults validation: mountain DINOv2 cold start (2026-05-28)
+
+First run exercising the raised defaults (§6.11). Used mountain DINOv2 (faster to
+train than loop h80) as the test vehicle: a single cold start with the permissive
+v1-recipe reward (`speed=0.15, cte=0.25`, `reward_crash=-20, crash_speed=10`).
+
+Config tested vs the actual §6.11 defaults — **note the confound**:
+
+| Knob | This run | §6.11 default |
+| --- | ---: | ---: |
+| `--batch-size` | **256** | 128 |
+| `--buffer-size` | 50_000 | 50_000 |
+| `--gradient-steps-scale` | **0.5** | 1.0 |
+| `--gradient-steps-cap` | 1000 | 1000 |
+
+Batch is double the default and scale=0.5 is the *ablation* value (§10), not the
+default. So this run conflates the §6.11 validation with the `gradient-steps-scale`
+ablation at a non-default batch — neither question is answered cleanly.
+
+Deterministic eval (5 ep × 2000 max steps; 30-60k from cold start, 70-90k from a
+resume that overshot to 90k — see session log 2026-05-28 §3):
+
+| Checkpoint | Trunc | Speed | Mean CTE | Max CTE | Best lap | Mean lap |
+| --- | :---: | ---: | ---: | ---: | ---: | ---: |
+| 30k | 0/5 | 2.04 | 0.59 | 2.76 | 25.90s | 27.80s |
+| **40k** | **5/5** | 2.18 | 0.66 | 2.27 | 27.00s | 28.24s |
+| 50k | 3/5 | 2.28 | 0.57 | 2.25 | 25.57s | 26.89s |
+| 60k | 4/5 | 2.21 | 0.53 | 2.54 | 26.60s | 27.95s |
+| 70k | 2/5 | 2.09 | 0.69 | 2.41 | 28.08s | 29.08s |
+| 80k | 4/5 | 2.10 | 0.70 | 2.63 | 28.09s | 29.24s |
+| 90k | 3/5 | 2.03 | 0.60 | 2.57 | 28.64s | 30.13s |
+
+**Findings:**
+
+- **A single-stage cold start reached a deployable 5/5 (40k).** v3 40k beats the
+  two-stage v2 40k deployment (§6.10) on speed (2.18 vs 2.093) and mean lap
+  (28.24s vs 29.88s), at the cost of running wider (mean_cte 0.66 vs 0.577,
+  max_cte 2.27 vs 2.112). The aggressive optimizer config let one cold start do
+  what previously needed v1-cold + v2-resume. This is the run's main positive
+  signal.
+- **The §6.11 defaults (batch=128, scale=1.0) remain unvalidated** — this run
+  cannot separate their effect from the extra-aggressive batch and the scale
+  change.
+- **Late-stage drift persisted.** scale=0.5 + batch=256 did not dampen the
+  10-20k peak-collapse-recovery cycle; 70-90k were uniformly worse than 40-60k,
+  and the extra 30k steps past 60k bought nothing. The peak shifted only
+  marginally later than v1's 30k (§6.10), to the 40-50k zone.
+
+**Deployment decision:** mountain primary stays **v2 40k** (§6.10). v3 40k is kept
+as a new-defaults validation artifact and a faster single-stage cold-start
+alternative — see README Model Inventory.
+
 ## 7. Practical Pitfalls
 
 - Do not install the PyPI `gym-donkeycar` package — it targets the old `gym` API.
@@ -1274,8 +1326,11 @@ What the experiments established about how to train and evaluate:
   `--encoder vae`, `--hidden-size 80`, safe_v2 reward defaults (`speed=0.15,
   cte_pen=0.25`), cold start, eval at every checkpoint. Use the best checkpoint
   from deterministic eval. Note: v3_h80 was trained with `--batch-size 64
-  --gradient-steps-cap 2000`; current defaults are 128/1000 (see §6.11) and
-  have not yet been validated — see README for the up-to-date training command.
+  --gradient-steps-cap 2000`; current defaults are 128/1000 (see §6.11). A
+  mountain DINOv2 run (§6.13) exercised raised optimizer settings and produced a
+  deployable single-stage cold start, but used batch=256 + scale=0.5 — the actual
+  128/1.0 defaults are still not cleanly validated. See README for the up-to-date
+  training command.
 - **Do not retune reward weights blindly.** v4 (`s=0.20, c=0.20`) and v5
   (`s=0.20, c=0.25`) were both deliberately tested and both produced worse
   deterministic-eval results than v3 (`s=0.15, c=0.25`). See §6.5 for the full ablation.
@@ -1366,19 +1421,18 @@ models/bc_official_categorical_9bin_sampler6_300/
 
 ### Validate new training defaults
 
-`--batch-size 128` and `--buffer-size 50_000` (raised 2026-05-27, see §6.11)
-have not been tested in a deterministic-eval run. The next cold-start training
-should compare:
-- training-time `ep_len` / `critic_loss` curves vs prior runs
-- whether the late-stage 10-20k peak-collapse-recovery cycle dampens
-- whether sweet-spot checkpoint shifts later than before (slower convergence
-  is the expected cost of larger batch + buffer)
+Partially exercised on 2026-05-28 (§6.13) but **not cleanly**: that run used
+batch=256 + scale=0.5, not the actual defaults (batch=128, scale=1.0). It did
+show late-stage drift persisting and the peak shifting only marginally later. A
+clean validation of `--batch-size 128` / `--buffer-size 50_000` at `scale=1.0`,
+ideally A/B against the old 64/30k baseline on the same env + seed, is still
+pending.
 
 ### `--gradient-steps-scale` ablation
 
-New CLI flag (default 1.0). Try a single 60k cold-start with `0.5` to see if
-halving the update-to-data ratio reduces late-stage drift. Compare against a
-1.0 baseline on the same env / seed.
+New CLI flag (default 1.0). `0.5` was run once on 2026-05-28 (§6.13) but
+confounded with batch=256, so its effect can't be isolated. A clean 1.0-vs-0.5
+A/B at the same batch on the same env / seed is still pending.
 
 ### Other open items
 

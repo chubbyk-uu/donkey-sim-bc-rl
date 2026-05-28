@@ -330,6 +330,7 @@ VAE encoder shared by all VAE-based loop models: `vae_loop_cones_fixedlight_v1/b
 |---|---|---|:---:|---|
 | `rl_dinov2_mountain_v2` | `sac_dinov2_vits14_40000_steps.zip` | DINOv2-S | 5/5 | **Primary** |
 | `rl_dinov2_mountain_v2` | `sac_dinov2_vits14_50000_steps.zip` | DINOv2-S | 5/5 | Backup (higher CTE) |
+| `rl_dinov2_mountain_v3` | `sac_dinov2_vits14_40000_steps.zip` | DINOv2-S | 5/5 | Alternative; faster single-stage cold start (new-defaults validation, [§6.13](docs/experiment-log.md#613-new-defaults-validation-mountain-dinov2-cold-start-2026-05-28)) |
 | `rl_dinov2_mountain_v1` | `sac_dinov2_vits14_*.zip` (6 ckpts) | DINOv2-S | — | Cold-start branch; kept for v2 reproducibility |
 | `rl_loop_resnet_mountain_v1` | `sac_resnet18_90000_steps.zip` | ResNet18 | 1/3 | Historical; superseded by DINOv2 pipeline |
 
