@@ -27,6 +27,29 @@ from rl.train_vae_sac import (
 )
 
 
+def _osc_period(x) -> tuple[float, float]:
+    """Oscillation period via local-extrema counting (sign flips of the first
+    difference). Robust to a DC offset / slow drift — i.e. if the car drives
+    off-center or holds a steady turn, that bias cancels in the difference, so
+    only the actual back-and-forth wiggle is counted. Returns
+    (period_in_steps, extrema_per_step); period=inf if no oscillation.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    if len(x) < 3:
+        return float("inf"), 0.0
+    d = np.diff(x)
+    s = np.sign(d)
+    nz = s[s != 0]                      # drop flat segments
+    if len(nz) < 2:
+        return float("inf"), 0.0
+    flips = int(np.sum(nz[1:] != nz[:-1]))   # local extrema (turning points)
+    if flips == 0:
+        return float("inf"), 0.0
+    extrema_rate = flips / (len(x) - 1)
+    period = 2.0 * (len(x) - 1) / flips        # 2 extrema (one peak+one trough) per cycle
+    return period, extrema_rate
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate VAE+SAC on the generated_track loop.")
     parser.add_argument("--model", type=Path, default=Path("models/rl_loop_vae_sac_v1/final_model.zip"))
@@ -35,9 +58,11 @@ def parse_args() -> argparse.Namespace:
                         default="vae",
                         help="Image encoder. Must match what the SAC model was trained with.")
     parser.add_argument("--encoder-crop-top", type=int, default=0,
-                        help="Top-row pixels to crop before encoding (ResNet/MobileNet only). "
-                             "Must match what the model was trained with. Use 40 for the older "
-                             "v4 ResNet checkpoint; use 0 for new-style ResNet runs.")
+                        help="Top-row pixels to crop before encoding. Applies to ALL frozen "
+                             "pretrained encoders (DINOv2, ResNet, MobileNet). The VAE always "
+                             "crops by its own fixed MARGIN_TOP and is unaffected by this flag. "
+                             "MUST match what the model was trained with. Use 40 for the older "
+                             "v4 ResNet checkpoint; use 0 for the standard DINOv2/ResNet runs.")
     parser.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_fixedlight_v1/best.pt"),
                         help="Only used when --encoder=vae.")
     parser.add_argument("--env-id", default="donkey-generated-track-v0")
@@ -118,6 +143,9 @@ def main() -> None:
         ep_lap_times: list[float] = []
         prev_lap_count = 0
         last_seen_lap_time = 0.0
+        ep_steers: list[float] = []
+        ep_steer_deltas: list[float] = []
+        ep_ctes_signed: list[float] = []
         while not (terminated or truncated):
             action, _ = model.predict(obs, deterministic=args.deterministic)
             obs, reward, terminated, truncated, info = env.step(action)
@@ -127,6 +155,9 @@ def main() -> None:
             max_cte = max(max_cte, abs_cte)
             cte_sum += abs_cte
             speed_sum += float(info.get("speed", 0.0))
+            ep_steers.append(float(info.get("rl_steer", 0.0)))
+            ep_steer_deltas.append(abs(float(info.get("rl_steer_delta", 0.0))))
+            ep_ctes_signed.append(float(info.get("cte", 0.0)))
             cur_lap_count = int(info.get("lap_count", 0))
             cur_last_lap = float(info.get("last_lap_time", 0.0))
             if cur_lap_count > prev_lap_count and cur_last_lap > 0 and cur_last_lap != last_seen_lap_time:
@@ -140,11 +171,17 @@ def main() -> None:
         best_lap = min(ep_lap_times) if ep_lap_times else 0.0
         mean_lap = float(np.mean(ep_lap_times)) if ep_lap_times else 0.0
         all_lap_times.extend(ep_lap_times)
+        mean_steer_delta = float(np.mean(ep_steer_deltas)) if ep_steer_deltas else 0.0
+        cte_std = float(np.std(ep_ctes_signed)) if ep_ctes_signed else 0.0
+        steer_period, _ = _osc_period(ep_steers)
+        cte_period, _ = _osc_period(ep_ctes_signed)
         print(
             f"ep {ep:2d}: steps={steps:5d} rew={total_r:8.1f} "
             f"mean_speed={mean_speed:.3f} "
             f"mean_cte={mean_cte:.3f} max_cte={max_cte:.2f} "
-            f"laps={lap_count} best_lap={best_lap:.2f}s mean_lap={mean_lap:.2f}s {outcome}"
+            f"laps={lap_count} best_lap={best_lap:.2f}s mean_lap={mean_lap:.2f}s {outcome}\n"
+            f"        weave: |dsteer|={mean_steer_delta:.3f} steer_period={steer_period:.1f}st "
+            f"cte_std={cte_std:.3f} cte_period={cte_period:.1f}st"
         )
         results.append(
             {
@@ -157,6 +194,10 @@ def main() -> None:
                 "lap_count": lap_count,
                 "best_lap": best_lap,
                 "mean_lap": mean_lap,
+                "steer_delta": mean_steer_delta,
+                "cte_std": cte_std,
+                "steer_period": steer_period,
+                "cte_period": cte_period,
             }
         )
 
@@ -169,6 +210,12 @@ def main() -> None:
     total_laps = sum(r["lap_count"] for r in results)
     overall_best = min(all_lap_times) if all_lap_times else 0.0
     overall_mean_lap = float(np.mean(all_lap_times)) if all_lap_times else 0.0
+    sd_mean = float(np.mean([r["steer_delta"] for r in results]))
+    ctestd_mean = float(np.mean([r["cte_std"] for r in results]))
+    finite_sp = [r["steer_period"] for r in results if np.isfinite(r["steer_period"])]
+    finite_cp = [r["cte_period"] for r in results if np.isfinite(r["cte_period"])]
+    sp_mean = float(np.mean(finite_sp)) if finite_sp else float("inf")
+    cp_mean = float(np.mean(finite_cp)) if finite_cp else float("inf")
     print(
         "\n--- summary ---\n"
         f"episodes:       {len(results)}\n"
@@ -178,7 +225,10 @@ def main() -> None:
         f"mean_abs_cte:   {cte_arr.mean():.3f}\n"
         f"max_abs_cte:    {max_cte_arr.max():.3f}\n"
         f"truncated:      {truncs}/{len(results)}\n"
-        f"total_laps:     {total_laps}   best_lap: {overall_best:.2f}s   mean_lap: {overall_mean_lap:.2f}s"
+        f"total_laps:     {total_laps}   best_lap: {overall_best:.2f}s   mean_lap: {overall_mean_lap:.2f}s\n"
+        f"weave:          |dsteer|={sd_mean:.3f}  cte_std={ctestd_mean:.3f}  "
+        f"steer_period={sp_mean:.1f}st  cte_period={cp_mean:.1f}st  "
+        f"(lower |dsteer|/cte_std = calmer; larger period = slower sway)"
     )
     env.close()
 

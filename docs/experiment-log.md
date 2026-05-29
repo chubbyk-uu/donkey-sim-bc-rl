@@ -1319,25 +1319,110 @@ re-tried):**
    Note the cte penalty is `weight × |cte| × speed`, so lowering speed weakens it
    — raising the weight is partly cancelled by the slower driving it induces.
 2. **Steering-change penalty** to damp the persistent left-right weave
-   (`abs_steer_delta_mean ≈ 0.30` throughout, ~15% of full range per step). Both
-   linear (`w=0.5`) and squared (`w=2.0`) penalties left steer_delta **dead flat
-   at ~0.30** over tens of thousands of steps — zero effect. Removed.
+   (`abs_steer_delta_mean ≈ 0.30` throughout — i.e. ~73% of the per-step steering
+   cap `max_steering_diff=0.2`→±0.4, *not* "15% of full range" as an earlier draft
+   wrongly stated). Both linear (`w=0.5`) and squared (`w=2.0`) penalties left
+   steer_delta **dead flat at ~0.30** over tens of thousands of steps — zero
+   effect. Removed.
 3. **Bigger frozen encoder** (DINOv2 ViT-B/14, z=768, hidden=384): steer_delta
    identical (~0.30) and trunc no better, at ~2× the per-step cost (fps ~9 vs
    ~15). Deleted.
 
 **Conclusions (where the limits actually are):**
 
-- **The weave is a SAC control artifact (bang-bang), not a perception or reward
-  problem.** It is identical across encoders (ViT-S vs ViT-B) and unmoved by
-  direct reward penalties. Fixing it would need a different control formulation,
-  not reward/encoder tuning.
+- **The weave is not an encoder-*capacity* problem and not a reward-tunable habit;
+  its root cause is still undetermined.** Evidence: `steer_delta` stays ~0.30
+  identically across ViT-S and ViT-B, and is unmoved by linear (`w=0.5`) or
+  squared (`w=2.0`) steer-change penalties. That rules out encoder *size/
+  resolution* and rules out "a free bad habit reward can fix". It does **not**
+  distinguish (a) a SAC control-layer high-gain/limit-cycle behavior from (b) a
+  *shared* perception weakness of frozen single-frame DINOv2 (noisy/laggy lateral
+  estimate the policy must high-frequency-correct). Both predict "identical across
+  ViT sizes" and "penalty can't remove it". An earlier draft calling this "a SAC
+  control artifact" overstated the evidence.
+- **Replay-buffer probe (v2 50k, 300-step run; training-time, includes SAC
+  exploration noise, no cte stored):** executed-steer **sign-flip rate 0.21**
+  (~one reversal per 5 steps) — a *mid-frequency large-amplitude* sway, **not**
+  step-by-step bang-bang (which would be ~0.5). mean|steer|≈0.47; per-step
+  |Δsteer|≈0.29 ≈ 73% of the 0.4 cap. The **raw policy** output wants |Δsteer|≈0.51
+  = **128% of the cap** — i.e. it continuously saturates `max_steering_diff`,
+  which is doing real smoothing work.
+- **Untried lever this surfaced:** since the policy pins the `max_steering_diff`
+  clamp, *tightening* it (0.2→~0.1) would physically suppress the weave (a hard
+  clamp the policy cannot ignore, unlike reward penalties) — at the risk of
+  under-steering tight corners. Not yet tested.
+- **Still to do for a clean diagnosis:** record per-step cte+steer from a
+  *deterministic* eval (buffer has no cte and is exploration-noisy), and/or test
+  frame-stacking (if the weave drops, it's a missing-temporal perception issue).
 - **The ~50% trunc ceiling on random layouts is not broken by a bigger *frozen*
   encoder.** The remaining hard layouts are heavy-shadow cases where the frozen
   latent likely entangles road-shadow edges with lane edges. The next real lever
   is a **task-adapted encoder** — fine-tuning DINOv2, or a depth / driving-
   segmentation model that is inherently shadow/lighting-invariant — not more RL
   reward tuning (see §8).
+
+> **Eval-clamp caveat (found 2026-05-29):** the paired-eval numbers above were
+> produced by `eval_paired_randomized.py`, which until 2026-05-29 **hardcoded
+> `max_steering_diff=0.15`** while training uses 0.2 — i.e. a tighter steering
+> clamp than the policy trained under, biasing these results slower/more
+> conservative. The bug is fixed (now a CLI arg, default 0.2). Independent
+> `eval_loop_vae_sac.py` runs (default 0.2) were unaffected. Re-measured at the
+> matched 0.2, v2 sits ~4/6 (§6.15 A), so these 3/6-ish figures slightly
+> understate v2.
+
+### 6.15 crop / steering-clamp / cte-tolerance probes (2026-05-29)
+
+Three probes against the §6.14 ~50% random-layout ceiling, plus a quantified look
+at the steering weave. All deterministic, paired on identical random layouts
+(`eval_paired_randomized.py --models`, matched `max_steering_diff=0.2`), unless
+noted. Narrative + exact commands: session log 2026-05-29.
+
+**crop (top-crop the camera before the encoder): no significant benefit.**
+A `--encoder-crop-top 40` cold start (drop the top third — sky/tree-canopy) was
+trained to 130k (resume from 80k at `max_episode_steps=1200`). Paired vs v2:
+
+| model (same 6 layouts) | Trunc | Mean CTE | Mean speed |
+| --- | :---: | ---: | ---: |
+| v2_50k (crop0) | 2/6 | 0.399 | 1.68 |
+| v2_60k (crop0) | 2/6 | 0.403 | 1.89 |
+| crop40_130k (crop40) | 4/6 | 0.472 | 1.96 |
+
+crop40_130k leads — but it trained to 130k vs v2's 60k, so the lead conflates crop
+with 70k extra steps. A same-steps control (crop40_60k vs v2_60k, same layouts):
+v2 **4/6** (cte 0.388) vs crop40 **3/6** (cte 0.540) — at equal steps crop did not
+win and ran wider. **Caveat:** that control is not blood-line-equal (v2_60k =
+v1-10k-resume + adaptive; crop40_60k = pure cold start), so the gap may be
+cold-start-vs-resume rather than crop. **Verdict: crop shows no significant
+benefit; not enough evidence to call it harmful. Default to crop0; don't pursue
+crop. The clean path to a stronger randomized model is to resume v2 (crop0) to
+more steps, not crop.** (`crop40_130k` is a decent artifact — 4/6 — but kept only
+as such, not promoted; it is crop=40.)
+
+**Also corrected here:** "training-table looked like a plateau (80k→130k)" was
+wrong — deterministic eval showed 80k=3/8 → 110k/130k=5/8 (at msd=0.2, separate
+8-layout run). Another training-table ≠ deterministic-eval case.
+
+**Steering weave: root cause still undetermined; one direct lever quantified.**
+Buffer probe (v2 50k, 300-step run): executed-steer sign-flip rate **0.21** (~one
+reversal / 5 steps — mid-frequency sway, *not* step-by-step bang-bang); raw policy
+|Δsteer| ≈ **128% of the 0.4 clamp** (it continuously saturates `max_steering_diff`).
+Tightening the clamp at eval (0.2→0.15) cut the *steering-action* amplitude
+(|dsteer| 0.30→0.25) **but cte_std did not improve** (~0.51 both) and trunc dropped
+sharply (crop40 130k: 5/8 → 0/8) with slower, wider driving. So a tighter clamp
+suppresses the *visual* wheel motion, not the underlying lateral instability, and
+costs generalization. The control-limit-cycle vs frozen-DINOv2-perception question
+is still open (needs deterministic per-step cte/steer frequency analysis +
+frame-stacking test).
+
+**`max_cte_error=2.0` is somewhat strict for this track.** Re-running crop40_130k
+at `--max-cte-error 2.5` (8 layouts) gave trunc **6/8** vs ~4/8 at 2.0. The two
+rescued episodes had max_cte 2.27 / 2.31 (light line-touching just past 2.0); true
+losses of control (max_cte 2.50, 2.84) were still not saved. So ~25% of "failures"
+at 2.0 are near-misses, not real crashes — but whether cte 2.3 is truly
+out-of-bounds depends on the track's drivable width (not measured), and rescued
+episodes ride the boundary (high cte_std), i.e. line-touching survival rather than
+better driving. Use a looser tolerance only if the track geometry justifies it,
+and never compare trunc rates across different `max_cte_error`.
 
 ## 7. Practical Pitfalls
 
@@ -1354,6 +1439,13 @@ re-tried):**
 - Do not judge SAC only by training reward or SB3 rolling means.
 - Save replay buffers at checkpoints if resume matters.
 - Do not resume SAC with replay buffers generated by a different reward function.
+- **Eval action/termination params must match training.** `--max-steering-diff`,
+  `--min-throttle`, `--max-throttle`, `--max-cte-error`, `--n-command-history`,
+  `--encoder-crop-top` all change how the policy is mapped/terminated at eval; if
+  they differ from training the results are not comparable (e.g. the 2026-05-29
+  `eval_paired` clamp bug ran every paired eval at msd=0.15 vs training's 0.2, §6.15).
+  Note `MAX_STEERING_DIFF=0.15` is a stale module constant; the real training
+  default is the `train_loop_vae_sac.py` CLI default 0.2.
 - `max_episode_steps` truncation is not a crash reward. It is a TimeLimit stop.
 - On a non-closed generated road, not reaching 3000 steps can still be success if the
   vehicle reached the route end.
@@ -1428,8 +1520,11 @@ What the experiments established about how to train and evaluate:
   ~50% truncate on unseen random layouts (§6.14). **Do not chase higher robustness with
   reward tuning or a bigger frozen encoder** — both were shown not to help (§6.14); the
   next lever is a task-adapted encoder (fine-tune / depth / segmentation).
-- **The left-right steering weave is a SAC control artifact**, not fixable by reward
-  penalties or a bigger encoder (§6.14). Don't spend reward-tuning effort on it.
+- **The left-right steering weave is not fixable by reward penalties or a bigger
+  frozen encoder** (§6.14) — so don't spend reward-tuning effort on it. Root cause
+  undetermined (control high-gain vs frozen-DINOv2 lateral-perception weakness). A
+  buffer probe showed the policy saturates the `max_steering_diff` clamp, so the
+  one untried direct lever is **tightening that clamp** (0.2→~0.1); see §6.14.
 
 ## 9. Current Data And Model Inventory
 

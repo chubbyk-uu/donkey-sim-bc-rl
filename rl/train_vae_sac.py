@@ -153,8 +153,10 @@ def make_encoder(encoder_name: str, device: torch.device, vae_checkpoint: Path |
                  crop_top: int = 0):
     """Factory: build an encoder by name. Returns object with .encode(obs) and .z_size.
 
-    `crop_top` only affects pretrained CNN encoders. The VAE encoder always uses its
-    fixed MARGIN_TOP crop (since the VAE was trained on cropped frames).
+    `crop_top` applies to all frozen pretrained encoders (DINOv2, ResNet, MobileNet).
+    The VAE encoder does not read this arg but is NOT uncropped: it always crops by
+    its own fixed MARGIN_TOP (the VAE was trained on cropped frames), see
+    FrozenVaeEncoder.encode.
     """
     if encoder_name == "vae":
         if vae_checkpoint is None:

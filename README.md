@@ -292,9 +292,11 @@ rl/
   train_vae.py                        VAE encoder training
   train_vae_sac.py                    shared env / reward / encoder code
   train_loop_vae_sac.py               SAC training entrypoint (loop + mountain)
-  eval_loop_vae_sac.py                evaluation entrypoint
-  eval_paired_randomized.py           compare checkpoints on the SAME random layouts
-                                      (removes layout-luck confound; for domain-rand runs)
+  eval_loop_vae_sac.py                evaluation entrypoint (reports weave metrics:
+                                      |dsteer|, cte_std, steer/cte oscillation period)
+  eval_paired_randomized.py           compare models on the SAME random layouts (removes
+                                      layout-luck confound). --models label:zip:crop lets you
+                                      mix dirs/crops in one paired run; also reports weave
 
 bc/
   train_bc.py                         BC regression CNN training
@@ -330,7 +332,7 @@ repo — regenerate by resuming training with `--save-replay-buffer`.
 | `rl_loop_vae_v15` | `sac_loop_vae_132488_steps.zip` | VAE | 2/5 | Reference only (faster laps, not deployable) |
 | `rl_loop_vae_sac_fixedlight_v2_h64` | `sac_loop_vae_100000_steps.zip` | VAE | 3/3 | Secondary (hidden=64, more centered) |
 | `rl_loop_dinov2_v8` | `sac_dinov2_vits14_30000_steps.zip` | DINOv2-S | 3/3 | Lighting-robust alternative |
-| `rl_loop_dinov2_randomtree_v2` | `sac_dinov2_vits14_50000_steps.zip` | DINOv2-S | ~3/6 rand | Domain-randomized: robust to random light + trees/shadows, ~50% trunc on unseen random layouts ([§6.14](docs/experiment-log.md#614-domain-randomization-random-light--tree-shadows-on-loop-2026-05-28)) |
+| `rl_loop_dinov2_randomtree_v2` | `sac_dinov2_vits14_50000_steps.zip` | DINOv2-S | ~50% rand | Domain-randomized: robust to random light + trees/shadows ([§6.14](docs/experiment-log.md#614-domain-randomization-random-light--tree-shadows-on-loop-2026-05-28); the old "3/6" was measured under the §6.15 eval-clamp bug — ~4/6 at matched params) |
 | `rl_loop_vae_sac_resnet_v4_notrees` | `sac_resnet18_50000_steps.zip` | ResNet18 | 3/3 | Backup, needs `--encoder-crop-top 40` |
 
 VAE encoder shared by all VAE-based loop models: `vae_loop_cones_fixedlight_v1/best.pt`

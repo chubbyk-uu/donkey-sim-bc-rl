@@ -43,10 +43,13 @@ def parse_args() -> argparse.Namespace:
                              "'resnet18' / 'mobilenet_v3_small' use frozen ImageNet-pretrained weights; "
                              "'dinov2_vits14' / 'dinov2_vitb14' use frozen DINOv2 ViT-S(384)/B(768).")
     parser.add_argument("--encoder-crop-top", type=int, default=0,
-                        help="Top-row pixels to crop before encoding (ResNet/MobileNet only; VAE "
-                             "uses its own fixed crop). Default 0 (no crop) reduces aspect ratio "
-                             "distortion when resizing to 224x224. Set to 40 to reproduce the "
-                             "older v4 ResNet behavior.")
+                        help="Top-row pixels to crop before encoding. Applies to ALL frozen "
+                             "pretrained encoders (DINOv2, ResNet, MobileNet). The VAE encoder "
+                             "always crops by its own fixed MARGIN_TOP (it was trained on cropped "
+                             "frames) and is unaffected by this flag. Default 0 (no extra crop) "
+                             "reduces aspect-ratio distortion when resizing to 224x224. Set to 40 "
+                             "to reproduce the older v4 ResNet behavior or to drop the top third "
+                             "(sky/tree-canopy) for any pretrained encoder.")
     parser.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_fixedlight_v1/best.pt"),
                         help="Only used when --encoder=vae.")
     parser.add_argument("--output-dir", type=Path, default=Path("models/rl_loop_vae_sac_v1"))

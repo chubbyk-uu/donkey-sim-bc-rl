@@ -175,8 +175,11 @@ getting it to work:
 
 ### 7.4 Findings + cleanup
 
-- The left-right **weave is a SAC control artifact** — identical across encoders,
-  unmoved by linear/squared steer penalties.
+- The left-right **weave is identical across encoders (ViT-S/ViT-B) and unmoved by
+  linear/squared steer penalties** — but its root cause is **undetermined**. (This
+  log first called it "a SAC control artifact"; a 2026-05-29 buffer probe showed
+  that overstated the evidence — see experiment-log §6.14 for the corrected
+  analysis and the untried `max_steering_diff` lever.)
 - The ~50% random-layout ceiling is **not broken by a bigger frozen encoder** →
   next lever is a task-adapted encoder (fine-tune / depth / segmentation). Full
   analysis in experiment-log §6.14.
