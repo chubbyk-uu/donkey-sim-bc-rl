@@ -8,6 +8,7 @@ camera image → (crop) → encoder → SAC policy → steer / throttle
 ```
 
 Detailed experiment history and design decisions: [docs/experiment-log.md](docs/experiment-log.md)
+Chinese README: [README-CN.md](README-CN.md)
 
 **Status (2026-05-29): stable milestone reached.** The project now has working BC
 baselines, a single generated-road VAE+SAC baseline, fixed-light loop deployments,
