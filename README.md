@@ -9,6 +9,17 @@ camera image → (crop) → encoder → SAC policy → steer / throttle
 
 Detailed experiment history and design decisions: [docs/experiment-log.md](docs/experiment-log.md)
 
+> **Status (2026-05-29): wound down at a clean milestone.** A full BC→RL pipeline
+> was validated on the Donkey sim — fixed-light VAE+SAC deployments
+> (v3_h80, v15), encoder-generalization study (VAE / DINOv2 / ResNet), a Mountain
+> DINOv2 pipeline, and scene-reload domain randomization (random light + tree
+> shadows). **Known ceiling:** with a *frozen* encoder, unseen random layouts cap
+> at ~50–65% truncate; the bottleneck is perception (road shadows vs lane edges),
+> and reward / crop / steering-clamp / more-steps all fail to break it (§6.13–6.15).
+> **Next lever, left as future work:** a task-adapted encoder (depth /
+> segmentation / fine-tuned DINOv2), not more RL tuning (§10). The models, tooling,
+> and per-session logs are complete and reproducible as-is.
+
 ---
 
 ## Current Deployments
