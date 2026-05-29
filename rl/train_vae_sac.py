@@ -298,6 +298,7 @@ class DonkeyVaeSACEnv(gym.Wrapper):
             self._steps_on_scene = 0  # reset whether or not reload succeeded (avoid retry spam)
 
         obs, info = self.env.reset(**kwargs)
+        self._prev_lap_count = int(info.get("lap_count", 0))
         return self._build_obs(obs), info
 
     def step(self, action):
@@ -623,7 +624,7 @@ def main() -> None:
         CheckpointCallback(
             save_freq=args.checkpoint_freq,
             save_path=str(args.output_dir),
-            name_prefix=f"sac_{args.encoder}",
+            name_prefix="sac_vae_raffin",
             save_replay_buffer=args.save_replay_buffer,
             save_vecnormalize=False,
         ),

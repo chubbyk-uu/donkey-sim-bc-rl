@@ -1502,6 +1502,9 @@ What the experiments established about how to train and evaluate:
   deployable single-stage cold start, but used batch=256 + scale=0.5 — the actual
   128/1.0 defaults are still not cleanly validated. See README for the up-to-date
   training command.
+- New `train_loop_vae_sac.py --encoder vae` checkpoints intentionally keep the
+  historical `sac_loop_vae_*_steps.zip` prefix. Non-VAE encoders use
+  `sac_{encoder}_*_steps.zip`.
 - **Do not retune reward weights blindly.** v4 (`s=0.20, c=0.20`) and v5
   (`s=0.20, c=0.25`) were both deliberately tested and both produced worse
   deterministic-eval results than v3 (`s=0.15, c=0.25`). See §6.5 for the full ablation.
@@ -1546,16 +1549,26 @@ data/curated_cornering_v2_clean/
 data/Cornering data.zip
 data/cornorraw.zip
   Compressed backups of raw cornering captures. The extracted copies were deleted.
+
+data/vae_raw/generated_track_loop_fixedlight_*/
+  Fixed-light loop VAE raw image captures. Current active loop VAE source data.
+
+data/vae_loop_cones_fixedlight_v1/
+  Prepared manifest/train/val split for the fixed-light loop VAE dataset.
+
+data/vae/cache_loop_cones_fixedlight_v1/
+  Cropped uint8 memmap cache used by `rl/train_vae.py` for the active fixed-light
+  loop VAE encoder.
 ```
 
 Deleted data categories:
 
 ```text
-data/vae/
-  Old generated-road VAE manifests/cache leftovers.
+data/vae/cache_loop_cones_v1/
+  Removed random-light loop VAE cache.
 
-data/vae_raw/
-  Random-light loop VAE raw images and older extracted cornering raw images.
+data/vae_raw/generated_track_loop_cones*/
+  Removed random-light loop VAE raw images.
 
 data/vae_loop_cones_v1/
   Manifest for the removed random-light loop VAE dataset.
@@ -1637,4 +1650,3 @@ pretraining may not transfer).
 - No further reward-weight ablations planned on loop (§6.5 closed the loop).
 - No further hidden-size ablations planned on loop (h64 → h80 → h128 path
   fully explored).
-

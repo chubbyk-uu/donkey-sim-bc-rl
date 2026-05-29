@@ -200,7 +200,7 @@ def main() -> None:
         CheckpointCallback(
             save_freq=args.checkpoint_freq,
             save_path=str(args.output_dir),
-            name_prefix=f"sac_{args.encoder}",
+            name_prefix="sac_loop_vae" if args.encoder == "vae" else f"sac_{args.encoder}",
             save_replay_buffer=args.save_replay_buffer,
             save_vecnormalize=False,
         ),

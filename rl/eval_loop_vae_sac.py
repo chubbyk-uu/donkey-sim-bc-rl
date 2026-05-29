@@ -94,7 +94,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lap-completion-bonus", type=float, default=0.0,
                         help="Match training value (affects reported reward only).")
     parser.add_argument("--cte-speed-penalty-weight", type=float, default=0.25)
-    parser.add_argument("--deterministic", action="store_true", default=True)
+    parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use deterministic policy actions. Pass --no-deterministic "
+                             "to sample stochastic SAC actions.")
     return parser.parse_args()
 
 

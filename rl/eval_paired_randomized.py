@@ -1,4 +1,3 @@
-from __future__ import annotations
 """Paired randomized eval: compare several checkpoints on the SAME set of random
 layouts.
 
@@ -18,6 +17,7 @@ Example:
       --steps 30000,40000,50000,60000 \
       --layouts 12 --max-episode-steps 2000
 """
+from __future__ import annotations
 
 import argparse
 import os
@@ -167,8 +167,9 @@ def main() -> None:
         for s in args.steps.split(","):
             if s.strip():
                 step = int(s.strip())
+                prefix = "sac_loop_vae" if args.encoder == "vae" else f"sac_{args.encoder}"
                 specs.append((f"{step // 1000}k",
-                              args.model_dir / f"sac_{args.encoder}_{step}_steps.zip",
+                              args.model_dir / f"{prefix}_{step}_steps.zip",
                               args.encoder_crop_top))
     else:
         raise SystemExit("provide --models or --steps")

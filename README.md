@@ -198,15 +198,15 @@ python rl/train_vae.py \
   --output-dir models/vae_loop_cones_fixedlight_v1 \
   --epochs 20
 
-# 3. Train SAC (proven recipe: safe_v2 reward, hidden=80)
+# 3. Train SAC (verified v3_h80 recipe: safe_v2 reward, hidden=80)
 python rl/train_loop_vae_sac.py \
   --encoder vae \
   --vae-model models/vae_loop_cones_fixedlight_v1/best.pt \
   --output-dir models/rl_loop_new \
   --hidden-size 80 \
-  --batch-size 128 \
+  --batch-size 64 \
   --gradient-steps-min 50 \
-  --gradient-steps-cap 1000 \
+  --gradient-steps-cap 2000 \
   --alive-reward 1.5 \
   --speed-reward-weight 0.15 \
   --cte-speed-penalty-weight 0.25 \
@@ -219,6 +219,9 @@ python rl/train_loop_vae_sac.py \
 Evaluate at each 10k checkpoint; deploy the best deterministic-eval result (not the
 final step). The 10-20k peak-valley-recovery cycle is normal — see
 [experiment log §6.9](docs/experiment-log.md#69-lessons-from-the-fixed-light-loop-work).
+Current CLI defaults are `--batch-size 128 --gradient-steps-cap 1000`; those newer
+defaults are useful for fresh experiments but have not cleanly reproduced the deployed
+v3_h80 result yet.
 
 ### Loop Track — DINOv2 / ResNet (no VAE collection)
 
@@ -336,6 +339,8 @@ repo — regenerate by resuming training with `--save-replay-buffer`.
 | `rl_loop_vae_sac_resnet_v4_notrees` | `sac_resnet18_50000_steps.zip` | ResNet18 | 3/3 | Backup, needs `--encoder-crop-top 40` |
 
 VAE encoder shared by all VAE-based loop models: `vae_loop_cones_fixedlight_v1/best.pt`
+New `--encoder vae` training checkpoints are written with the historical
+`sac_loop_vae_*_steps.zip` prefix for compatibility with these artifacts.
 
 ### Mountain Track
 
