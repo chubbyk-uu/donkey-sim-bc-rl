@@ -4,6 +4,28 @@ This document records the practical experiment history: what worked, what failed
 what should not be repeated. The short project entrypoint is kept in
 [README.md](../README.md).
 
+## Reading Guide
+
+This log is chronological enough to preserve context, but the project now has several
+parallel lines. Use this guide instead of reading straight through on a first pass:
+
+```text
+BC baselines                                  §1
+Original single generated-road VAE+SAC        §2
+Removed random-light loop VAE history         §3-5
+Current fixed-light loop VAE pipeline         §6.1-6.6 and §6.9
+Mountain DINOv2 pipeline                      §6.7, §6.10, §6.13
+Encoder lighting/generalization comparison    §6.12
+Random light + tree-shadow domain randomization §6.14-6.15
+Operational pitfalls and monitoring rules     §7
+Current recommendations                       §8
+Data/model inventory and TODOs                §9-10
+```
+
+README is the source of truth for current deployment commands and the short model
+inventory. This log explains why those choices were made and records deleted or
+failed branches so they are not repeated.
+
 ## 1. Behavioral Cloning
 
 BC had two serious branches: continuous regression and official-style categorical
@@ -331,7 +353,7 @@ reward:              1.0 + 0.1 * throttle/max_throttle
 crash:               -10 - 5 * normalized_throttle
 train_freq:          (1, "episode")
 gradient_steps:      -1
-gradient_steps_cap:  600 in current script
+gradient_steps_cap:  600 in this historical run; current script default is 1000
 max_episode_steps:   3000
 ```
 
@@ -730,7 +752,7 @@ After this finding the entire `models/rl_loop_vae_sac_fixedlight_v1/` directory 
 deleted (about 4.1 GB freed). The branch is documented here only as a "do not use this
 recipe for the next deployment" data point.
 
-### 6.3 fixedlight_v2_h64 — current deployment
+### 6.3 fixedlight_v2_h64 — former deployment / secondary kept model
 
 Second attempt switched to the smaller MLP that matched the historical `safe_v2`
 recipe:
@@ -771,11 +793,15 @@ low.
 Files kept:
 
 ```text
-models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_100000_steps.zip    (deployment)
+models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_100000_steps.zip    (former deployment / secondary)
 models/rl_loop_vae_sac_fixedlight_v2_h64/sac_loop_vae_90000_steps.zip     (backup)
 ```
 
 All other v2_h64 checkpoints and the 110k checkpoint were removed.
+
+Status update: v2_h64 100k was later replaced by v3_h80 90k as the README primary
+loop deployment, but the 100k/90k v2_h64 checkpoints remain useful secondary
+references.
 
 ### 6.4 fixedlight_v3_h80 — slightly faster than v2_h64
 
@@ -796,6 +822,11 @@ Eval at 70k/80k/90k/100k:
 mean_cte ~0.31, similar reward. 100k showed sharp regression (0/3 truncate, 933 mean
 steps) — peak was earlier. v3_h80 90k became the new deployment best, replacing
 v2_h64 100k.
+
+Current fixed-light loop status: README treats **v3_h80 90k** as the primary
+fixed-light loop deployment and **v15 112488** as the long-eval co-primary. The v15
+details live in `docs/session_2026-05-26_log.md` because that branch was developed in
+the later DINOv2/v15 session; model inventory keeps both artifacts visible.
 
 ### 6.5 Reward weight ablations: v4 (s20c20) and v5 (s20c25)
 
@@ -1679,7 +1710,7 @@ pretraining may not transfer).
   v1 30k. If v2 stays stable across future work, v1 can be reduced to just
   the 30k zip + buffer.
 - Loop deployment v3_h80 90k and v15 112488 remain the production models.
-- Resnet mountain v1 (§6.8) is superseded but kept as historical reference.
+- ResNet mountain v1 (§6.8) is superseded but kept as historical reference.
 - No further reward-weight ablations planned on loop (§6.5 closed the loop).
 - No further hidden-size ablations planned on loop (h64 → h80 → h128 path
   fully explored).
