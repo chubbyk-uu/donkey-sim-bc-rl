@@ -1327,6 +1327,17 @@ re-tried):**
 3. **Bigger frozen encoder** (DINOv2 ViT-B/14, z=768, hidden=384): steer_delta
    identical (~0.30) and trunc no better, at ~2× the per-step cost (fps ~9 vs
    ~15). Deleted.
+4. **Frozen ResNet18 under the same randomized light/tree-shadow setup** (crop_top=0,
+   hidden=256, batch=256, `gradient_steps_scale=0.5`, `alive_reward=1.65`,
+   adaptive reload `alpha=3 kmin=200`) was stopped at 20k. It produced
+   `sac_resnet18_10000_steps.zip` and `sac_resnet18_20000_steps.zip` during the run,
+   but the branch was deleted immediately after review: at ~21.4k env steps, the last
+   100 episodes averaged ~121 steps, the best recent episode was 179 steps, and
+   `lap_count_mean` stayed at 0. Visually, it could pass the first bend on some
+   layouts and fail again after a scene reload, indicating strong sensitivity to
+   road-shadow layout. Conclusion: **ResNet18's random road-shadow generalization is
+   far worse than DINOv2-S**; do not spend more randomtree experiments on frozen
+   ResNet unless the goal is a negative baseline.
 
 **Conclusions (where the limits actually are):**
 
@@ -1424,6 +1435,25 @@ episodes ride the boundary (high cte_std), i.e. line-touching survival rather th
 better driving. Use a looser tolerance only if the track geometry justifies it,
 and never compare trunc rates across different `max_cte_error`.
 
+**Resuming past the plateau + a speed-vs-stability finding.** crop40 resumed
+130k→200k (paired on the same 6 layouts, msd=0.2): trunc 130k=2/6, 170k=4/6,
+200k=3/6 — peak-valley, no breakthrough; resuming past ~130k buys nothing on
+trunc. But per-lap times show the real trade-off: on layouts each *can* finish,
+**130k laps ~1-1.5 s faster** (steady ~12.0-12.5 s) than 170k/200k (~13.4-13.6 s).
+So resume = "slow down to survive more layouts" (130k fast-but-fragile, 170k
+stable-but-slower); neither dominates.
+
+**Methodology: read lap time, not `mean_speed`, for driving speed.** `mean_speed`
+is the instantaneous speed averaged over *every* eval step — **including the
+low-speed / losing-control steps before a crash**. A checkpoint that crashes more
+(130k: 2/6) gets its `mean_speed` dragged down by those steps (130k mean_speed
+1.666, the *lowest* of the three) even though its actual lap pace is the
+*fastest*. So `mean_speed` conflates "how fast it drives" with "how often it
+crashes" and is misleading — use lap time for driving speed. Likewise, with only
+~6 layouts the absolute trunc/mean_speed swing a lot batch-to-batch (the same
+130k scored 4/6 in one batch, 2/6 in another); only within-batch relative
+ordering is trustworthy.
+
 ## 7. Practical Pitfalls
 
 - Do not install the PyPI `gym-donkeycar` package — it targets the old `gym` API.
@@ -1520,9 +1550,12 @@ What the experiments established about how to train and evaluate:
 - **For robustness to randomized appearance (random light + trees/shadows), train with
   scene-reload domain randomization** (`--scene-reload-alpha 3 --scene-reload-kmin 200`),
   and eval with `--scene-reload-every 1` (fresh layout per episode). This gets DINOv2 to
-  ~50% truncate on unseen random layouts (§6.14). **Do not chase higher robustness with
-  reward tuning or a bigger frozen encoder** — both were shown not to help (§6.14); the
-  next lever is a task-adapted encoder (fine-tune / depth / segmentation).
+  ~50% truncate on unseen random layouts (§6.14). Frozen ResNet18 was stopped at 20k
+  with no laps completed and strong scene-to-scene shadow sensitivity, so DINOv2 is
+  the better frozen encoder for this condition. **Do not chase higher robustness with
+  reward tuning, frozen ResNet, or a bigger frozen DINO encoder** — these were shown
+  not to help (§6.14); the next lever is a task-adapted encoder (fine-tune / depth /
+  segmentation).
 - **The left-right steering weave is not fixable by reward penalties or a bigger
   frozen encoder** (§6.14) — so don't spend reward-tuning effort on it. Root cause
   undetermined (control high-gain vs frozen-DINOv2 lateral-perception weakness). A

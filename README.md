@@ -245,6 +245,9 @@ scene-reload domain randomization: `--scene-reload-alpha 3 --scene-reload-kmin 2
 layouts). Eval with `--scene-reload-every 1` (fresh layout per episode). DINOv2
 reaches ~50% truncate on unseen random layouts this way — see
 [experiment log §6.14](docs/experiment-log.md#614-domain-randomization-random-light--tree-shadows-on-loop-2026-05-28).
+Frozen ResNet18 was tested under the same random light + tree-shadow setup and was
+stopped at 20k: it never completed a lap and recent episodes stayed under 200 steps.
+For shadowed-road robustness, DINOv2 is clearly stronger than ResNet18.
 
 ### Mountain Track — DINOv2
 

@@ -113,3 +113,43 @@ not better driving.
   stronger randomized model is to **resume v2 (crop0) to more steps**, not crop.
 - Weave root cause still undetermined; next real lever remains a task-adapted
   encoder (§6.14 / §10), not reward/crop/clamp tuning.
+
+## 7. crop40 resume 130k→200k + the speed-vs-stability finding (+cleanup)
+
+Resumed crop40 130k to 200k (max_ep 1200, on port 9081), then paired-eval
+130k/170k/200k on the same 6 layouts (crop-top 40, msd 0.2):
+
+| ckpt | trunc | mean_steps | mean_cte | mean_spd |
+| --- | :---: | ---: | ---: | ---: |
+| 130k | 2/6 | 890 | 0.444 | 1.666 |
+| 170k | 4/6 | 1422 | 0.440 | 1.746 |
+| 200k | 3/6 | 1385 | 0.447 | 1.818 |
+
+trunc went 2→4→3: a peak-valley (170k is the local peak), **not** monotonic
+progress and no breakthrough — same plateau (~50-65%) the other runs show.
+Resuming past ~130k buys nothing on trunc. Best of this batch: 170k.
+
+**The real finding (from per-lap times, not the summary):** on the layouts each
+model *can* finish, **130k laps ~1-1.5 s faster** than 170k/200k (steady laps
+~12.0-12.5 s vs ~13.4-13.6 s). So resume 130k→170k is **"slow down to stay on
+track"**: it trades ~1.5 s/lap for surviving more random layouts (2/6→4/6).
+130k = fast-but-fragile, 170k = stable-but-slower; neither strictly dominates.
+
+**Methodology correction (important):** I first read `mean_speed` (130k=1.666,
+lowest) and wrongly said "speed rises with training." `mean_speed` averages the
+instantaneous speed over *every* step of the eval, **including the low-speed /
+losing-control steps before a crash**. 130k crashes more (2/6), so those steps
+drag its `mean_speed` down — even though its *driving* speed (lap time) is the
+fastest. So `mean_speed` mixes "how fast it drives" with "how often it crashes"
+and is misleading. **Use lap time for real driving speed, not `mean_speed`.**
+(See experiment-log §6.15 for the durable version.)
+
+Also reaffirmed: 6-layout samples have large layout-to-layout variance — the same
+130k checkpoint scored 4/6 in the 3-way batch and 2/6 here (different random
+layouts). Only within-batch relative ordering is trustworthy; absolute
+trunc / mean_speed are not comparable across batches.
+
+**Cleanup:** crop40_v1 pruned 3.4G → 16M (kept only 130k + 170k zips as the
+fast/stable exemplars; deleted all 20 replay buffers and the other 19 zips).
+Not added to the repo — it's a crop=40 experiment artifact (crop not pursued),
+and v2 already represents the randomtree deployment line.
