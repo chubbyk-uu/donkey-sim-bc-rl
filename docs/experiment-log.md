@@ -1485,6 +1485,45 @@ crashes" and is misleading — use lap time for driving speed. Likewise, with on
 130k scored 4/6 in one batch, 2/6 in another); only within-batch relative
 ordering is trustworthy.
 
+### 6.16 Depth/seg probe for the task-adapted encoder (2026-06-12)
+
+The cheap probe called for in §10 ("verify depth/seg output quality on the
+cartoonish sim frames before investing"), now done. Script:
+`tools/probe_depth_seg.py` — runs Depth Anything V2 Small plus a
+Cityscapes-pretrained SegFormer on sim frames and writes
+original|depth|seg|road-mask panels.
+
+**Inputs.** 3 fixed-light frames from `data/vae_raw`, plus 5 random-light +
+random-tree frames freshly captured (3 separate scene loads = 3 layouts,
+`tools/collect_sim_frames.py`, cte-pid driving) including one worst-case frame
+with dense dappled tree shadow across the road. Frames in
+`data/probe_randomtree_frames/`, panels in `logs/probe_depth_seg*/` (both
+local-only, gitignored).
+
+**Segmentation — model size decides.** SegFormer-**B0** does not transfer to
+the sim (road class 2-20% of pixels, inconsistent across frames, road confused
+with sidewalk/terrain). SegFormer-**B4** transfers well: road 45-49% on
+fixed-light frames, consistent, mask stops cleanly at the grass edge and
+**covers the ego-car shadow region as road**. Under random tree shadows: still
+clean at light/moderate shadow (road 53-55%), but the worst dappled-shadow
+frame degrades (road 31%, holes in the mask under the densest patches) and one
+frame bled road onto shadowed grass.
+
+**Depth — shadow-immune but lane-blind.** Smooth ground-plane gradient on every
+frame, tree trunks/cones pop out, and shadows are invisible by construction
+(geometry, not appearance). But lane lines and the road/grass boundary are also
+flat, hence invisible — depth alone cannot lane-keep; auxiliary channel only.
+
+**Verdict.** The sim→real domain gap is manageable at B4 scale, and a
+seg-derived road mask is exactly the shadow-invariant signal the frozen
+encoders lack (§6.14-6.15 ceiling). Used raw, B4 would likely *raise* the ~50%
+random-layout ceiling rather than remove it (worst-case dappled shadow still
+breaks the mask), and B4 is too heavy for the ~20 Hz control loop. The
+recommended path if this is picked up: **auto-label sim frames with B4
+pseudo-labels and distill a small seg net** (data is free in the sim; also
+solves inference cost), then feed mask (or mask+image) to SAC. Status:
+probe positive, line validated as worth pursuing; no training done.
+
 ## 7. Practical Pitfalls
 
 - Do not install the PyPI `gym-donkeycar` package — it targets the old `gym` API.
@@ -1505,8 +1544,8 @@ ordering is trustworthy.
   `--encoder-crop-top` all change how the policy is mapped/terminated at eval; if
   they differ from training the results are not comparable (e.g. the 2026-05-29
   `eval_paired` clamp bug ran every paired eval at msd=0.15 vs training's 0.2, §6.15).
-  Note `MAX_STEERING_DIFF=0.15` is a stale module constant; the real training
-  default is the `train_loop_vae_sac.py` CLI default 0.2.
+  The stale `MAX_STEERING_DIFF=0.15` module constant in `train_vae_sac.py` was
+  fixed to 0.2 on 2026-06-12; all entry points now default to 0.2.
 - `max_episode_steps` truncation is not a crash reward. It is a TimeLimit stop.
 - On a non-closed generated road, not reaching 3000 steps can still be success if the
   vehicle reached the route end.
@@ -1700,9 +1739,12 @@ and showed neither reward tuning nor a bigger frozen encoder (ViT-B) helps. The
 identified next lever: a **task-adapted encoder** — fine-tune DINOv2 (warm-start
 from a competent policy, low LR, partial unfreeze; needs storing raw images in
 the buffer + encoding in the SB3 features_extractor), or swap in a depth /
-driving-segmentation model that is inherently shadow/lighting-invariant. Verify
-the depth/seg output quality on the cartoonish sim frames first (real-world
-pretraining may not transfer).
+driving-segmentation model that is inherently shadow/lighting-invariant.
+**Probe done 2026-06-12 (§6.16): positive.** SegFormer-B4 (Cityscapes) reads
+the sim road through moderate tree shadow; depth is shadow-immune but
+lane-blind. Remaining work if picked up: distill B4 pseudo-labels into a small
+seg net (B4 itself fails on the densest dappled shadow and is too slow for the
+20 Hz loop), then train SAC on the mask features.
 
 ### Other open items
 
