@@ -1826,14 +1826,15 @@ frames, 12 GIFs, plots/contact sheets under `control_analysis/`).
 - Offline replay using saved frames plus the previous 20 mapped commands exactly
   reproduces all 15 sampled next actions (max absolute difference 0). This
   validates camera/history/policy alignment for those samples, not simulator
-  command-to-frame causality. Script/output: `verify_policy_alignment.py`,
-  `alignment_check.json` inside the artifact directory.
+  command-to-frame causality. Script: `tools/verify_policy_alignment.py`
+  (originally run from a copy inside the artifact directory; the tool reproduces
+  the same numbers); output `alignment_check.json` in that directory.
 - A limited offline sensitivity probe freezes command history and applies RGB
   gains 0.9/1.1 to those 15 frames. Across 30 perturbations, median absolute steer
   change is 0.0034, maximum 0.536, and no sign flips occur when the original
   magnitude exceeds 0.2. This is neither a closed-loop result nor a test of local
-  tree-shadow invariance. Script/output: `probe_visual_sensitivity.py`,
-  `brightness_probe.json` in the same directory.
+  tree-shadow invariance. Script: `tools/verify_policy_alignment.py
+  --brightness-gains 0.9 1.1`; output `brightness_probe.json` in the same directory.
 
 **Interpretation:** current evidence does not establish perception as the sole
 bottleneck, and does not establish control as the sole cause either. Keep the

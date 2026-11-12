@@ -272,3 +272,81 @@ def test_wrapper_preserves_action_mapping_and_history():
     assert info["rl_throttle"] == pytest.approx(.7)
     assert obs[-2:] == pytest.approx([.39998, .7])
     assert reward == 1. and not terminated and not truncated
+
+
+def test_steering_rate_limit_does_not_depend_on_history_length():
+    encoder = SimpleNamespace(z_size=3, encode=lambda obs: np.zeros(3, np.float32))
+    env = DonkeyVaeSACEnv(TinyEnv(), vae=encoder, n_command_history=0)
+    obs, _ = env.reset()
+    assert obs.shape == (3,)
+    steers = [env.step(np.array([1., 0.]))[4]["rl_steer"] for _ in range(2)]
+    assert steers == pytest.approx([.39998, .79996])
+    env.reset()
+    assert env.step(np.array([-1., 0.]))[4]["rl_steer"] == pytest.approx(-.39998)
+
+
+def test_paired_and_loop_evaluations_use_the_requested_rewards(monkeypatch):
+    import sys
+    from rl import eval_paired_randomized as paired
+    from rl.train_vae_sac import reward_config_from_args
+    monkeypatch.setattr(sys, "argv", ["eval", "--steps", "1", "--alive-reward", "1.7", "--cte-target", "3.5"])
+    config = reward_config_from_args(paired.parse_args())
+    assert (config.alive_reward, config.speed_reward_weight, config.cte_target) == (1.7, .15, 3.5)
+    assert reward_config_from_args(SimpleNamespace(max_cte_error=2.5)).max_cte_error == 2.5
+
+
+class EpisodeEnv(TinyEnv):
+    """Episodes of `length` steps, so a checkpoint can fall mid-episode."""
+    length = 6
+
+    def step(self, action):
+        obs, reward, terminated, _, info = super().step(action)
+        return obs, reward, terminated, self.steps == self.length, info
+
+
+def test_replay_buffer_is_saved_at_episode_end_not_mid_episode(tmp_path):
+    config = environment_config(arguments(tmp_path))
+    model = SAC("MlpPolicy", EpisodeEnv(), buffer_size=64, learning_starts=100,
+                policy_kwargs={"net_arch": [8]}, device="cpu")
+    model.donkey_config = config
+    seen = []
+
+    class Watch(ConfigCheckpointCallback):
+        def _save_pending_replay(self):
+            if self._pending_replay_path is not None:
+                seen.append((self.num_timesteps, self._pending_replay_path.name))
+            super()._save_pending_replay()
+
+    model.learn(9, callback=Watch(save_freq=4, save_path=str(tmp_path), save_replay_buffer=True))
+    # Checkpoint at step 4 waits for the episode end at 6; the one at 8 is
+    # flushed when training stops at 9, before its episode ends.
+    assert seen == [(6, "rl_model_replay_buffer_4_steps.pkl"), (9, "rl_model_replay_buffer_8_steps.pkl")]
+    assert (tmp_path / "rl_model_4_steps.zip").is_file()
+    validate_replay(tmp_path / "rl_model_replay_buffer_4_steps.pkl", config)
+
+
+def test_resume_without_buffer_waits_for_data_and_keeps_configuration(tmp_path, monkeypatch):
+    training, args, config, env, _ = resumed_training(
+        tmp_path, monkeypatch, ["--timesteps", "24", "--resume-warmup-steps", "10",
+                                "--gradient-steps-min", "5", "--checkpoint-freq", "4"])
+    # Episode training with dynamic updates, as in the real loop recipes.
+    model = SAC("MlpPolicy", env, batch_size=4, buffer_size=16, device="cpu", train_freq=(1, "episode"),
+                gradient_steps=-1, policy_kwargs={"net_arch": {"pi": [8, 8], "qf": [8, 8]}})
+    model.donkey_config = config
+    model.num_timesteps = 1000  # far past learning_starts, as on a real resume
+    monkeypatch.setattr(training.SAC, "load", lambda *args, **kwargs: model)
+    updates = []
+    monkeypatch.setattr(SAC, "train", lambda self, gradient_steps, batch_size:
+                        updates.append((self.replay_buffer.size(), gradient_steps)))
+    (tmp_path / "run_config.json").write_text("{}")
+    training._train(args, env, torch.device("cpu"), config)
+    # TinyEnv episodes are 4 steps: nothing may be updated on 4 or 8
+    # transitions; afterwards the dynamic floor of 5 applies again.
+    assert updates == [(12, 5), (16, 5), (16, 5), (16, 5)]
+    from stable_baselines3.common.base_class import BaseAlgorithm
+    load = BaseAlgorithm.load.__func__
+    assert load(SAC, tmp_path / "final_model.zip", device="cpu").gradient_steps == 5
+    # Saved during the warm-up: must not carry the temporary zero.
+    assert load(SAC, tmp_path / "sac_loop_vae_1008_steps.zip", device="cpu").gradient_steps != 0
+    assert (tmp_path / "run_config.json").read_text() == "{}"
+    assert (tmp_path / "run_config_from_1000_steps.json").is_file()

@@ -20,7 +20,6 @@ from rl.train_vae_sac import (
     CAMERA_WIDTH,
     DonkeyVaeSACEnv,
     FrozenVaeEncoder,
-    MAX_CTE_ERROR,
     MAX_STEERING,
     MAX_STEERING_DIFF,
     MAX_THROTTLE,
@@ -42,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-episode-steps", type=int, default=3000)
     p.add_argument("--min-throttle", type=float, default=MIN_THROTTLE)
     p.add_argument("--max-throttle", type=float, default=MAX_THROTTLE)
-    p.add_argument("--deterministic", action="store_true", default=True)
+    p.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
     return p.parse_args()
 
 

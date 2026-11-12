@@ -51,8 +51,9 @@ def validate_args(args) -> None:
     for name in ("episodes", "layouts", "max_episode_steps", "batch_size", "buffer_size", "train_freq", "timesteps", "checkpoint_freq"):
         if hasattr(args, name) and getattr(args, name) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    if getattr(args, "capture_tail_steps", 0) < 0:
-        raise ValueError("--capture-tail-steps must be nonnegative")
+    for name in ("capture_tail_steps", "resume_warmup_steps"):
+        if getattr(args, name, 0) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be nonnegative")
     if not 0 <= args.min_throttle <= args.max_throttle <= 1:
         raise ValueError("Require 0 <= min_throttle <= max_throttle <= 1")
     if not 0 < args.max_steering_diff <= 1 or args.max_steering <= 0:
@@ -141,8 +142,9 @@ class EvalRecord:
         self.path = args.output_dir or Path("logs") / ("eval_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
         self.path.mkdir(parents=True, exist_ok=False)
         try:
-            head = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
-            dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], text=True))
+            repo = Path(__file__).resolve().parent
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, stderr=subprocess.DEVNULL, text=True).strip()
+            dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, stderr=subprocess.DEVNULL, text=True))
         except (OSError, subprocess.CalledProcessError):
             head, dirty = None, None
         self.metadata = {

@@ -23,34 +23,29 @@ from rl.train_vae_sac import (
     CAMERA_WIDTH,
     DonkeyVaeSACEnv,
     MAX_STEERING,
-    MAX_STEERING_DIFF,
     N_COMMAND_HISTORY,
-    RaffinRewardConfig,
     make_encoder,
+    reward_config_from_args,
 )
 
 
-def _osc_period(x) -> tuple[float, float]:
+def _osc_period(x) -> float:
     """Oscillation period via local-extrema counting (sign flips of the first
     difference). Robust to a DC offset / slow drift — i.e. if the car drives
     off-center or holds a steady turn, that bias cancels in the difference, so
-    only the actual back-and-forth wiggle is counted. Returns
-    (period_in_steps, extrema_per_step); period=inf if no oscillation.
+    only the actual back-and-forth wiggle is counted. Returns the period in
+    steps; inf if there is no oscillation.
     """
     x = np.asarray(x, dtype=np.float64)
     if len(x) < 3:
-        return float("inf"), 0.0
-    d = np.diff(x)
-    s = np.sign(d)
+        return float("inf")
+    s = np.sign(np.diff(x))
     nz = s[s != 0]                      # drop flat segments
     if len(nz) < 2:
-        return float("inf"), 0.0
+        return float("inf")
     flips = int(np.sum(nz[1:] != nz[:-1]))   # local extrema (turning points)
-    if flips == 0:
-        return float("inf"), 0.0
-    extrema_rate = flips / (len(x) - 1)
-    period = 2.0 * (len(x) - 1) / flips        # 2 extrema (one peak+one trough) per cycle
-    return period, extrema_rate
+    # 2 extrema (one peak + one trough) per cycle
+    return (2.0 * (len(x) - 1) / flips) if flips else float("inf")
 
 
 def parse_args() -> argparse.Namespace:
@@ -138,18 +133,7 @@ def _evaluate(args, record) -> None:
         max_steering=args.max_steering,
         max_steering_diff=args.max_steering_diff,
         n_command_history=args.n_command_history,
-        reward_config=RaffinRewardConfig(
-            max_cte_error=args.max_cte_error,
-            reward_crash=args.reward_crash,
-            crash_speed_weight=args.crash_speed_weight,
-            alive_reward=args.alive_reward,
-            speed_reward_weight=args.speed_reward_weight,
-            min_alive_speed=args.min_alive_speed,
-            alive_scale_floor=args.alive_scale_floor,
-            lap_completion_bonus=args.lap_completion_bonus,
-            cte_speed_penalty_weight=args.cte_speed_penalty_weight,
-            cte_target=args.cte_target,
-        ),
+        reward_config=reward_config_from_args(args),
         scene_reload_every=args.scene_reload_every,
     )
     env = TimeLimit(env, max_episode_steps=args.max_episode_steps)
@@ -202,8 +186,8 @@ def _evaluate(args, record) -> None:
             all_lap_times.extend(ep_lap_times)
             mean_steer_delta = float(np.mean(ep_steer_deltas)) if ep_steer_deltas else 0.0
             cte_std = float(np.std(ep_ctes_signed)) if ep_ctes_signed else 0.0
-            steer_period, _ = _osc_period(ep_steers)
-            cte_period, _ = _osc_period(ep_ctes_signed)
+            steer_period = _osc_period(ep_steers)
+            cte_period = _osc_period(ep_ctes_signed)
             print(
                 f"ep {ep:2d}: steps={steps:5d} rew={total_r:8.1f} "
                 f"mean_speed={mean_speed:.3f} "

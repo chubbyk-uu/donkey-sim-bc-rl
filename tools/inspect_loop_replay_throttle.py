@@ -121,7 +121,7 @@ def main() -> None:
         print(f"  [{lo:.3f}, {hi:.3f})  {hist[i]:5d}  {pct:5.1f}%  {bar}")
 
     # Throttle trajectory in chunks (e.g., 50 chunks across the episode)
-    print(f"\n--- longest episode throttle over time (50 bins) ---")
+    print("\n--- longest episode throttle over time (50 bins) ---")
     n_bins = 50
     edges_t = np.linspace(0, len(ep_th), n_bins + 1, dtype=int)
     for i in range(n_bins):

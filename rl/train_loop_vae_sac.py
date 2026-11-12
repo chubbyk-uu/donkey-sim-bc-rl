@@ -15,8 +15,8 @@ try:
         CappedDynamicGradientStepsCallback,
         DonkeyInfoCallback,
         MAX_STEERING,
-        MAX_STEERING_DIFF,
         N_COMMAND_HISTORY,
+        ReplayWarmupCallback,
         build_env,
         make_encoder,
     )
@@ -28,8 +28,8 @@ except ImportError:
         CappedDynamicGradientStepsCallback,
         DonkeyInfoCallback,
         MAX_STEERING,
-        MAX_STEERING_DIFF,
         N_COMMAND_HISTORY,
+        ReplayWarmupCallback,
         build_env,
         make_encoder,
     )
@@ -63,6 +63,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-replay-buffer", type=Path, default=None)
     parser.add_argument("--allow-legacy-replay-buffer", action="store_true",
                         help="Allow a buffer without configuration metadata; only use when its rewards and encoder are known to match.")
+    parser.add_argument("--resume-warmup-steps", type=int, default=2000,
+                        help="On --resume-model, hold SAC updates until the replay buffer holds this "
+                             "many transitions (the loaded policy keeps driving). Matters when resuming "
+                             "without a buffer, e.g. after a reward change: otherwise the first short "
+                             "episode would be replayed for --gradient-steps-min updates. No effect once "
+                             "a loaded buffer is at least this large. 0 disables.")
     parser.add_argument("--timesteps", type=int, default=100_000,
                         help="Steps to collect in this invocation; on resume these are ADDITIONAL steps.")
     parser.add_argument("--seed", type=int, default=42)
@@ -243,7 +249,11 @@ def _train(args, env, device, current_config) -> None:
     }
     print(f"Effective SAC configuration: {effective}", flush=True)
     print(f"Training {args.timesteps} additional steps from {model.num_timesteps}", flush=True)
-    write_json(args.output_dir / "run_config.json", {
+    # A resume into the same directory keeps the earlier run's record.
+    config_path = args.output_dir / "run_config.json"
+    if args.resume_model is not None and config_path.exists():
+        config_path = args.output_dir / f"run_config_from_{model.num_timesteps}_steps.json"
+    write_json(config_path, {
         "requested": vars(args), "environment": current_config, "effective_algorithm": effective,
         "start_timesteps": model.num_timesteps, "additional_timesteps": args.timesteps,
     })
@@ -264,6 +274,12 @@ def _train(args, env, device, current_config) -> None:
             floor=args.gradient_steps_min,
             scale=args.gradient_steps_scale,
         ))
+    warmup = None
+    if args.resume_model is not None and args.resume_warmup_steps > 0:
+        warmup = ReplayWarmupCallback(min(args.resume_warmup_steps, model.replay_buffer.buffer_size))
+        callbacks.append(warmup)  # after the dynamic callback: it must have the last word
+        print(f"Resume warm-up: no updates until the replay buffer holds {warmup.min_transitions} "
+              f"transitions (now {model.replay_buffer.size()})", flush=True)
 
     try:
         model.learn(
@@ -273,6 +289,8 @@ def _train(args, env, device, current_config) -> None:
             reset_num_timesteps=args.resume_model is None,
         )
     finally:
+        if warmup is not None:
+            warmup.release()
         model.save(str(args.output_dir / "final_model"))
         if args.save_final_replay_buffer:
             model.save_replay_buffer(str(args.output_dir / "final_replay_buffer"))

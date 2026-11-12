@@ -44,8 +44,12 @@ On a new machine, create the environment and install dependencies:
 ```bash
 conda create -n rlpy312 python=3.12
 conda activate rlpy312
-pip install "stable-baselines3[extra]" gymnasium numpy pillow opencv-python tqdm tensorboard
+# first install PyTorch for the local CUDA version (see below), then:
+pip install -r requirements.txt
 ```
+
+`requirements.txt` pins the versions of the working environment, including the
+upstream gym-donkeycar commit from step 2.
 
 Install PyTorch with the command matching the local CUDA version from the official
 PyTorch selector.
@@ -190,6 +194,10 @@ Single generated-road baseline:
 The original Raffin-style VAE+SAC baseline. Drives a fixed generated road (not a
 closed loop — a good run reaches the end before 3000 steps). Kept as a
 starting-point reference; not the current main target.
+
+**These two model files are not in the repository or Git LFS** (they were never
+committed and are absent from the current working copy), so this command needs
+them restored or retrained first.
 
 ```bash
 python rl/eval_vae_sac.py \
@@ -401,7 +409,10 @@ python tools/analyze_control_failures.py logs/<run_directory>
 ```
 
 This produces per-episode time plots, frame contact sheets (when captured), and
-JSON/CSV metrics. To test repeatability on the same layout, pass the same policy
+JSON/CSV metrics. `tools/verify_policy_alignment.py logs/<run_directory>` replays
+the captured tail frames of failed episodes offline and checks that the policy
+reproduces the recorded actions; `--brightness-gains 0.9 1.1` adds an offline
+RGB-gain sensitivity probe. To test repeatability on the same layout, pass the same policy
 twice with different labels via `--models`; these labels represent repeats, not
 different trained models.
 
@@ -426,12 +437,25 @@ and resume reject incompatible configurations; old checkpoints warn that metadat
 is unavailable. Pretrained encoder names identify the model family; upstream
 pretrained weights/source revisions are not yet pinned by this contract.
 
-Loop training saves requested and effective parameters in `run_config.json`.
+Loop training saves requested and effective parameters in `run_config.json`
+(a resume into the same directory writes `run_config_from_<steps>_steps.json`
+and appends to `monitor.csv` instead of replacing them).
 `--timesteps` means **additional steps** when resuming. SAC inherits algorithm
 parameters from its checkpoint; explicitly requesting a different inherited batch
 size, buffer size, architecture, etc. now fails instead of silently ignoring it.
 Use `--override-learning-rate` to change LR; the override persists in saved models.
 Dynamic gradient updates apply only to episode-based training.
+
+On resume, SAC updates are held until the replay buffer holds
+`--resume-warmup-steps` transitions (default 2000; 0 disables). The loaded policy
+drives during this warm-up. Without it, a resume with no buffer would run
+`--gradient-steps-min` updates on the first short episode alone. The default is
+a starting value and has not been tuned in the simulator.
+
+With `--save-replay-buffer`, the policy checkpoint is written on schedule and the
+buffer at the next episode end, so the control loop does not stall mid-episode.
+The buffer file keeps the checkpoint's step number and also contains the rest of
+that episode.
 
 Replay buffers saved by the loop trainer have a `.pkl.json` sidecar with their
 configuration and file hash. A reward/termination/encoder/action mismatch rejects
@@ -446,7 +470,7 @@ These contract checks apply to `train_loop_vae_sac.py`; the original generated-r
 Run simulator-free regression checks in `rlpy312`:
 
 ```bash
-python -m pytest -q tests
+python -m pytest -q
 ```
 
 ---
@@ -463,6 +487,10 @@ rl/
   eval_paired_randomized.py           compare models on the SAME random layouts (removes
                                       layout-luck confound). --models label:zip:crop lets you
                                       mix dirs/crops in one paired run; also reports weave
+  experiment.py                       argument/checkpoint/replay contracts and the
+                                      evaluation record (JSON/CSV, telemetry, tail capture)
+  eval_vae_sac.py                     legacy single generated-road evaluation
+  vae.py, vae_dataset.py              ConvVAE model and memmap dataset
 
 bc/
   train_bc.py                         BC regression CNN training
@@ -476,6 +504,13 @@ tools/
   build_vae_cache.py
   inspect_loop_replay_throttle.py     per-episode throttle/CTE analysis from replay buffer
   test_scene_reload.py                probe: reload the sim scene to confirm trees/light regenerate
+  analyze_control_failures.py         plots/contact sheets/metrics from a recorded evaluation
+  verify_policy_alignment.py          offline replay of captured frames through encoder + policy
+  probe_depth_seg.py                  depth + Cityscapes segmentation probe on sim frames
+  extract_cornering_segments.py       BC: cut cornering segments out of tubs
+  diag_official_categorical.py        BC: categorical model diagnostics
+
+tests/                                simulator-free regression tests (python -m pytest -q)
 
 docs/
   experiment-log.md                   full experiment history and design decisions
@@ -521,7 +556,7 @@ New `--encoder vae` training checkpoints are written with the historical
 | Directory | Notes |
 |---|---|
 | `vae_loop_cones_fixedlight_v1` | Fixed-light loop VAE encoder (required for VAE-based loop models) |
-| `vae_raffin_v1` | Generated-road VAE encoder (single-road baseline only) |
-| `rl_vae_sac_raffin_v1` | Generated-road SAC policy (single-road baseline) |
+| `vae_raffin_v1` | Generated-road VAE encoder (single-road baseline only). **Not in the repository/LFS.** |
+| `rl_vae_sac_raffin_v1` | Generated-road SAC policy (single-road baseline). **Not in the repository/LFS.** |
 | `bc_nvidia_slow_006_flip` | Best BC regression model; needs ~1.8× steering scale at eval |
 | `bc_official_categorical_curve_aug_balanced_v1` | Best BC categorical model; needs ~1.4× steering scale |

@@ -264,7 +264,7 @@ def init_from_checkpoint(model: nn.Module, checkpoint_path: Path, device: torch.
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=Path, nargs="+", default=[Path("/mnt/d/WSL/log")])
+    parser.add_argument("--data-dir", type=Path, nargs="+", required=True)
     parser.add_argument("--val-dir", type=Path, nargs="+")
     parser.add_argument("--output-dir", type=Path, default=Path("models/bc_nvidia"))
     parser.add_argument("--drop-head", type=int, default=0)

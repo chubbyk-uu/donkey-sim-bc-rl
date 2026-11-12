@@ -122,7 +122,7 @@ def run_episode(env, model, device, history, frame_stride, args, episode_index: 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=Path, default=Path("models/bc_nvidia_generated_road_001/best.pt"))
+    parser.add_argument("--model", type=Path, default=Path("models/bc_nvidia_slow_006_flip/best.pt"))
     parser.add_argument("--env-id", default="donkey-generated-roads-v0")
     parser.add_argument("--host", default=os.environ.get("DONKEY_SIM_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("DONKEY_SIM_PORT", "9091")))

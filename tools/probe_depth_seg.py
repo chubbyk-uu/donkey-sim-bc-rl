@@ -7,6 +7,11 @@ the depth/seg latent line is worth pursuing.
 
 Usage:
     python tools/probe_depth_seg.py FRAME [FRAME ...] --out logs/probe_depth_seg
+
+The default segmenter is SegFormer-B4, the size that transferred to the sim
+(experiment-log 6.16). Pass
+--seg-model nvidia/segformer-b0-finetuned-cityscapes-1024-1024 to reproduce the
+negative B0 result.
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ from transformers import (
 )
 
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
-SEG_MODEL = "nvidia/segformer-b0-finetuned-cityscapes-1024-1024"
+SEG_MODEL = "nvidia/segformer-b4-finetuned-cityscapes-1024-1024"
 CITYSCAPES_ROAD_ID = 0
 
 # Cityscapes train-id palette (19 classes), enough to eyeball the seg map.
@@ -53,6 +58,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("frames", nargs="+", type=Path)
     parser.add_argument("--out", type=Path, default=Path("logs/probe_depth_seg"))
+    parser.add_argument("--seg-model", default=SEG_MODEL,
+                        help="Hugging Face id of a Cityscapes SegFormer checkpoint.")
     parser.add_argument("--infer-width", type=int, default=518,
                         help="upscale frames to this width before inference")
     args = parser.parse_args()
@@ -62,8 +69,8 @@ def main() -> None:
 
     depth_proc = AutoImageProcessor.from_pretrained(DEPTH_MODEL)
     depth_model = AutoModelForDepthEstimation.from_pretrained(DEPTH_MODEL).to(device).eval()
-    seg_proc = AutoImageProcessor.from_pretrained(SEG_MODEL)
-    seg_model = SegformerForSemanticSegmentation.from_pretrained(SEG_MODEL).to(device).eval()
+    seg_proc = AutoImageProcessor.from_pretrained(args.seg_model)
+    seg_model = SegformerForSemanticSegmentation.from_pretrained(args.seg_model).to(device).eval()
 
     for frame_path in args.frames:
         img = Image.open(frame_path).convert("RGB")

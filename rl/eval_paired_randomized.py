@@ -35,6 +35,7 @@ from stable_baselines3 import SAC
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from rl.eval_loop_vae_sac import _osc_period
 from rl.experiment import EvalRecord, environment_config, validate_args, validate_model_config
 
 from rl.train_vae_sac import (
@@ -42,11 +43,10 @@ from rl.train_vae_sac import (
     CAMERA_WIDTH,
     DonkeyVaeSACEnv,
     MAX_STEERING,
-    MAX_STEERING_DIFF,
     N_COMMAND_HISTORY,
-    RaffinRewardConfig,
     make_encoder,
     reload_scene,
+    reward_config_from_args,
 )
 
 
@@ -85,8 +85,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-throttle", type=float, default=0.2)
     p.add_argument("--max-steering-diff", type=float, default=0.2,
                    help="Per-step steering-change clamp. MUST match training "
-                        "(train_loop_vae_sac.py default is 0.2, NOT the 0.15 "
-                        "historical MAX_STEERING_DIFF constant).")
+                        "(train_loop_vae_sac.py default is 0.2).")
     p.add_argument("--max-throttle", type=float, default=0.7)
     p.add_argument("--max-steering", type=float, default=MAX_STEERING,
                    help="Steering output range. MUST match training (default 1.0).")
@@ -96,25 +95,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-cte-error", type=float, default=2.0,
                    help="Termination threshold on |cte-target|. MUST match training.")
     p.add_argument("--cte-target", type=float, default=0.0)
-    p.add_argument("--cte-speed-penalty-weight", type=float, default=0.25,
-                   help="Only affects the (unreported) reward value, not trunc/cte/"
-                        "steer metrics; exposed for completeness.")
+    # Reward flags only change the recorded reward column, not trunc/cte/steer
+    # metrics. Defaults are the loop training defaults; match training to
+    # compare the recorded reward with training curves.
+    p.add_argument("--reward-crash", type=float, default=-10.0)
+    p.add_argument("--crash-speed-weight", type=float, default=5.0)
+    p.add_argument("--alive-reward", type=float, default=1.5)
+    p.add_argument("--speed-reward-weight", type=float, default=0.15)
+    p.add_argument("--min-alive-speed", type=float, default=0.0)
+    p.add_argument("--alive-scale-floor", type=float, default=0.0)
+    p.add_argument("--lap-completion-bonus", type=float, default=0.0)
+    p.add_argument("--cte-speed-penalty-weight", type=float, default=0.25)
     return p.parse_args()
-
-
-def _osc_period(x) -> float:
-    """Oscillation period (steps) via local-extrema counting on the first
-    difference. DC-immune: a steady off-center bias or held turn cancels in the
-    difference, so only the real back-and-forth wiggle is counted. inf if none."""
-    x = np.asarray(x, dtype=np.float64)
-    if len(x) < 3:
-        return float("inf")
-    s = np.sign(np.diff(x))
-    nz = s[s != 0]
-    if len(nz) < 2:
-        return float("inf")
-    flips = int(np.sum(nz[1:] != nz[:-1]))
-    return (2.0 * (len(x) - 1) / flips) if flips else float("inf")
 
 
 def run_episode(env, model, max_steps: int, record=None, context=None) -> dict:
@@ -232,11 +224,7 @@ def _evaluate(args, specs, record) -> None:
         max_steering=args.max_steering,
         max_steering_diff=args.max_steering_diff,
         n_command_history=args.n_command_history,
-        reward_config=RaffinRewardConfig(
-            max_cte_error=args.max_cte_error,
-            cte_target=args.cte_target,
-            cte_speed_penalty_weight=args.cte_speed_penalty_weight,
-        ),
+        reward_config=reward_config_from_args(args),
         scene_reload_every=0,   # reloads are driven manually here (once per layout)
         scene_reload_alpha=0.0,
     )

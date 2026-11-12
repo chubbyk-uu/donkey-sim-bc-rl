@@ -40,8 +40,11 @@ conda activate rlpy312
 ```bash
 conda create -n rlpy312 python=3.12
 conda activate rlpy312
-pip install "stable-baselines3[extra]" gymnasium numpy pillow opencv-python tqdm tensorboard
+# 先按本机 CUDA 版本安装 PyTorch（见下），再执行：
+pip install -r requirements.txt
 ```
+
+`requirements.txt` 固定了当前可用环境的版本，包括第 2 步中 upstream gym-donkeycar 的 commit。
 
 PyTorch 请根据本机 CUDA 版本，从 PyTorch 官方安装页面选择对应命令安装。
 
@@ -190,6 +193,9 @@ Mountain 场景的 spawn CTE 约为 3.54（右车道中心），黄色中线是 
 
 这是最早的 Raffin-style VAE+SAC 基线。它跑的是固定 generated road，不是闭环道路；
 成功运行通常会在 3000 step 前到达路线末端附近。
+
+**这两个模型文件不在仓库和 Git LFS 中**（从未提交过，当前工作目录里也没有），
+运行此命令前需要先找回或重新训练。
 
 ```bash
 python rl/eval_vae_sac.py \
@@ -398,6 +404,8 @@ python tools/analyze_control_failures.py logs/<run_directory>
 ```
 
 输出每次运行的时序图、画面拼图（有捕获时）和JSON/CSV统计。
+`tools/verify_policy_alignment.py logs/<run_directory>` 离线重放失败 episode 的尾部画面，
+检查策略能否复现记录的动作；加 `--brightness-gains 0.9 1.1` 可做离线 RGB 增益敏感性探针。
 若要检查同一布局内的重复性，可通过 `--models` 给同一checkpoint指定两个不同标签；
 这些标签代表重复运行，不是两个不同训练模型。
 
@@ -419,10 +427,19 @@ Loop 评估默认使用 VAE 90k 主模型。Simulator 的光照/树木设置仍�
 历史模型没有这些元数据，会提示无法完成校验。预训练编码器目前只标识模型家族，
 尚未固定其上游源码与权重版本。
 
-Loop 训练在 `run_config.json` 中保存请求配置和实际配置。续训的 `--timesteps` 是
+Loop 训练在 `run_config.json` 中保存请求配置和实际配置（续训到同一目录时写入
+`run_config_from_<steps>_steps.json`，并追加而不是覆盖 `monitor.csv`）。续训的 `--timesteps` 是
 **追加步数**。SAC 算法参数继承 checkpoint；显式传入不同的 batch、buffer、网络宽度等
 会报错，避免静默忽略。学习率通过 `--override-learning-rate` 修改，并持久保存在模型中。
 动态梯度步数仅用于按 episode 训练。
+
+续训时，replay buffer 攒够 `--resume-warmup-steps` 条样本（默认 2000，0 为关闭）之前
+不做 SAC 更新，期间由加载的策略驾驶。否则不带 buffer 续训时，第一个很短的 episode
+就会被重复采样 `--gradient-steps-min` 次。该默认值只是起点，尚未在模拟器中调过。
+
+使用 `--save-replay-buffer` 时，策略检查点按计划保存，buffer 推迟到下一个 episode
+结束时保存，避免控制环在 episode 中途停顿。buffer 文件沿用检查点的步数编号，
+并包含该 episode 剩余的样本。
 
 新保存的 replay buffer 配有 `.pkl.json` 配置和哈希记录。不允许在奖励、终止条件、
 编码器或动作配置变化后复用旧 buffer；例如上面的 Mountain 第二阶段改用空 buffer。
@@ -434,7 +451,7 @@ Loop 训练在 `run_config.json` 中保存请求配置和实际配置。续训�
 在 `rlpy312` 中运行无需模拟器的回归测试：
 
 ```bash
-python -m pytest -q tests
+python -m pytest -q
 ```
 
 ---
@@ -449,6 +466,10 @@ rl/
   eval_loop_vae_sac.py                loop + mountain 评估入口，输出 weave 指标：
                                       |dsteer|, cte_std, steer/cte oscillation period
   eval_paired_randomized.py           在同一批 random layouts 上比较模型，避免 layout luck
+  experiment.py                       参数/检查点/replay 校验，以及评估记录
+                                      （JSON/CSV、遥测、尾部画面捕获）
+  eval_vae_sac.py                     legacy single generated-road 评估
+  vae.py, vae_dataset.py              ConvVAE 模型与 memmap 数据集
 
 bc/
   train_bc.py                         BC regression CNN 训练
@@ -462,6 +483,13 @@ tools/
   build_vae_cache.py                  生成 cropped uint8 memmap cache
   inspect_loop_replay_throttle.py     从 replay buffer 分析每个 episode 的 throttle/CTE
   test_scene_reload.py                测试 scene reload 是否重新生成 tree/light
+  analyze_control_failures.py         从评估记录生成时序图、画面拼图和统计
+  verify_policy_alignment.py          离线把捕获画面重放过 encoder + policy
+  probe_depth_seg.py                  在 sim 画面上跑深度 + Cityscapes 分割探针
+  extract_cornering_segments.py       BC：从 tub 中截取弯道片段
+  diag_official_categorical.py        BC：categorical 模型诊断
+
+tests/                                无需模拟器的回归测试（python -m pytest -q）
 
 docs/
   experiment-log.md                   完整实验历史和设计记录
@@ -515,7 +543,7 @@ sac_loop_vae_*_steps.zip
 | 目录 | 说明 |
 |---|---|
 | `vae_loop_cones_fixedlight_v1` | fixed-light loop VAE encoder，所有 loop VAE 模型需要它 |
-| `vae_raffin_v1` | generated-road VAE encoder，仅用于 single-road baseline |
-| `rl_vae_sac_raffin_v1` | generated-road SAC policy，仅用于 single-road baseline |
+| `vae_raffin_v1` | generated-road VAE encoder，仅用于 single-road baseline。**不在仓库/LFS 中。** |
+| `rl_vae_sac_raffin_v1` | generated-road SAC policy，仅用于 single-road baseline。**不在仓库/LFS 中。** |
 | `bc_nvidia_slow_006_flip` | 最好的 BC regression 模型，评估需要约 1.8x steering scale |
 | `bc_official_categorical_curve_aug_balanced_v1` | 最好的 BC categorical 模型，评估需要约 1.4x steering scale |

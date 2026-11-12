@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import os
 import time
 from pathlib import Path
@@ -64,6 +64,11 @@ class RaffinRewardConfig:
                               # is right-lane center; on mountain-track right lane is at
                               # cte=3.5, so set cte_target=3.5 there so abs(cte-target)
                               # measures how far off the desired line the car is.
+
+
+def reward_config_from_args(args) -> RaffinRewardConfig:
+    """One mapping from CLI arguments to rewards, shared by training and both evals."""
+    return RaffinRewardConfig(**{f.name: getattr(args, f.name, f.default) for f in fields(RaffinRewardConfig)})
 
 
 class FrozenVaeEncoder:
@@ -228,6 +233,7 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         self.n_command_history = n_command_history
         self.reward_config = reward_config or RaffinRewardConfig()
         self.command_history = np.zeros((self.n_command_history, 2), dtype=np.float32)
+        self.last_steer = 0.0
         self._prev_lap_count = 0
         # Scene-reload (domain randomization). Two mutually exclusive modes:
         #   adaptive step-based (scene_reload_alpha > 0): reload after the car has
@@ -265,6 +271,7 @@ class DonkeyVaeSACEnv(gym.Wrapper):
 
     def reset(self, **kwargs):
         self.command_history.fill(0.0)
+        self.last_steer = 0.0
         self.last_throttle = self.min_throttle
         self._prev_lap_count = 0
         self._reset_count += 1
@@ -306,7 +313,7 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         self._episode_steps += 1
         self._steps_on_scene += 1
         raw_action = np.asarray(action, dtype=np.float32).reshape(-1)
-        prev_steer = float(self.command_history[-1, 0]) if self.n_command_history > 0 else 0.0
+        prev_steer = self.last_steer
         executed = self._map_and_clip_action(raw_action)
         obs, original_reward, terminated, truncated, info = self.env.step(executed)
         if "cte" not in info or not np.isfinite(float(info["cte"])):
@@ -342,12 +349,12 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         t = float(np.clip((action[1] + 1.0) / 2.0, 0.0, 1.0))
         throttle = (1.0 - t) * self.min_throttle + self.max_throttle * t
 
-        if self.n_command_history > 0:
-            prev_steer = float(self.command_history[-1, 0])
-            max_diff = (self.max_steering_diff - 1e-5) * (2.0 * self.max_steering)
-            diff = float(np.clip(steer - prev_steer, -max_diff, max_diff))
-            steer = prev_steer + diff
+        # Rate limit against the last executed command; it must not depend on
+        # how much command history the observation carries.
+        max_diff = (self.max_steering_diff - 1e-5) * (2.0 * self.max_steering)
+        steer = self.last_steer + float(np.clip(steer - self.last_steer, -max_diff, max_diff))
 
+        self.last_steer = float(np.float32(steer))  # as stored in the command history
         self.last_throttle = float(throttle)
         return np.array([steer, throttle], dtype=np.float32)
 
@@ -391,15 +398,72 @@ class DonkeyVaeSACEnv(gym.Wrapper):
 
 
 class ConfigCheckpointCallback(CheckpointCallback):
-    """Keep replay configuration alongside each SB3 replay-buffer file."""
+    """Checkpoint the policy on schedule; write the replay buffer (plus its
+    configuration sidecar) at the next episode end.
+
+    Pickling and hashing the buffer takes long enough that doing it mid-episode
+    leaves the car driving on a stale command. At an episode end the car has
+    just been reset, and no update has run since the policy checkpoint, so the
+    saved pair is consistent; the buffer holds the rest of that episode too.
+    """
+
+    def __init__(self, *args, save_replay_buffer: bool = False, **kwargs) -> None:
+        super().__init__(*args, save_replay_buffer=False, **kwargs)
+        self.deferred_replay_buffer = save_replay_buffer
+        self._pending_replay_path: Path | None = None
+
+    def _save_pending_replay(self) -> None:
+        path, self._pending_replay_path = self._pending_replay_path, None
+        if path is not None:
+            self.model.save_replay_buffer(str(path))
+            save_replay_metadata(path, self.model)
 
     def _on_step(self) -> bool:
         result = super()._on_step()
-        if self.n_calls % self.save_freq == 0 and self.save_replay_buffer:
-            path = Path(self._checkpoint_path("replay_buffer_", extension="pkl"))
-            if path.exists():
-                save_replay_metadata(path, self.model)
+        if self.deferred_replay_buffer and self.n_calls % self.save_freq == 0:
+            self._pending_replay_path = Path(self._checkpoint_path("replay_buffer_", extension="pkl"))
+        if self._pending_replay_path is not None and np.any(self.locals.get("dones", [True])):
+            self._save_pending_replay()
         return result
+
+    def _on_training_end(self) -> None:
+        self._save_pending_replay()
+
+
+class ReplayWarmupCallback(BaseCallback):
+    """Hold SAC updates until the replay buffer holds `min_transitions`.
+
+    For resuming without a replay buffer: the loaded policy drives (it is never
+    replaced by random actions, unlike `learning_starts`) and nothing is
+    updated until there is enough fresh data to sample from. Must come after
+    CappedDynamicGradientStepsCallback in the callback list.
+
+    SB3 skips the update when gradient_steps is 0. The zero is held only
+    between a rollout's end and the next rollout's start, so checkpoints
+    written during a rollout never contain it.
+    """
+
+    def __init__(self, min_transitions: int) -> None:
+        super().__init__()
+        self.min_transitions = int(min_transitions)
+        self._held: int | None = None
+
+    def release(self) -> None:
+        if self._held is not None:
+            self.model.gradient_steps, self._held = self._held, None
+
+    def _on_rollout_start(self) -> None:
+        self.release()
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if self.model.replay_buffer.size() < self.min_transitions:
+            self._held, self.model.gradient_steps = self.model.gradient_steps, 0
+
+    def _on_training_end(self) -> None:
+        self.release()
 
 
 class CappedDynamicGradientStepsCallback(BaseCallback):
@@ -502,25 +566,16 @@ def build_env(args: argparse.Namespace, vae: FrozenVaeEncoder) -> gym.Env:
         max_steering=args.max_steering,
         max_steering_diff=args.max_steering_diff,
         n_command_history=args.n_command_history,
-        reward_config=RaffinRewardConfig(
-            max_cte_error=args.max_cte_error,
-            reward_crash=args.reward_crash,
-            crash_speed_weight=args.crash_speed_weight,
-            alive_reward=args.alive_reward,
-            speed_reward_weight=args.speed_reward_weight,
-            min_alive_speed=args.min_alive_speed,
-            alive_scale_floor=getattr(args, "alive_scale_floor", 0.0),
-            lap_completion_bonus=getattr(args, "lap_completion_bonus", 0.0),
-            cte_speed_penalty_weight=getattr(args, "cte_speed_penalty_weight", 0.0),
-            cte_target=getattr(args, "cte_target", 0.0),
-        ),
+        reward_config=reward_config_from_args(args),
         scene_reload_every=getattr(args, "scene_reload_every", 0),
         scene_reload_alpha=getattr(args, "scene_reload_alpha", 0.0),
         scene_reload_kmin=getattr(args, "scene_reload_kmin", 200),
         scene_reload_kmax=max(1, args.max_episode_steps - 1),
     )
     env = TimeLimit(env, max_episode_steps=args.max_episode_steps)
-    return Monitor(env, filename=str(args.output_dir / "monitor.csv"))
+    # Resuming into the same directory appends to its episode log.
+    return Monitor(env, filename=str(args.output_dir / "monitor.csv"),
+                   override_existing=getattr(args, "resume_model", None) is None)
 
 
 def parse_args() -> argparse.Namespace:
