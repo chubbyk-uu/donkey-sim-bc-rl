@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import importlib.metadata
+import itertools
 import json
 import math
 import platform
@@ -14,6 +15,8 @@ import warnings
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
+
+import numpy as np
 
 
 def json_value(value):
@@ -42,6 +45,95 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def wilson_interval(successes: int, n: int, z: float = 1.959964) -> tuple[float, float]:
+    """95% Wilson score interval for a rate estimated from n independent trials."""
+    if n == 0:
+        return 0.0, 1.0
+    rate = successes / n
+    half = z * math.sqrt(rate * (1 - rate) / n + z * z / (4 * n * n))
+    centre, scale = rate + z * z / (2 * n), 1 + z * z / n
+    return max(0.0, (centre - half) / scale), min(1.0, (centre + half) / scale)
+
+
+def bootstrap_mean_interval(values, resamples: int = 10000) -> tuple[float, float]:
+    """95% percentile bootstrap interval for a mean; fixed seed so reruns agree."""
+    values = np.asarray(values, dtype=float)
+    draws = np.random.default_rng(0).integers(len(values), size=(resamples, len(values)))
+    low, high = np.percentile(values[draws].mean(axis=1), [2.5, 97.5])
+    return float(low), float(high)
+
+
+def paired_statistics(episodes: list[dict]) -> dict:
+    """How far a paired evaluation can be trusted.
+
+    The primary metric is laps per episode (step cap fixed, leaving the track
+    ends the episode), which rewards both speed and staying on the road. Per
+    model: mean laps, completion rate and mean episode length with 95% intervals
+    over layouts. Per pair of models: the mean per-layout difference in laps and
+    in episode length, and an exact sign test on the layouts where exactly one
+    of them completed.
+    """
+    runs: dict[str, dict] = {}
+    for episode in episodes:
+        runs.setdefault(episode["model"], {})[episode["layout"]] = episode
+    models = {}
+    for label, by_layout in runs.items():
+        steps = [e["steps"] for e in by_layout.values()]
+        laps = [e["laps"] for e in by_layout.values()]
+        done = sum(bool(e["trunc"]) for e in by_layout.values())
+        models[label] = {
+            "layouts": len(steps),
+            "mean_laps": float(np.mean(laps)), "mean_laps_ci95": bootstrap_mean_interval(laps),
+            "completions": done,
+            "completion_rate": done / len(steps),
+            "completion_rate_ci95": wilson_interval(done, len(steps)),
+            "mean_steps": float(np.mean(steps)), "mean_steps_ci95": bootstrap_mean_interval(steps),
+        }
+    pairs = []
+    for a, b in itertools.combinations(runs, 2):
+        shared = sorted(runs[a].keys() & runs[b].keys())
+        if not shared:
+            continue
+        only_a = sum(bool(runs[a][k]["trunc"]) and not runs[b][k]["trunc"] for k in shared)
+        only_b = sum(bool(runs[b][k]["trunc"]) and not runs[a][k]["trunc"] for k in shared)
+        differing = only_a + only_b
+        tail = sum(math.comb(differing, i) for i in range(min(only_a, only_b) + 1))
+        difference = [runs[a][k]["steps"] - runs[b][k]["steps"] for k in shared]
+        laps = [runs[a][k]["laps"] - runs[b][k]["laps"] for k in shared]
+        pairs.append({
+            "a": a, "b": b, "layouts": len(shared),
+            "mean_laps_difference": float(np.mean(laps)),
+            "mean_laps_difference_ci95": bootstrap_mean_interval(laps),
+            "only_a_completed": only_a, "only_b_completed": only_b,
+            "sign_test_p": min(1.0, 2 * tail / 2 ** differing),
+            "mean_steps_difference": float(np.mean(difference)),
+            "mean_steps_difference_ci95": bootstrap_mean_interval(difference),
+        })
+    return {"models": models, "pairs": pairs}
+
+
+def format_paired_statistics(statistics: dict) -> str:
+    lines = [f"{'model':>12} | {'laps (95% CI)':>19} | {'completed':>9} | {'rate (95% CI)':>19} | mean steps (95% CI)"]
+    for label, row in statistics["models"].items():
+        low, high = row["completion_rate_ci95"]
+        steps_low, steps_high = row["mean_steps_ci95"]
+        laps_low, laps_high = row["mean_laps_ci95"]
+        lines.append(f"{label:>12} | {row['mean_laps']:>5.2f} ({laps_low:>4.2f} - {laps_high:>4.2f}) | "
+                     f"{row['completions']:>4}/{row['layouts']:<4} | "
+                     f"{row['completion_rate']:>4.0%} ({low:>4.0%} - {high:>4.0%}) | "
+                     f"{row['mean_steps']:.0f} ({steps_low:.0f} - {steps_high:.0f})")
+    for pair in statistics["pairs"]:
+        low, high = pair["mean_steps_difference_ci95"]
+        laps_low, laps_high = pair["mean_laps_difference_ci95"]
+        lines.append(f"{pair['a']} vs {pair['b']} on {pair['layouts']} shared layouts: "
+                     f"laps difference {pair['mean_laps_difference']:+.2f} ({laps_low:+.2f} to {laps_high:+.2f}); "
+                     f"only {pair['a']} completed {pair['only_a_completed']}, "
+                     f"only {pair['b']} completed {pair['only_b_completed']}, "
+                     f"sign test p={pair['sign_test_p']:.3f}; "
+                     f"steps difference {pair['mean_steps_difference']:+.0f} ({low:+.0f} to {high:+.0f})")
+    return "\n".join(lines)
 
 
 def validate_args(args) -> None:
@@ -255,8 +347,8 @@ class EvalRecord:
         return {"directory": folder.name, "animation": f"{folder.name}/tail.gif",
                 "first_step": index[0]["step"], "last_step": index[-1]["step"], "frames": len(index)}
 
-    def finish(self, summary):
-        write_json(self.path / "results.json", {"summary": summary, "episodes": self.results})
+    def finish(self, summary, **extra):
+        write_json(self.path / "results.json", {"summary": summary, **extra, "episodes": self.results})
 
     def __exit__(self, exc_type, exc, tb):
         if self.telemetry is not None:

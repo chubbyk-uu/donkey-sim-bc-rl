@@ -421,6 +421,17 @@ and mark metadata as failed. Layout numbers identify scene loads within a run;
 they are not reproducible simulator seeds. Paired evaluation reloads even the
 first layout, aborts on reload timeout, and shuffles model order with `--order-seed`.
 
+The paired summary ends with the uncertainty over layouts. The primary metric is
+laps per episode (fixed step cap, leaving the track ends the episode), reported
+with a bootstrap 95% interval, followed by a Wilson interval on each completion
+rate, a bootstrap interval on mean episode length, and for each pair of models the
+per-layout laps difference and an exact sign test on the layouts where only one
+completed. The same
+numbers are stored under `statistics` in `results.json`;
+`python tools/summarize_paired_eval.py logs/<run_directory>` recomputes them for
+older or aborted runs. With 12 layouts, 8/12 completions spans roughly 39%-86%, so
+use 30+ layouts before comparing models.
+
 ```bash
 python rl/eval_loop_vae_sac.py --episodes 5 --max-episode-steps 3000 \
   --output-dir logs/loop_fixedlight_check --save-telemetry
@@ -506,6 +517,9 @@ tools/
   test_scene_reload.py                probe: reload the sim scene to confirm trees/light regenerate
   analyze_control_failures.py         plots/contact sheets/metrics from a recorded evaluation
   verify_policy_alignment.py          offline replay of captured frames through encoder + policy
+  summarize_paired_eval.py            confidence intervals / paired tests for a paired-eval run
+  probe_state_from_features.py        can cte / lateral drift be regressed from encoder features
+                                      (CLS vs patch tokens) on unseen layouts; uses captured frames
   probe_depth_seg.py                  depth + Cityscapes segmentation probe on sim frames
   extract_cornering_segments.py       BC: cut cornering segments out of tubs
   diag_official_categorical.py        BC: categorical model diagnostics

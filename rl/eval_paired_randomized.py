@@ -36,7 +36,10 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from rl.eval_loop_vae_sac import _osc_period
-from rl.experiment import EvalRecord, environment_config, validate_args, validate_model_config
+from rl.experiment import (
+    EvalRecord, environment_config, format_paired_statistics, paired_statistics,
+    validate_args, validate_model_config,
+)
 
 from rl.train_vae_sac import (
     CAMERA_HEIGHT,
@@ -303,6 +306,10 @@ def _evaluate(args, specs, record) -> None:
             cells = " ".join(f"{'T' if row[lb] else '.':>12}" for lb in labels)
             print(f"{i:>6} | {cells}")
 
+        statistics = paired_statistics(record.results)
+        print("\n--- uncertainty over layouts ---")
+        print(format_paired_statistics(statistics))
+
         record.finish({label: {
             "layouts": len(rs), "time_limit_completions": sum(r["trunc"] for r in rs),
             "mean_steps": float(np.mean([r["steps"] for r in rs])),
@@ -311,7 +318,7 @@ def _evaluate(args, specs, record) -> None:
             "mean_speed": float(np.mean([r["mean_speed"] for r in rs])),
             "total_laps": sum(r["laps"] for r in rs),
             "mean_lap": float(np.mean([t for r in rs for t in r["lap_times"]])) if any(r["lap_times"] for r in rs) else None,
-        } for label, rs in results.items()})
+        } for label, rs in results.items()}, statistics=statistics)
     finally:
         env.close()
 

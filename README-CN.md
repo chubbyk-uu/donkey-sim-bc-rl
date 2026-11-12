@@ -413,6 +413,14 @@ python tools/analyze_control_failures.py logs/<run_directory>
 Paired 评估从首个布局开始 reload，reload 超时直接失败，不复用旧布局计数；
 `--order-seed` 控制模型测试顺序。布局编号仅标识本轮加载，不能用于重建随机场景。
 
+Paired 汇总的最后一段给出布局间的不确定性。主指标是每个 episode 的圈数
+（步数上限固定，出界即停），带 bootstrap 95% 区间；其后是每个模型完成率的 95% Wilson 区间、
+平均 episode 步数的 bootstrap 区间，以及每对模型的逐布局圈数差和
+“只有一方完成”的布局上的精确符号检验。
+同样的数字保存在 `results.json` 的 `statistics` 里；
+`python tools/summarize_paired_eval.py logs/<run_directory>` 可对旧的或中途失败的运行重新计算。
+12 个布局时 8/12 的区间约为 39%–86%，比较模型前请用 30 个以上布局。
+
 ```bash
 python rl/eval_loop_vae_sac.py --episodes 5 --max-episode-steps 3000 \
   --output-dir logs/loop_fixedlight_check --save-telemetry
@@ -485,6 +493,9 @@ tools/
   test_scene_reload.py                测试 scene reload 是否重新生成 tree/light
   analyze_control_failures.py         从评估记录生成时序图、画面拼图和统计
   verify_policy_alignment.py          离线把捕获画面重放过 encoder + policy
+  summarize_paired_eval.py            paired 评估结果的置信区间 / 配对检验
+  probe_state_from_features.py        在未见过的布局上，从编码器特征（CLS / patch token）
+                                      线性回归 CTE 和横向漂移；使用评估捕获的画面
   probe_depth_seg.py                  在 sim 画面上跑深度 + Cityscapes 分割探针
   extract_cornering_segments.py       BC：从 tub 中截取弯道片段
   diag_official_categorical.py        BC：categorical 模型诊断

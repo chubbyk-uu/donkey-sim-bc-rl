@@ -350,3 +350,32 @@ def test_resume_without_buffer_waits_for_data_and_keeps_configuration(tmp_path, 
     assert load(SAC, tmp_path / "sac_loop_vae_1008_steps.zip", device="cpu").gradient_steps != 0
     assert (tmp_path / "run_config.json").read_text() == "{}"
     assert (tmp_path / "run_config_from_1000_steps.json").is_file()
+
+
+def test_paired_statistics_report_intervals_and_exact_paired_test():
+    from rl.experiment import paired_statistics, wilson_interval
+
+    low, high = wilson_interval(8, 12)
+    assert (round(low, 3), round(high, 3)) == (0.391, 0.862)
+    assert wilson_interval(0, 10)[0] == 0.0 and wilson_interval(10, 10)[1] == pytest.approx(1.0)
+
+    # a completes all 8 layouts; b fails 6 of them and never wins one.
+    episodes = [{"model": "a", "layout": i, "trunc": True, "steps": 2000, "laps": 7} for i in range(8)]
+    episodes += [{"model": "b", "layout": i, "trunc": i < 2, "steps": 2000 if i < 2 else 500,
+                  "laps": 7 if i < 2 else 1} for i in range(8)]
+    episodes.append({"model": "a", "layout": 99, "trunc": False, "steps": 100, "laps": 0})  # b never ran it
+    stats = paired_statistics(episodes)
+    assert stats["models"]["a"]["completions"] == 8 and stats["models"]["a"]["layouts"] == 9
+    assert stats["models"]["b"]["completion_rate"] == 0.25
+    pair, = stats["pairs"]
+    assert (pair["layouts"], pair["only_a_completed"], pair["only_b_completed"]) == (8, 6, 0)
+    assert pair["sign_test_p"] == 2 / 2 ** 6
+    assert pair["mean_steps_difference"] == 1125.0
+    assert pair["mean_laps_difference"] == 4.5 and pair["mean_laps_difference_ci95"][0] > 0
+    assert stats["models"]["b"]["mean_laps"] == 2.5
+    assert stats["models"]["b"]["mean_laps_ci95"][0] < 2.5 < stats["models"]["b"]["mean_laps_ci95"][1]
+    low, high = pair["mean_steps_difference_ci95"]
+    assert 0 < low < 1125 < high <= 1500
+
+    same = paired_statistics([dict(e, model=m) for e in episodes[:8] for m in ("x", "y")])
+    assert same["pairs"][0]["sign_test_p"] == 1.0
