@@ -185,6 +185,10 @@ def validate_args(args) -> None:
         raise ValueError("Require max_cte_error > 0 and n_command_history >= 0")
     if not 0 <= getattr(args, "encoder_crop_top", 0) < 120:
         raise ValueError("encoder_crop_top must be in [0, 120)")
+    if any(lag <= 0 for lag in getattr(args, "latent_lags", ())):
+        raise ValueError("--latent-lags must be positive step counts")
+    if getattr(args, "encoder", "vae").endswith("_grid") and getattr(args, "encoder_projection", None) is None:
+        raise ValueError("--encoder-projection is required for a grid encoder")
     if getattr(args, "resume_replay_buffer", None) and not getattr(args, "resume_model", None):
         raise ValueError("--resume-replay-buffer requires --resume-model")
     if getattr(args, "gradient_steps_cap", 0) > 0:
@@ -194,16 +198,27 @@ def validate_args(args) -> None:
             raise ValueError("Use --gradient-steps-cap 0 for fixed --gradient-steps; dynamic updates would override it")
 
 
+def parse_lags(text: str) -> tuple[int, ...]:
+    """'2,4' -> (2, 4); '' -> ()."""
+    return tuple(int(item) for item in text.split(",") if item.strip())
+
+
 def environment_config(args) -> dict:
     encoder = getattr(args, "encoder", "vae")
+    observation = {
+        "encoder": encoder,
+        "vae_sha256": sha256(args.vae_model) if encoder == "vae" else None,
+        "crop_top": 40 if encoder == "vae" else args.encoder_crop_top,
+        "n_command_history": getattr(args, "n_command_history", 20),
+    }
+    # Added only when used, so configurations saved before these existed still compare equal.
+    if encoder.endswith("_grid"):
+        observation["projection_sha256"] = sha256(args.encoder_projection)
+    if getattr(args, "latent_lags", ()):
+        observation["latent_lags"] = list(args.latent_lags)
     return {
         "env_id": args.env_id,
-        "observation": {
-            "encoder": encoder,
-            "vae_sha256": sha256(args.vae_model) if encoder == "vae" else None,
-            "crop_top": 40 if encoder == "vae" else args.encoder_crop_top,
-            "n_command_history": getattr(args, "n_command_history", 20),
-        },
+        "observation": observation,
         "action": {key: getattr(args, key) for key in ("min_throttle", "max_throttle", "max_steering", "max_steering_diff")},
         "termination": {"max_cte_error": args.max_cte_error, "cte_target": getattr(args, "cte_target", 0.0)},
         "reward": {key: getattr(args, key, default) for key, default in {

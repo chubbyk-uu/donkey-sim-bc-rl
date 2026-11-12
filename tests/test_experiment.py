@@ -24,7 +24,7 @@ def arguments(tmp_path):
         env_id="test", host="127.0.0.1", port=9091, encoder="vae", vae_model=vae, encoder_crop_top=0,
         n_command_history=20, min_throttle=.2, max_throttle=.7,
         max_steering=1., max_steering_diff=.2, max_cte_error=2., cte_target=0.,
-        cte_speed_penalty_weight=.25,
+        cte_speed_penalty_weight=.25, encoder_projection=None, latent_lags=(),
         output_dir=tmp_path / "eval", save_telemetry=True, episodes=1,
     )
 
@@ -379,3 +379,72 @@ def test_paired_statistics_report_intervals_and_exact_paired_test():
 
     same = paired_statistics([dict(e, model=m) for e in episodes[:8] for m in ("x", "y")])
     assert same["pairs"][0]["sign_test_p"] == 1.0
+
+
+def test_observation_carries_earlier_latents_in_order_and_refills_on_reset():
+    frames = iter(range(1, 100))
+    encoder = SimpleNamespace(z_size=1, encode=lambda obs: np.array([next(frames)], np.float32))
+    env = DonkeyVaeSACEnv(TinyEnv(), vae=encoder, n_command_history=1, latent_lags=(1, 3))
+    assert env.observation_space.shape == (5,)  # latent now, 1 step ago, 3 steps ago, one command
+    obs, _ = env.reset()
+    assert obs[:3].tolist() == [1, 1, 1]  # no earlier frame yet: the first one stands in
+    seen = [env.step(np.array([0., 0.]))[0][:3].tolist() for _ in range(4)]
+    assert seen == [[2, 1, 1], [3, 2, 1], [4, 3, 1], [5, 4, 2]]
+    obs, _ = env.reset()
+    assert obs[:3].tolist() == [6, 6, 6]  # nothing leaks across episodes
+
+    plain = DonkeyVaeSACEnv(TinyEnv(), vae=encoder, n_command_history=1)
+    assert plain.reset()[0].shape == (3,)
+
+
+def test_new_observation_options_are_part_of_the_checkpoint_contract(tmp_path):
+    args = arguments(tmp_path)
+    plain = environment_config(args)
+    assert "latent_lags" not in plain["observation"] and "projection_sha256" not in plain["observation"]
+
+    args.latent_lags = (2, 4)
+    lagged = environment_config(args)
+    with pytest.raises(ValueError, match="observation mismatch"):
+        validate_model_config(SimpleNamespace(donkey_config=plain), lagged)
+
+    args.encoder, args.encoder_projection = "dinov2_vits14_grid", tmp_path / "projection.pt"
+    with pytest.raises(ValueError, match="encoder-projection"):
+        validate_args(argparse.Namespace(**dict(vars(args), encoder_projection=None)))
+    args.encoder_projection.write_bytes(b"one projection")
+    saved = environment_config(args)
+    args.encoder_projection.write_bytes(b"another projection, same shape")
+    with pytest.raises(ValueError, match="observation mismatch"):
+        validate_model_config(SimpleNamespace(donkey_config=saved), environment_config(args))
+
+
+def test_paired_evaluation_gives_each_model_its_own_observation(tmp_path, monkeypatch):
+    from rl import eval_paired_randomized as paired
+    args = arguments(tmp_path)
+    args.max_episode_steps, args.order_seed, args.layouts, args.encoder = 4, 42, 1, "dinov2_vits14"
+    env = TinyEnv()
+    env.viewer = SimpleNamespace(handler=SimpleNamespace(SceneToLoad="test"))
+    made = []
+
+    def make_encoder(name, **kwargs):
+        made.append((name, kwargs["crop_top"]))
+        return SimpleNamespace(z_size=3, model=torch.nn.Linear(3, 3), encode=lambda obs: np.zeros(3, np.float32))
+
+    lagged_args = argparse.Namespace(**dict(vars(args), latent_lags=(2, 4)))
+    models = {"old.zip": SimpleNamespace(), "new.zip": SimpleNamespace(donkey_config=environment_config(lagged_args))}
+    shapes = {}
+
+    def episode(env, model, max_steps, record, context):
+        shapes[context["model"]] = env.reset()[0].shape
+        return {"trunc": True, "steps": 4, "mean_cte": 0., "max_cte": 0., "mean_speed": 1., "laps": 1,
+                "best_lap": 1., "lap_times": [1.], "steer_delta": 0., "cte_std": 0., "steer_period": 1., "cte_period": 1.}
+
+    monkeypatch.setattr(paired, "make_encoder", make_encoder)
+    monkeypatch.setattr(paired.gym, "make", lambda *a, **k: env)
+    monkeypatch.setattr(paired.SAC, "load", lambda path, **k: models[path])
+    monkeypatch.setattr(paired, "reload_scene", lambda *a: True)
+    monkeypatch.setattr(paired, "run_episode", episode)
+    with pytest.warns(UserWarning, match="Legacy checkpoint"):
+        with EvalRecord(args, {"policy": args.vae_model}) as record:
+            paired._evaluate(args, [("old", "old.zip", 0), ("new", "new.zip", 0)], record)
+    assert shapes == {"old": (3 + 40,), "new": (9 + 40,)}
+    assert made == [("dinov2_vits14", 0)]  # same encoder and crop: built once, shared

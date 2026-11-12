@@ -20,7 +20,7 @@ try:
         build_env,
         make_encoder,
     )
-    from rl.experiment import (algorithm_config, environment_config, save_replay_metadata, simulator_saved_settings,
+    from rl.experiment import (algorithm_config, environment_config, parse_lags, save_replay_metadata, simulator_saved_settings,
                                validate_args, validate_model_config, validate_replay, write_json)
 except ImportError:
     from train_vae_sac import (
@@ -33,7 +33,7 @@ except ImportError:
         build_env,
         make_encoder,
     )
-    from experiment import (algorithm_config, environment_config, save_replay_metadata, simulator_saved_settings,
+    from experiment import (algorithm_config, environment_config, parse_lags, save_replay_metadata, simulator_saved_settings,
                             validate_args, validate_model_config, validate_replay, write_json)
 
 
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=os.environ.get("DONKEY_SIM_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("DONKEY_SIM_PORT", "9091")))
     parser.add_argument("--encoder",
-                        choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14"],
+                        choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14", "dinov2_vits14_grid"],
                         default="vae",
                         help="Image encoder. 'vae' uses --vae-model checkpoint; "
                              "'resnet18' / 'mobilenet_v3_small' use frozen ImageNet-pretrained weights; "
@@ -56,6 +56,11 @@ def parse_args() -> argparse.Namespace:
                              "reduces aspect-ratio distortion when resizing to 224x224. Set to 40 "
                              "to reproduce the older v4 ResNet behavior or to drop the top third "
                              "(sky/tree-canopy) for any pretrained encoder.")
+    parser.add_argument("--encoder-projection", type=Path, default=None,
+                         help="Projection file from tools/fit_grid_projection.py; required for dinov2_vits14_grid.")
+    parser.add_argument("--latent-lags", type=parse_lags, default=(),
+                         help="Also give the policy the latent from this many steps ago, e.g. '2,4'. "
+                              "MUST match training.")
     parser.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_fixedlight_v1/best.pt"),
                         help="Only used when --encoder=vae.")
     parser.add_argument("--output-dir", type=Path, default=Path("models/rl_loop_vae_sac_v1"))
@@ -162,8 +167,8 @@ def main() -> None:
         device = torch.device(args.device)
 
     vae = make_encoder(args.encoder, device=device, vae_checkpoint=args.vae_model,
-                       crop_top=args.encoder_crop_top)
-    print(f"Encoder: {args.encoder}  z_size={vae.z_size}  crop_top={args.encoder_crop_top}")
+                       crop_top=args.encoder_crop_top, projection=args.encoder_projection)
+    print(f"Encoder: {args.encoder}  z_size={vae.z_size}  crop_top={args.encoder_crop_top}  latent_lags={args.latent_lags}")
     env = build_env(args, vae)
     env.action_space.seed(args.seed)
 

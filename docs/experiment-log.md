@@ -1765,11 +1765,18 @@ standard simulator setting, and compare laps paired against v2 50k (baseline at
 that setting: 6.08 laps, 31/40). Second lever: DINOv2 patch tokens pooled to a
 grid instead of the class token.
 
+Status 2026-11-12: the code for the second lever plus earlier frames exists
+(`--encoder dinov2_vits14_grid --encoder-projection ... --latent-lags 2,4`,
+projection from `tools/fit_grid_projection.py`). One run of it
+(`models/rl_loop_dinov2_grid_lags_v1`) and one class-token control with the same
+recipe and simulator setting (`models/rl_loop_dinov2_cls_ctrl_ts2_v1`) are
+trained to 60k steps. **Neither has been evaluated**; there is no result yet.
+
 ### Reproducible layouts and more throughput
 
 `set_random_seed` is not handled on the client port; the private API port is
-untried. Time scale 3 with FPS limit 180 and several simulator instances are
-untested (§12).
+untried. Several simulator instances are untested; time scale 3 degrades v2 50k
+(§12).
 
 ### Other open items
 
@@ -1889,22 +1896,24 @@ paired tests (`paired_statistics` in `rl/experiment.py`;
 `tools/summarize_paired_eval.py` recomputes them for old or aborted runs). Do not
 relax throttle range, CTE limit or step cap to raise the number.
 
-### Baseline at three simulator settings
+### Baseline at four simulator settings
 
 | Simulator setting | Layouts | Laps (95% CI) | Completed (95% CI) | Steps/s incl. reloads | Step interval median (p5-p95) |
 |---|---:|---:|---:|---:|---:|
 | Time scale 1, FPS limit 60 | 40 | 5.53 (4.72-6.22) | 27/40 = 68% (52-80%) | 18.8 | 50.0 ms (48.0-51.9) |
 | Time scale 2, FPS limit 60 | 24 | 5.04 (4.04-5.96) | 13/24 = 54% (35-72%) | 35.0 | 20.1 ms (15.3-34.7) |
 | Time scale 2, FPS limit 120 | 40 | 6.08 (5.42-6.62) | 31/40 = 78% (62-88%) | 35.7 | 25.1 ms (23.8-26.3) |
+| Time scale 3, FPS limit 180 | 40 | 4.42 (3.50-5.33) | 22/40 = 55% (40-69%) | 48.2 | 16.7 ms (14.7-18.5) |
 
 Artifacts: `logs/randomtree_baseline_40layouts_v2_50k/`,
 `logs/randomtree_timescale2_24layouts_v2_50k/`,
-`logs/randomtree_timescale2_fps120_40layouts_v2_50k/`. The three runs use
+`logs/randomtree_timescale2_fps120_40layouts_v2_50k/`,
+`logs/randomtree_timescale3_fps180_40layouts_v2_50k/`. The four runs use
 different random layouts (unpaired).
 
 - The earlier 8/12 (§11) has a Wilson interval of 39-86%; twelve layouts cannot
   rank models.
-- The same checkpoint scores 68%, 54% and 78% in three runs. Single-run absolute
+- The same checkpoint scores 68%, 54% and 78% in the first three runs. Single-run absolute
   rates on 24-40 layouts are not comparable across runs; compare models paired on
   the same layouts.
 - Time scale 2 with FPS limit 120 versus time scale 1: laps difference +0.55
@@ -1915,6 +1924,14 @@ different random layouts (unpaired).
 - Time scale 2 with FPS limit 60 versus time scale 1: laps -0.48 (CI -1.68 to
   +0.72), maximum |CTE| in completed episodes +0.14 (CI +0.00 to +0.27). Not
   significant, but every safety metric moves the wrong way.
+- Time scale 3 with FPS limit 180 is **worse**, although its step intervals are
+  steady: laps -1.65 against time scale 2 / FPS 120 (CI -2.73 to -0.58, p=0.009)
+  and -1.38 against the first and third rows pooled (CI -2.40 to -0.34,
+  p=0.012); lap time +0.18 s against time scale 1 (CI +0.07 to +0.27); 7 of the
+  18 failures happen within the first 300 steps. The client's roughly 5 ms of
+  encoder and policy time is about 15 ms of simulated time at this scale (5 ms
+  at time scale 1), which is the likely cause; that this checkpoint loses more
+  than a lap to it is consistent with the thin control margin described below.
 
 ### Can the car's position be read from the frozen features?
 
@@ -1996,13 +2013,14 @@ pooled patch tokens are a second, independent lever.
 - Evaluation `metadata.json` and training run configs now record
   `simulator_saved_settings` (time scale, FPS limit, random light/trees/cones),
   read from the Windows registry where the simulator saves its menu options.
-  They are the saved values, not the live process state. The three runs above
-  predate this field.
+  They are the saved values, not the live process state. The first three runs
+  above predate this field.
 - Not reproducible layouts yet: the installed build (v25.10.06) knows a
   `set_random_seed` message, but on the client port 9091 it logs "No delegates
   for msg type: set_random_seed" and layouts are not reproduced. The private API
   port (9092, key-protected) was not tried.
-- Untested: time scale 3 with FPS limit 180, several simulator instances on
-  different ports (`--port`), the protocol's synchronous `step_mode`.
+- Do not go beyond time scale 2 with policies trained at time scale 1 or 2 (see
+  the table). Untested: several simulator instances on different ports
+  (`--port`), the protocol's synchronous `step_mode`.
 
-**Validation:** 22 pytest tests pass (paired statistics added).
+**Validation:** 25 pytest tests pass (paired statistics, latent lags and per-model observation in paired evaluation added).

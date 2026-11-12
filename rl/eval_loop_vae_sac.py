@@ -16,7 +16,7 @@ from stable_baselines3 import SAC
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from rl.experiment import EvalRecord, environment_config, validate_args, validate_model_config
+from rl.experiment import EvalRecord, environment_config, parse_lags, validate_args, validate_model_config
 
 from rl.train_vae_sac import (
     CAMERA_HEIGHT,
@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate VAE+SAC on the generated_track loop.")
     parser.add_argument("--model", type=Path, default=Path("models/rl_loop_vae_sac_fixedlight_v3_h80/sac_loop_vae_90000_steps.zip"))
     parser.add_argument("--encoder",
-                        choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14"],
+                        choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14", "dinov2_vits14_grid"],
                         default="vae",
                         help="Image encoder. Must match what the SAC model was trained with.")
     parser.add_argument("--encoder-crop-top", type=int, default=0,
@@ -61,6 +61,11 @@ def parse_args() -> argparse.Namespace:
                              "crops by its own fixed MARGIN_TOP and is unaffected by this flag. "
                              "MUST match what the model was trained with. Use 40 for the older "
                              "v4 ResNet checkpoint; use 0 for the standard DINOv2/ResNet runs.")
+    parser.add_argument("--encoder-projection", type=Path, default=None,
+                         help="Projection file from tools/fit_grid_projection.py; required for dinov2_vits14_grid.")
+    parser.add_argument("--latent-lags", type=parse_lags, default=(),
+                         help="Also give the policy the latent from this many steps ago, e.g. '2,4'. "
+                              "MUST match training.")
     parser.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_fixedlight_v1/best.pt"),
                         help="Only used when --encoder=vae.")
     parser.add_argument("--env-id", default="donkey-generated-track-v0")
@@ -120,7 +125,7 @@ def _evaluate(args, record) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     vae = make_encoder(args.encoder, device=device, vae_checkpoint=args.vae_model,
-                       crop_top=args.encoder_crop_top)
+                       crop_top=args.encoder_crop_top, projection=args.encoder_projection)
     record.encoder(vae)
     print(f"Encoder: {args.encoder}  z_size={vae.z_size}  crop_top={args.encoder_crop_top}")
     conf = {"host": args.host, "port": args.port, "cam_resolution": (CAMERA_HEIGHT, CAMERA_WIDTH, 3)}
@@ -133,6 +138,7 @@ def _evaluate(args, record) -> None:
         max_steering=args.max_steering,
         max_steering_diff=args.max_steering_diff,
         n_command_history=args.n_command_history,
+        latent_lags=args.latent_lags,
         reward_config=reward_config_from_args(args),
         scene_reload_every=args.scene_reload_every,
     )

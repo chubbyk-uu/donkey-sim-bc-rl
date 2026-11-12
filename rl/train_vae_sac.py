@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from dataclasses import dataclass, fields
 import os
 import time
@@ -156,8 +157,54 @@ class FrozenPretrainedCnnEncoder:
         return feat.squeeze(0).cpu().numpy().astype(np.float32)
 
 
+GRID_SIDE = 4
+
+
+class FrozenDinoGridEncoder(FrozenPretrainedCnnEncoder):
+    """DINOv2-S patch tokens pooled to a 4x4 grid, then a fixed linear projection.
+
+    The class token used by "dinov2_vits14" discards where things are in the
+    image; the pooled grid keeps it and reads lane position about twice as
+    accurately (experiment-log 12). The grid has 16 * 384 values, so a
+    projection fitted offline (tools/fit_grid_projection.py) reduces it to a
+    few whitened components.
+    """
+
+    def __init__(self, device: torch.device, crop_top: int = 0, projection: Path | None = None) -> None:
+        super().__init__("dinov2_vits14", device=device, crop_top=crop_top)
+        self.model_name = "dinov2_vits14_grid"
+        self.z_size = GRID_SIDE * GRID_SIDE * self.z_size
+        self.projection = None
+        if projection is not None:
+            saved = torch.load(projection, map_location=device, weights_only=True)
+            self.projection = (saved["mean"].float(), saved["components"].float(), saved["scale"].float())
+            self.z_size = int(saved["components"].shape[0])
+
+    @torch.no_grad()
+    def grid_features(self, images: np.ndarray) -> torch.Tensor:
+        """(N, H, W, 3) uint8 frames -> (N, 16 * 384) pooled patch tokens."""
+        tensor = torch.from_numpy(np.array(images[:, self.crop_top:])).to(self.device)  # copy: frames may be read-only
+        tensor = tensor.permute(0, 3, 1, 2).contiguous().float() / 255.0
+        tensor = torch.nn.functional.interpolate(tensor, size=(224, 224), mode="bilinear", align_corners=False)
+        patches = self.model.forward_features((tensor - self._mean) / self._std)["x_norm_patchtokens"]
+        side = int(patches.shape[1] ** 0.5)  # row-major patch grid
+        grid = patches.transpose(1, 2).reshape(len(images), -1, side, side)
+        return torch.nn.functional.adaptive_avg_pool2d(grid, (GRID_SIDE, GRID_SIDE)).flatten(1)
+
+    @torch.no_grad()
+    def encode(self, obs: np.ndarray) -> np.ndarray:
+        image = np.asarray(obs, dtype=np.uint8)
+        if image.shape != (CAMERA_HEIGHT, CAMERA_WIDTH, 3):
+            raise ValueError(f"unexpected image shape {image.shape}")
+        features = self.grid_features(image[None])
+        if self.projection is not None:
+            mean, components, scale = self.projection
+            features = (features - mean) @ components.T / scale
+        return features.squeeze(0).cpu().numpy().astype(np.float32)
+
+
 def make_encoder(encoder_name: str, device: torch.device, vae_checkpoint: Path | None = None,
-                 crop_top: int = 0):
+                 crop_top: int = 0, projection: Path | None = None):
     """Factory: build an encoder by name. Returns object with .encode(obs) and .z_size.
 
     `crop_top` applies to all frozen pretrained encoders (DINOv2, ResNet, MobileNet).
@@ -171,6 +218,10 @@ def make_encoder(encoder_name: str, device: torch.device, vae_checkpoint: Path |
         return FrozenVaeEncoder(vae_checkpoint, device=device, z_size=Z_SIZE)
     if encoder_name in {"resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14"}:
         return FrozenPretrainedCnnEncoder(encoder_name, device=device, crop_top=crop_top)
+    if encoder_name == "dinov2_vits14_grid":
+        if projection is None:
+            raise ValueError("--encoder-projection is required when --encoder=dinov2_vits14_grid")
+        return FrozenDinoGridEncoder(device=device, crop_top=crop_top, projection=projection)
     raise ValueError(f"unsupported encoder: {encoder_name}")
 
 
@@ -218,6 +269,7 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         max_steering: float = MAX_STEERING,
         max_steering_diff: float = MAX_STEERING_DIFF,
         n_command_history: int = N_COMMAND_HISTORY,
+        latent_lags: tuple[int, ...] = (),
         reward_config: RaffinRewardConfig | None = None,
         scene_reload_every: int = 0,
         scene_reload_alpha: float = 0.0,
@@ -260,17 +312,28 @@ class DonkeyVaeSACEnv(gym.Wrapper):
             high=np.array([self.max_steering, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
-        obs_dim = self.vae.z_size + 2 * self.n_command_history
-        self.observation_space = gym.spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(obs_dim,),
-            dtype=np.float32,
-        )
+        self.set_observation(vae, latent_lags)
         self.last_throttle = self.min_throttle
+
+    def set_observation(self, encoder, latent_lags: tuple[int, ...] = ()) -> None:
+        """Choose the encoder and which earlier latents the observation carries.
+
+        The observation is [latent now, latent `lag` steps ago for each lag,
+        command history]. Earlier latents let the policy see how the view is
+        changing (how fast it is drifting across the road), which one frame
+        cannot show. Call between episodes only.
+        """
+        self.vae = encoder
+        self.latent_lags = tuple(int(lag) for lag in latent_lags)
+        if any(lag <= 0 for lag in self.latent_lags):
+            raise ValueError("latent_lags must be positive step counts")
+        self._latents: deque = deque(maxlen=max(self.latent_lags, default=0) + 1)
+        obs_dim = encoder.z_size * (1 + len(self.latent_lags)) + 2 * self.n_command_history
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
     def reset(self, **kwargs):
         self.command_history.fill(0.0)
+        self._latents.clear()
         self.last_steer = 0.0
         self.last_throttle = self.min_throttle
         self._prev_lap_count = 0
@@ -369,9 +432,14 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         started = time.perf_counter()
         z = self.vae.encode(self.last_raw_obs)
         self.last_encode_seconds = time.perf_counter() - started
-        if self.n_command_history <= 0:
-            return z
-        return np.concatenate([z, self.command_history.reshape(-1)], dtype=np.float32)
+        # Newest first; right after a reset every earlier latent is the first frame.
+        self._latents.appendleft(z)
+        while len(self._latents) < self._latents.maxlen:
+            self._latents.append(z)
+        parts = [z] + [self._latents[lag] for lag in self.latent_lags]
+        if self.n_command_history > 0:
+            parts.append(self.command_history.reshape(-1))
+        return parts[0] if len(parts) == 1 else np.concatenate(parts, dtype=np.float32)
 
     def _is_game_over(self, terminated: bool, info: dict) -> bool:
         cte_dev = abs(float(info.get("cte", 0.0)) - self.reward_config.cte_target)
@@ -566,6 +634,7 @@ def build_env(args: argparse.Namespace, vae: FrozenVaeEncoder) -> gym.Env:
         max_steering=args.max_steering,
         max_steering_diff=args.max_steering_diff,
         n_command_history=args.n_command_history,
+        latent_lags=getattr(args, "latent_lags", ()),
         reward_config=reward_config_from_args(args),
         scene_reload_every=getattr(args, "scene_reload_every", 0),
         scene_reload_alpha=getattr(args, "scene_reload_alpha", 0.0),

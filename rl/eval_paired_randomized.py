@@ -37,7 +37,7 @@ if __package__ is None or __package__ == "":
 
 from rl.eval_loop_vae_sac import _osc_period
 from rl.experiment import (
-    EvalRecord, environment_config, format_paired_statistics, paired_statistics,
+    EvalRecord, environment_config, format_paired_statistics, paired_statistics, parse_lags,
     validate_args, validate_model_config,
 )
 
@@ -59,9 +59,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--host", default=os.environ.get("DONKEY_SIM_HOST", "127.0.0.1"))
     p.add_argument("--port", type=int, default=int(os.environ.get("DONKEY_SIM_PORT", "9091")))
     p.add_argument("--encoder",
-                   choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14"],
+                   choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14", "dinov2_vits14_grid"],
                    default="dinov2_vits14")
     p.add_argument("--encoder-crop-top", type=int, default=0)
+    p.add_argument("--encoder-projection", type=Path, default=None,
+                    help="Projection file from tools/fit_grid_projection.py; required for dinov2_vits14_grid.")
+    p.add_argument("--latent-lags", type=parse_lags, default=(),
+                    help="Also give the policy the latent from this many steps ago, e.g. '2,4'. "
+                         "MUST match training.")
     p.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_fixedlight_v1/best.pt"))
     p.add_argument("--model-dir", type=Path, default=None,
                    help="Directory holding sac_{encoder}_{step}_steps.zip checkpoints. "
@@ -194,6 +199,8 @@ def main() -> None:
     files = {lb: path for lb, path, _ in specs}
     if args.encoder == "vae":
         files["vae_encoder"] = args.vae_model
+    if args.encoder_projection is not None:
+        files["encoder_projection"] = args.encoder_projection
     for _, path, crop in specs:
         if not 0 <= crop < CAMERA_HEIGHT:
             raise ValueError("Model crop_top must be in [0, 120)")
@@ -206,22 +213,32 @@ def main() -> None:
 def _evaluate(args, specs, record) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     labels = [lb for lb, _, _ in specs]
-    crop_of = {lb: cr for lb, _, cr in specs}
 
-    # one frozen encoder per distinct crop (DINOv2 z_size is identical across crops,
-    # so obs dim / action space are the same and we can swap the env's encoder per model)
-    encoders = {}
-    for _, _, cr in specs:
-        if cr not in encoders:
-            encoders[cr] = make_encoder(args.encoder, device=device,
-                                        vae_checkpoint=args.vae_model, crop_top=cr)
-            record.encoder(encoders[cr])
+    # Each model gets the observation it was trained with: the encoder, crop and
+    # latent lags its checkpoint records, or for checkpoints without that record
+    # --encoder, the crop from its spec and --latent-lags.
+    models, observation, encoders = {}, {}, {}
+    for label, path, crop in specs:
+        models[label] = SAC.load(str(path), device=device)
+        saved = (getattr(models[label], "donkey_config", None) or {}).get("observation", {})
+        model_args = argparse.Namespace(**vars(args))
+        model_args.encoder = saved.get("encoder", args.encoder)
+        model_args.encoder_crop_top = saved.get("crop_top", crop)
+        model_args.latent_lags = tuple(saved.get("latent_lags", args.latent_lags))
+        validate_model_config(models[label], environment_config(model_args))
+        key = (model_args.encoder, model_args.encoder_crop_top)
+        if key not in encoders:
+            encoders[key] = make_encoder(key[0], device=device, vae_checkpoint=args.vae_model,
+                                         crop_top=key[1], projection=args.encoder_projection)
+            record.encoder(encoders[key])
+        observation[label] = (encoders[key], model_args.latent_lags)
+        print(f"loaded [{label}] encoder={key[0]} crop={key[1]} latent_lags={model_args.latent_lags} {path}")
 
     conf = {"host": args.host, "port": args.port, "cam_resolution": (CAMERA_HEIGHT, CAMERA_WIDTH, 3)}
     base_env = gym.make(args.env_id, conf=conf)
     dk_env = DonkeyVaeSACEnv(
         base_env,
-        vae=encoders[specs[0][2]],
+        vae=observation[labels[0]][0],
         min_throttle=args.min_throttle,
         max_throttle=args.max_throttle,
         max_steering=args.max_steering,
@@ -236,16 +253,6 @@ def _evaluate(args, specs, record) -> None:
     scene = controller.handler.SceneToLoad
 
     try:
-        models = {}
-        for label, path, cr in specs:
-            if not path.exists():
-                raise FileNotFoundError(path)
-            models[label] = SAC.load(str(path), env=env, device=device)
-            model_args = argparse.Namespace(**vars(args))
-            model_args.encoder_crop_top = cr
-            validate_model_config(models[label], environment_config(model_args))
-            print(f"loaded [{label}] crop={cr} {path}")
-
         results = {lb: [] for lb in labels}
         trunc_matrix = []  # per layout: dict label->bool
         order_rng = np.random.default_rng(args.order_seed)
@@ -256,7 +263,7 @@ def _evaluate(args, specs, record) -> None:
                 raise RuntimeError(f"Scene reload failed for layout {layout}; layout not counted")
             row = {}
             for order, label in enumerate(order_rng.permutation(labels), 1):
-                dk_env.vae = encoders[crop_of[label]]   # swap encoder crop to this model's
+                dk_env.set_observation(*observation[label])
                 res = run_episode(env, models[label], args.max_episode_steps, record,
                                   {"layout": layout, "model": label})
                 record.episode(dict(res, layout=layout, model=label, order=order))
