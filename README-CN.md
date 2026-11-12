@@ -23,9 +23,21 @@ DINOv2、depth 或 segmentation，而不是继续微调 reward。
 
 ### 1. Python 环境
 
+本项目在本机实际使用的环境是 **`rlpy312`（Python 3.12）**。Shell 历史确认
+曾在激活该环境后运行 `rl/eval_loop_vae_sac.py`。原来的 `rl311` / Python 3.11
+示例已由下面的环境说明替代；项目仍需使用时，应保留 `rlpy312`。
+
+本机训练或评估前，直接激活已有环境：
+
 ```bash
-conda create -n rl311 python=3.11
-conda activate rl311
+conda activate rlpy312
+```
+
+在新机器上初始化时，再创建环境并安装依赖：
+
+```bash
+conda create -n rlpy312 python=3.12
+conda activate rlpy312
 pip install "stable-baselines3[extra]" gymnasium numpy pillow opencv-python tqdm tensorboard
 ```
 

@@ -26,9 +26,22 @@ tuning.
 
 ### 1. Python Environment
 
+The existing local environment for this project is **`rlpy312` (Python 3.12)**.
+Shell history confirms it was used to run `rl/eval_loop_vae_sac.py`. The old
+`rl311` / Python 3.11 setup example is superseded by the environment below.
+Keep `rlpy312` while this project is in use.
+
+Activate the existing environment before training or evaluation:
+
 ```bash
-conda create -n rl311 python=3.11
-conda activate rl311
+conda activate rlpy312
+```
+
+On a new machine, create the environment and install dependencies:
+
+```bash
+conda create -n rlpy312 python=3.12
+conda activate rlpy312
 pip install "stable-baselines3[extra]" gymnasium numpy pillow opencv-python tqdm tensorboard
 ```
 
