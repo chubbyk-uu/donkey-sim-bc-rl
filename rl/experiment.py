@@ -8,8 +8,11 @@ import itertools
 import json
 import math
 import platform
+import re
 import shutil
+import struct
 import subprocess
+import tempfile
 import time
 import warnings
 from collections import deque
@@ -45,6 +48,34 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def simulator_saved_settings() -> dict | None:
+    """Simulator menu options that change results but are invisible to the client.
+
+    Read from the Windows registry where the simulator saves them (time scale,
+    FPS limit, random light / trees / cones). These are the saved values, not
+    the state of the running process. None when they cannot be read, e.g.
+    outside WSL.
+    """
+    reg = Path("/mnt/c/Windows/System32/reg.exe")
+    if not reg.exists():
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "simulator.reg"
+            windows_path = subprocess.check_output(["wslpath", "-w", str(target)], text=True).strip()
+            subprocess.run([str(reg), "export", r"HKCU\Software\DonkeyCar\donkey_sim", windows_path, "/y"],
+                           cwd="/mnt/c", check=True, capture_output=True, timeout=20)
+            text = target.read_text(encoding="utf-16")
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    names = "timeScale|fps|randomLight|generateTrees|generateRandomCones|useSeed"
+    settings = {}
+    for name, kind, raw in re.findall(rf'"({names})_h\d+"=(dword|hex\(4\)):([0-9a-f,]+)', text):
+        # Unity stores ints as dwords and floats as 8-byte doubles.
+        settings[name] = int(raw, 16) if kind == "dword" else struct.unpack("<d", bytes.fromhex(raw.replace(",", "")))[0]
+    return settings or None
 
 
 def wilson_interval(successes: int, n: int, z: float = 1.959964) -> tuple[float, float]:
@@ -246,6 +277,7 @@ class EvalRecord:
             "versions": {key: importlib.metadata.version(key) for key in ("torch", "stable-baselines3", "gymnasium", "gym-donkeycar", "numpy")},
             "files": {key: {"path": str(path), "sha256": sha256(path)} for key, path in files.items()},
             "layout_note": "Layout numbers identify loads within this run; they are not reproducible simulator seeds.",
+            "simulator_saved_settings": simulator_saved_settings(),
         }
         source_dir = self.path / "source"
         source_dir.mkdir()

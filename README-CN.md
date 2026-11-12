@@ -431,6 +431,9 @@ python rl/eval_paired_randomized.py --encoder dinov2_vits14 \
 ```
 
 Loop 评估默认使用 VAE 90k 主模型。Simulator 的光照/树木设置仍需匹配模型。
+Simulator 菜单里的 Time scale 和 FPS limit 也会影响结果：训练和评估统一使用
+Time scale 2 + FPS limit 120（约快 1.9 倍，见 experiment-log §12）。评估的 metadata
+和训练的 run config 会把 simulator 保存的设置记录为 `simulator_saved_settings`。
 新的 loop 训练 checkpoint 内保存编码器、裁剪和动作配置，评估/续训不兼容时会拒绝运行；
 历史模型没有这些元数据，会提示无法完成校验。预训练编码器目前只标识模型家族，
 尚未固定其上游源码与权重版本。

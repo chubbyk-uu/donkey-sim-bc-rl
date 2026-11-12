@@ -443,6 +443,10 @@ python rl/eval_paired_randomized.py --encoder dinov2_vits14 \
 
 The loop evaluator defaults to the primary VAE 90k policy. Match simulator
 lighting/tree settings to the checkpoint; these settings are external to Python.
+The simulator's Time scale and FPS limit also change results: the standard is
+Time scale 2 with FPS limit 120 for both training and evaluation (about 1.9x
+faster; see experiment-log §12). Evaluation metadata and training run configs
+record the simulator's saved settings as `simulator_saved_settings`.
 New loop training checkpoints embed encoder/crop/action configuration. Evaluation
 and resume reject incompatible configurations; old checkpoints warn that metadata
 is unavailable. Pretrained encoder names identify the model family; upstream

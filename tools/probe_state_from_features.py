@@ -94,7 +94,7 @@ def extract_features(records: list[dict], device: torch.device, crop_top: int, b
         images = np.stack([np.asarray(Image.open(r["image"]).convert("RGB")) for r in records[start:start + batch]])
         if start == 0:
             policy_input = encoder.encode(images[0])
-        tensor = torch.from_numpy(images[:, crop_top:]).to(device).permute(0, 3, 1, 2).float() / 255.0
+        tensor = torch.from_numpy(images[:, crop_top:]).to(device).permute(0, 3, 1, 2).contiguous().float() / 255.0
         out["pixels"].append(torch.nn.functional.adaptive_avg_pool2d(tensor, (15, 20)).flatten(1).cpu().numpy())
         tensor = torch.nn.functional.interpolate(tensor, size=(224, 224), mode="bilinear", align_corners=False)
         tokens = encoder.model.forward_features((tensor - encoder._mean) / encoder._std)

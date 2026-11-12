@@ -20,7 +20,7 @@ try:
         build_env,
         make_encoder,
     )
-    from rl.experiment import (algorithm_config, environment_config, save_replay_metadata,
+    from rl.experiment import (algorithm_config, environment_config, save_replay_metadata, simulator_saved_settings,
                                validate_args, validate_model_config, validate_replay, write_json)
 except ImportError:
     from train_vae_sac import (
@@ -33,7 +33,7 @@ except ImportError:
         build_env,
         make_encoder,
     )
-    from experiment import (algorithm_config, environment_config, save_replay_metadata,
+    from experiment import (algorithm_config, environment_config, save_replay_metadata, simulator_saved_settings,
                             validate_args, validate_model_config, validate_replay, write_json)
 
 
@@ -256,6 +256,7 @@ def _train(args, env, device, current_config) -> None:
     write_json(config_path, {
         "requested": vars(args), "environment": current_config, "effective_algorithm": effective,
         "start_timesteps": model.num_timesteps, "additional_timesteps": args.timesteps,
+        "simulator_saved_settings": simulator_saved_settings(),
     })
 
     callbacks = [
