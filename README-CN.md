@@ -9,13 +9,15 @@ camera image -> (crop) -> encoder -> SAC policy -> steer / throttle
 
 详细实验过程、失败分支和设计原因见：[docs/experiment-log.md](docs/experiment-log.md)。
 
-**当前状态（2026-05-29）：已到达一个稳定里程碑。** 项目已有可运行的 BC 基线、最早
+**当前状态（2026-11-12）：基线已复测，已补充控制诊断。** 项目已有可运行的 BC 基线、最早
 single generated-road VAE+SAC 基线、fixed-light loop 部署模型、Mountain DINOv2
 部署模型，以及 random light + tree shadows 的 domain-randomization 实验记录。
 fixed-light loop 上最强模型仍是 track-specific VAE；需要光照/外观泛化时，DINOv2
-是目前最好的 frozen encoder。剩余主要问题是随机树影下的鲁棒感知：frozen encoder
-只能做到部分成功，下一步真正有价值的方向是 task-adapted encoder，例如 fine-tuned
-DINOv2、depth 或 segmentation，而不是继续微调 reward。
+是目前最好的 frozen encoder。随机场景可靠性仍未解决。任务适配编码器值得尝试，
+但重复布局测试也发现轨迹变化和困难弯道，尚未分离感知与状态/控制方面的限制。
+最新一批重新加载的12个布局中8个跑满；另一组六布局双次复测为9/12 episode跑满，
+后者存在组内相关性，不能当作12个独立布局。详见
+[本次诊断记录](docs/experiment-log.md#11-runtime-revalidation-and-control-diagnostics-2026-11-12)。
 
 ---
 
@@ -288,7 +290,7 @@ python rl/train_loop_vae_sac.py \
   --vae-model models/vae_loop_cones_fixedlight_v1/best.pt \
   --output-dir models/rl_loop_new \
   --hidden-size 80 \
-  --batch-size 64 \
+  --batch-size 64 --buffer-size 60000 \
   --gradient-steps-min 50 \
   --gradient-steps-cap 2000 \
   --alive-reward 1.5 \
@@ -371,9 +373,68 @@ python rl/train_loop_vae_sac.py \
   --gradient-steps-cap 1000 --gradient-steps-min 200 \
   --learning-rate 2e-4 --override-learning-rate \
   --resume-model models/rl_dinov2_mountain_new_v1/<best_checkpoint>.zip \
-  --resume-replay-buffer models/rl_dinov2_mountain_new_v1/<best_checkpoint>_replay_buffer.pkl \
   --output-dir models/rl_dinov2_mountain_new_v2 \
   --timesteps 40000 --save-replay-buffer --device cuda
+```
+
+---
+
+## 评估记录与续训校验
+
+两个 loop 评估入口默认在 `logs/` 下新建目录，保存 `metadata.json`、`results.json`、
+`episodes.csv` 和起始画面。元数据记录编码器实际权重的哈希，`source/` 保留运行源码。
+`--output-dir` 可指定一个尚不存在的目录；
+`--save-telemetry` 额外保存逐步动作、CTE、速度、圈数、终止原因和时间戳。
+`--capture-tail-steps 120` 会在内存中保留每次结束前120帧（20Hz下约6秒），
+同时适用于失败和跑满的episode，并自动启用遥测。结束后写出PNG、GIF和按步号索引。
+捕获画面是实际编码器输入的副本，避免读取稍后到达的实时相机画面。
+遥测补充位姿、速度向量及客户端策略、编码器、整步耗时。
+映射后的转向指令没有Unity执行确认；整步耗时包含等待遥测和编码，不等于网络RTT。
+
+分析已完成的一轮评估：
+
+```bash
+python tools/analyze_control_failures.py logs/<run_directory>
+```
+
+输出每次运行的时序图、画面拼图（有捕获时）和JSON/CSV统计。
+若要检查同一布局内的重复性，可通过 `--models` 给同一checkpoint指定两个不同标签；
+这些标签代表重复运行，不是两个不同训练模型。
+
+无穷大的振荡周期保存为 JSON `null`。异常会保留已完成结果，并标记失败。
+Paired 评估从首个布局开始 reload，reload 超时直接失败，不复用旧布局计数；
+`--order-seed` 控制模型测试顺序。布局编号仅标识本轮加载，不能用于重建随机场景。
+
+```bash
+python rl/eval_loop_vae_sac.py --episodes 5 --max-episode-steps 3000 \
+  --output-dir logs/loop_fixedlight_check --save-telemetry
+
+python rl/eval_paired_randomized.py --encoder dinov2_vits14 \
+  --model-dir models/rl_loop_dinov2_randomtree_v2 --steps 50000 \
+  --layouts 12 --max-episode-steps 2000 --save-telemetry
+```
+
+Loop 评估默认使用 VAE 90k 主模型。Simulator 的光照/树木设置仍需匹配模型。
+新的 loop 训练 checkpoint 内保存编码器、裁剪和动作配置，评估/续训不兼容时会拒绝运行；
+历史模型没有这些元数据，会提示无法完成校验。预训练编码器目前只标识模型家族，
+尚未固定其上游源码与权重版本。
+
+Loop 训练在 `run_config.json` 中保存请求配置和实际配置。续训的 `--timesteps` 是
+**追加步数**。SAC 算法参数继承 checkpoint；显式传入不同的 batch、buffer、网络宽度等
+会报错，避免静默忽略。学习率通过 `--override-learning-rate` 修改，并持久保存在模型中。
+动态梯度步数仅用于按 episode 训练。
+
+新保存的 replay buffer 配有 `.pkl.json` 配置和哈希记录。不允许在奖励、终止条件、
+编码器或动作配置变化后复用旧 buffer；例如上面的 Mountain 第二阶段改用空 buffer。
+历史实验曾混合新旧奖励，因此修正后的续训方案需要重新验证，不能视作历史结果的精确复现。
+历史 buffer 无元数据时，可用 `--allow-legacy-replay-buffer` 明确接受无法校验的兼容性；
+该选项不能绕过已知的配置冲突。这些续训校验适用于 `train_loop_vae_sac.py`，
+最早的 generated-road `train_vae_sac.py` 入口仍为 legacy trainer。
+
+在 `rlpy312` 中运行无需模拟器的回归测试：
+
+```bash
+python -m pytest -q tests
 ```
 
 ---

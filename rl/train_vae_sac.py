@@ -18,8 +18,10 @@ from stable_baselines3.common.utils import set_random_seed
 
 try:
     from rl.vae import ConvVAE
+    from rl.experiment import save_replay_metadata
 except ImportError:
     from vae import ConvVAE
+    from experiment import save_replay_metadata
 
 
 CAMERA_HEIGHT = 120
@@ -108,11 +110,11 @@ class FrozenPretrainedCnnEncoder:
             model.classifier = torch.nn.Identity()
             feature_dim = 576
         elif model_name == "dinov2_vits14":
-            model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14",
+            model = torch.hub.load("facebookresearch/dinov2:main", "dinov2_vits14",
                                    pretrained=True, trust_repo=True)
             feature_dim = 384
         elif model_name == "dinov2_vitb14":
-            model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14",
+            model = torch.hub.load("facebookresearch/dinov2:main", "dinov2_vitb14",
                                    pretrained=True, trust_repo=True)
             feature_dim = 768
         else:
@@ -293,9 +295,8 @@ class DonkeyVaeSACEnv(gym.Wrapper):
             print(f"[scene-reload] reset #{self._reset_count}: reloading {scene} ({reason})",
                   flush=True)
             if not reload_scene(controller, scene):
-                print(f"[scene-reload] WARNING: reload timed out at reset "
-                      f"#{self._reset_count}; continuing on current scene", flush=True)
-            self._steps_on_scene = 0  # reset whether or not reload succeeded (avoid retry spam)
+                raise RuntimeError(f"Scene reload timed out at reset #{self._reset_count}; layout not counted")
+            self._steps_on_scene = 0
 
         obs, info = self.env.reset(**kwargs)
         self._prev_lap_count = int(info.get("lap_count", 0))
@@ -308,6 +309,9 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         prev_steer = float(self.command_history[-1, 0]) if self.n_command_history > 0 else 0.0
         executed = self._map_and_clip_action(raw_action)
         obs, original_reward, terminated, truncated, info = self.env.step(executed)
+        if "cte" not in info or not np.isfinite(float(info["cte"])):
+            raise ValueError("Missing or non-finite CTE telemetry")
+        base_terminated = terminated
         terminated = self._is_game_over(terminated, info)
         reward = self._calculate_reward(terminated, executed[1], info)
         cur_lap_count = int(info.get("lap_count", 0))
@@ -326,9 +330,12 @@ class DonkeyVaeSACEnv(gym.Wrapper):
                 "rl_throttle": float(executed[1]),
                 "abs_cte": abs(cte - self.reward_config.cte_target),
                 "vae_reward": reward,
+                "termination_reason": ("simulator" if base_terminated else "cte_limit") if terminated else None,
             }
         )
-        return self._build_obs(obs), reward, terminated, truncated, info
+        encoded_obs = self._build_obs(obs)
+        info["encoder_seconds"] = self.last_encode_seconds
+        return encoded_obs, reward, terminated, truncated, info
 
     def _map_and_clip_action(self, action: np.ndarray) -> np.ndarray:
         steer = float(np.clip(action[0], -self.max_steering, self.max_steering))
@@ -351,7 +358,10 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         self.command_history[-1] = action
 
     def _build_obs(self, obs: np.ndarray) -> np.ndarray:
-        z = self.vae.encode(obs)
+        self.last_raw_obs = np.array(obs, copy=True)
+        started = time.perf_counter()
+        z = self.vae.encode(self.last_raw_obs)
+        self.last_encode_seconds = time.perf_counter() - started
         if self.n_command_history <= 0:
             return z
         return np.concatenate([z, self.command_history.reshape(-1)], dtype=np.float32)
@@ -380,6 +390,18 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         )
 
 
+class ConfigCheckpointCallback(CheckpointCallback):
+    """Keep replay configuration alongside each SB3 replay-buffer file."""
+
+    def _on_step(self) -> bool:
+        result = super()._on_step()
+        if self.n_calls % self.save_freq == 0 and self.save_replay_buffer:
+            path = Path(self._checkpoint_path("replay_buffer_", extension="pkl"))
+            if path.exists():
+                save_replay_metadata(path, self.model)
+        return result
+
+
 class CappedDynamicGradientStepsCallback(BaseCallback):
     """gradient_steps = clamp(episode_length * scale, [floor, cap]).
 
@@ -404,6 +426,8 @@ class CappedDynamicGradientStepsCallback(BaseCallback):
         return True
 
     def _on_rollout_end(self) -> None:
+        if self.model.train_freq.unit.value != "episode":
+            return
         ep_len = max(1, int(self.model.num_timesteps) - self._rollout_start_ts)
         scaled = int(ep_len * self.scale)
         new_grads = max(self.floor, min(scaled, self.cap))

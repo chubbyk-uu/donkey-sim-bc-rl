@@ -10,15 +10,17 @@ camera image → (crop) → encoder → SAC policy → steer / throttle
 Detailed experiment history and design decisions: [docs/experiment-log.md](docs/experiment-log.md)
 Chinese README: [README-CN.md](README-CN.md)
 
-**Status (2026-05-29): stable milestone reached.** The project now has working BC
+**Status (2026-11-12): baselines rechecked; control diagnostics added.** The project now has working BC
 baselines, a single generated-road VAE+SAC baseline, fixed-light loop deployments,
 a Mountain DINOv2 deployment, and a documented domain-randomization study for
 random light + tree shadows. The strongest fixed-light loop policies still use a
 track-specific VAE; DINOv2 is the best frozen encoder for lighting/domain changes.
-The remaining open problem is robust perception under heavy random tree shadows:
-frozen encoders plateau around partial success, so the next meaningful lever is a
-task-adapted encoder (fine-tuned DINOv2, depth, or segmentation), not more reward
-tuning.
+Random-layout reliability remains partial. A task-adapted encoder is a candidate,
+but repeated-layout tests also show trajectory variability and difficult corners;
+perception versus state/control limitations have not been isolated. The latest
+fresh-layout batch reached 8/12 time limits; a separate six-layout repeat
+probe reached 9/12 episodes (correlated repeats, not twelve independent layouts).
+See [the dated diagnostic results](docs/experiment-log.md#11-runtime-revalidation-and-control-diagnostics-2026-11-12).
 
 ---
 
@@ -290,7 +292,7 @@ python rl/train_loop_vae_sac.py \
   --vae-model models/vae_loop_cones_fixedlight_v1/best.pt \
   --output-dir models/rl_loop_new \
   --hidden-size 80 \
-  --batch-size 64 \
+  --batch-size 64 --buffer-size 60000 \
   --gradient-steps-min 50 \
   --gradient-steps-cap 2000 \
   --alive-reward 1.5 \
@@ -370,9 +372,81 @@ python rl/train_loop_vae_sac.py \
   --gradient-steps-cap 1000 --gradient-steps-min 200 \
   --learning-rate 2e-4 --override-learning-rate \
   --resume-model models/rl_dinov2_mountain_new_v1/<best_checkpoint>.zip \
-  --resume-replay-buffer models/rl_dinov2_mountain_new_v1/<best_checkpoint>_replay_buffer.pkl \
   --output-dir models/rl_dinov2_mountain_new_v2 \
   --timesteps 40000 --save-replay-buffer --device cuda
+```
+
+---
+
+## Evaluation records and safe resume
+
+Both loop evaluation scripts write `metadata.json`, `results.json`, `episodes.csv`,
+and initial camera frames to a new directory under `logs/`. Metadata records actual
+encoder tensor hashes, and `source/` preserves the evaluation source. Use `--output-dir`
+to choose a **new** directory and `--save-telemetry` to also save stepwise JSONL
+(actions, CTE, speed, lap counts, termination reason, and wall-clock timing).
+Use `--capture-tail-steps 120` to retain the final 120 returned camera frames
+(about 6 seconds at 20 Hz) of **both** failed and time-limited episodes. This
+also enables telemetry. Images stay in a bounded RAM buffer during driving;
+episode completion writes PNGs, a GIF and a step-indexed manifest. Captured
+images are copies of the actual encoder input, rather than a later live frame.
+Telemetry includes pose/velocity plus client policy, encoder and env-step timing.
+The mapped steering command has no execution acknowledgement from Unity;
+`env_step_seconds` includes telemetry waiting and encoding, and is not network RTT.
+
+Analyze a completed run with:
+
+```bash
+python tools/analyze_control_failures.py logs/<run_directory>
+```
+
+This produces per-episode time plots, frame contact sheets (when captured), and
+JSON/CSV metrics. To test repeatability on the same layout, pass the same policy
+twice with different labels via `--models`; these labels represent repeats, not
+different trained models.
+
+Non-finite oscillation periods are JSON `null`. Failures retain completed episodes
+and mark metadata as failed. Layout numbers identify scene loads within a run;
+they are not reproducible simulator seeds. Paired evaluation reloads even the
+first layout, aborts on reload timeout, and shuffles model order with `--order-seed`.
+
+```bash
+python rl/eval_loop_vae_sac.py --episodes 5 --max-episode-steps 3000 \
+  --output-dir logs/loop_fixedlight_check --save-telemetry
+
+python rl/eval_paired_randomized.py --encoder dinov2_vits14 \
+  --model-dir models/rl_loop_dinov2_randomtree_v2 --steps 50000 \
+  --layouts 12 --max-episode-steps 2000 --save-telemetry
+```
+
+The loop evaluator defaults to the primary VAE 90k policy. Match simulator
+lighting/tree settings to the checkpoint; these settings are external to Python.
+New loop training checkpoints embed encoder/crop/action configuration. Evaluation
+and resume reject incompatible configurations; old checkpoints warn that metadata
+is unavailable. Pretrained encoder names identify the model family; upstream
+pretrained weights/source revisions are not yet pinned by this contract.
+
+Loop training saves requested and effective parameters in `run_config.json`.
+`--timesteps` means **additional steps** when resuming. SAC inherits algorithm
+parameters from its checkpoint; explicitly requesting a different inherited batch
+size, buffer size, architecture, etc. now fails instead of silently ignoring it.
+Use `--override-learning-rate` to change LR; the override persists in saved models.
+Dynamic gradient updates apply only to episode-based training.
+
+Replay buffers saved by the loop trainer have a `.pkl.json` sidecar with their
+configuration and file hash. A reward/termination/encoder/action mismatch rejects
+reuse: resume **without the buffer** when changing rewards, as in the Mountain
+stage-2 example above. Historical runs reused old rewards, so this safer recipe
+requires fresh validation rather than being an exact reproduction of those runs.
+For historical buffers without metadata, `--allow-legacy-replay-buffer` explicitly
+opts into unverified compatibility; it does not bypass a known metadata mismatch.
+These contract checks apply to `train_loop_vae_sac.py`; the original generated-road
+`train_vae_sac.py` entrypoint remains a legacy trainer.
+
+Run simulator-free regression checks in `rlpy312`:
+
+```bash
+python -m pytest -q tests
 ```
 
 ---

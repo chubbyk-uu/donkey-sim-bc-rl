@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 import gymnasium as gym
@@ -33,6 +34,8 @@ from stable_baselines3 import SAC
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from rl.experiment import EvalRecord, environment_config, validate_args, validate_model_config
 
 from rl.train_vae_sac import (
     CAMERA_HEIGHT,
@@ -70,6 +73,12 @@ def parse_args() -> argparse.Namespace:
                         "384 for any crop). Example: "
                         "'v2_50k:models/rl_loop_dinov2_randomtree_v2/sac_dinov2_vits14_50000_steps.zip:0,"
                         "crop40_130k:models/rl_loop_dinov2_randomtree_crop40_v1/sac_dinov2_vits14_130000_steps.zip:40'")
+    p.add_argument("--output-dir", type=Path, help="New results directory; defaults to logs/eval_<timestamp>.")
+    p.add_argument("--capture-tail-steps", type=int, default=0,
+                         help="Keep the last N returned camera frames per episode in RAM; save PNG/GIF at termination or time limit. Enables telemetry.")
+    p.add_argument("--save-telemetry", action="store_true")
+    p.add_argument("--order-seed", type=int, default=42,
+                   help="Seed for model order within layouts, not a simulator layout seed.")
     p.add_argument("--layouts", type=int, default=12,
                    help="Number of distinct random layouts; every checkpoint is run on each.")
     p.add_argument("--max-episode-steps", type=int, default=2000)
@@ -77,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-steering-diff", type=float, default=0.2,
                    help="Per-step steering-change clamp. MUST match training "
                         "(train_loop_vae_sac.py default is 0.2, NOT the 0.15 "
-                        "MAX_STEERING_DIFF constant).")
+                        "historical MAX_STEERING_DIFF constant).")
     p.add_argument("--max-throttle", type=float, default=0.7)
     p.add_argument("--max-steering", type=float, default=MAX_STEERING,
                    help="Steering output range. MUST match training (default 1.0).")
@@ -108,22 +117,30 @@ def _osc_period(x) -> float:
     return (2.0 * (len(x) - 1) / flips) if flips else float("inf")
 
 
-def run_episode(env, model, max_steps: int) -> dict:
-    obs, _ = env.reset()  # reset_car only (scene reload is disabled on the wrapper)
+def run_episode(env, model, max_steps: int, record=None, context=None) -> dict:
+    obs, reset_info = env.reset()  # reset_car only (scene reload is disabled on the wrapper)
+    first_frame = record.frame(context, env.get_wrapper_attr("last_raw_obs")) if record else None
     total_r = steps = 0
     max_cte = cte_sum = speed_sum = 0.0
     terminated = truncated = False
     ep_lap_times: list[float] = []
-    prev_lap = 0
-    last_seen_lap = 0.0
+    prev_lap = int(reset_info.get("lap_count", 0))
     ep_steers: list[float] = []
     ep_steer_deltas: list[float] = []
     ep_ctes_signed: list[float] = []
     while not (terminated or truncated):
+        started = time.perf_counter()
         action, _ = model.predict(obs, deterministic=True)
+        predicted = time.perf_counter()
         obs, reward, terminated, truncated, info = env.step(action)
+        info = dict(info, policy_seconds=predicted-started, env_step_seconds=time.perf_counter()-predicted)
         total_r += float(reward)
         steps += 1
+        if record is not None:
+            record.step(context or {}, steps, action, reward, terminated, truncated, info,
+                        image=env.get_wrapper_attr("last_raw_obs") if record.capture.maxlen else None)
+        if steps >= max_steps and not (terminated or truncated):
+            raise RuntimeError("Evaluation env must enforce max_steps via TimeLimit")
         abs_cte = float(info.get("abs_cte", 0.0))
         max_cte = max(max_cte, abs_cte)
         cte_sum += abs_cte
@@ -133,11 +150,15 @@ def run_episode(env, model, max_steps: int) -> dict:
         ep_ctes_signed.append(float(info.get("cte", 0.0)))
         cur_lap = int(info.get("lap_count", 0))
         cur_last = float(info.get("last_lap_time", 0.0))
-        if cur_lap > prev_lap and cur_last > 0 and cur_last != last_seen_lap:
+        if cur_lap > prev_lap and cur_last > 0:
             ep_lap_times.append(cur_last)
-            last_seen_lap = cur_last
         prev_lap = cur_lap
     return {
+        "initial_frame": first_frame,
+        "termination_reason": info.get("termination_reason") or ("time_limit" if truncated else "unknown"),
+        "reward": total_r,
+        "lap_times": ep_lap_times,
+        "mean_lap": float(np.mean(ep_lap_times)) if ep_lap_times else 0.0,
         "steps": steps,
         "trunc": bool(truncated and not terminated),
         "mean_cte": cte_sum / max(1, steps),
@@ -154,7 +175,7 @@ def run_episode(env, model, max_steps: int) -> dict:
 
 def main() -> None:
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    validate_args(args)
     # build (label, zip_path, crop_top) specs from --models or --model-dir/--steps
     specs: list[tuple[str, Path, int]] = []
     if args.models:
@@ -173,6 +194,22 @@ def main() -> None:
                               args.encoder_crop_top))
     else:
         raise SystemExit("provide --models or --steps")
+    if not specs or len({lb for lb, _, _ in specs}) != len(specs) or any(not lb for lb, _, _ in specs):
+        raise ValueError("Model labels must be nonempty and unique")
+    files = {lb: path for lb, path, _ in specs}
+    if args.encoder == "vae":
+        files["vae_encoder"] = args.vae_model
+    for _, path, crop in specs:
+        if not 0 <= crop < CAMERA_HEIGHT:
+            raise ValueError("Model crop_top must be in [0, 120)")
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    with EvalRecord(args, files) as record:
+        _evaluate(args, specs, record)
+
+
+def _evaluate(args, specs, record) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     labels = [lb for lb, _, _ in specs]
     crop_of = {lb: cr for lb, _, cr in specs}
 
@@ -183,6 +220,7 @@ def main() -> None:
         if cr not in encoders:
             encoders[cr] = make_encoder(args.encoder, device=device,
                                         vae_checkpoint=args.vae_model, crop_top=cr)
+            record.encoder(encoders[cr])
 
     conf = {"host": args.host, "port": args.port, "cam_resolution": (CAMERA_HEIGHT, CAMERA_WIDTH, 3)}
     base_env = gym.make(args.env_id, conf=conf)
@@ -206,75 +244,88 @@ def main() -> None:
     controller = env.unwrapped.viewer
     scene = controller.handler.SceneToLoad
 
-    models = {}
-    for label, path, cr in specs:
-        if not path.exists():
-            raise FileNotFoundError(path)
-        models[label] = SAC.load(str(path), device=device)
-        print(f"loaded [{label}] crop={cr} {path}")
+    try:
+        models = {}
+        for label, path, cr in specs:
+            if not path.exists():
+                raise FileNotFoundError(path)
+            models[label] = SAC.load(str(path), env=env, device=device)
+            model_args = argparse.Namespace(**vars(args))
+            model_args.encoder_crop_top = cr
+            validate_model_config(models[label], environment_config(model_args))
+            print(f"loaded [{label}] crop={cr} {path}")
 
-    results = {lb: [] for lb in labels}
-    trunc_matrix = []  # per layout: dict label->bool
+        results = {lb: [] for lb in labels}
+        trunc_matrix = []  # per layout: dict label->bool
+        order_rng = np.random.default_rng(args.order_seed)
 
-    for layout in range(1, args.layouts + 1):
-        if layout == 1:
-            # reuse the scene gym.make already loaded; skips a redundant reload
-            print(f"\n===== layout {layout}/{args.layouts}: using initial scene =====", flush=True)
-        else:
+        for layout in range(1, args.layouts + 1):
             print(f"\n===== layout {layout}/{args.layouts}: reloading scene =====", flush=True)
             if not reload_scene(controller, scene):
-                print("  WARNING: reload timed out; reusing current scene for this layout", flush=True)
-        row = {}
+                raise RuntimeError(f"Scene reload failed for layout {layout}; layout not counted")
+            row = {}
+            for order, label in enumerate(order_rng.permutation(labels), 1):
+                dk_env.vae = encoders[crop_of[label]]   # swap encoder crop to this model's
+                res = run_episode(env, models[label], args.max_episode_steps, record,
+                                  {"layout": layout, "model": label})
+                record.episode(dict(res, layout=layout, model=label, order=order))
+                results[label].append(res)
+                row[label] = res["trunc"]
+                tag = "TRUNC" if res["trunc"] else "OUT  "
+                print(f"  [{label:>12}] {tag} steps={res['steps']:5d} "
+                      f"mean_cte={res['mean_cte']:.3f} max_cte={res['max_cte']:.2f} "
+                      f"laps={res['laps']} best_lap={res['best_lap']:.2f}s", flush=True)
+            trunc_matrix.append(row)
+
+        # ---- paired summary ----
+        print("\n\n========== PAIRED SUMMARY (same layouts for all models) ==========")
+        print(f"{'model':>12} | {'trunc':>7} | {'mean_steps':>10} | {'mean_cte':>8} | "
+              f"{'max_cte':>7} | {'mean_spd':>8} | {'laps':>5}")
+        print("-" * 78)
         for label in labels:
-            dk_env.vae = encoders[crop_of[label]]   # swap encoder crop to this model's
-            res = run_episode(env, models[label], args.max_episode_steps)
-            results[label].append(res)
-            row[label] = res["trunc"]
-            tag = "TRUNC" if res["trunc"] else "OUT  "
-            print(f"  [{label:>12}] {tag} steps={res['steps']:5d} "
-                  f"mean_cte={res['mean_cte']:.3f} max_cte={res['max_cte']:.2f} "
-                  f"laps={res['laps']} best_lap={res['best_lap']:.2f}s", flush=True)
-        trunc_matrix.append(row)
+            rs = results[label]
+            n = len(rs)
+            tr = sum(1 for r in rs if r["trunc"])
+            mean_steps = np.mean([r["steps"] for r in rs])
+            mean_cte = np.mean([r["mean_cte"] for r in rs])
+            max_cte = max(r["max_cte"] for r in rs)
+            mean_spd = np.mean([r["mean_speed"] for r in rs])
+            laps = sum(r["laps"] for r in rs)
+            print(f"{label:>12} | {tr:>3}/{n:<3} | {mean_steps:>10.0f} | {mean_cte:>8.3f} | "
+                  f"{max_cte:>7.2f} | {mean_spd:>8.3f} | {laps:>5}")
 
-    # ---- paired summary ----
-    print("\n\n========== PAIRED SUMMARY (same layouts for all models) ==========")
-    print(f"{'model':>12} | {'trunc':>7} | {'mean_steps':>10} | {'mean_cte':>8} | "
-          f"{'max_cte':>7} | {'mean_spd':>8} | {'laps':>5}")
-    print("-" * 78)
-    for label in labels:
-        rs = results[label]
-        n = len(rs)
-        tr = sum(1 for r in rs if r["trunc"])
-        mean_steps = np.mean([r["steps"] for r in rs])
-        mean_cte = np.mean([r["mean_cte"] for r in rs])
-        max_cte = max(r["max_cte"] for r in rs)
-        mean_spd = np.mean([r["mean_speed"] for r in rs])
-        laps = sum(r["laps"] for r in rs)
-        print(f"{label:>12} | {tr:>3}/{n:<3} | {mean_steps:>10.0f} | {mean_cte:>8.3f} | "
-              f"{max_cte:>7.2f} | {mean_spd:>8.3f} | {laps:>5}")
+        # ---- weave summary (steering oscillation; lower |dsteer|/cte_std = calmer) ----
+        print(f"\n{'model':>12} | {'|dsteer|':>8} | {'cte_std':>8} | {'steer_period':>12} | {'cte_period':>10}")
+        print("-" * 62)
+        for label in labels:
+            rs = results[label]
+            sd = np.mean([r["steer_delta"] for r in rs])
+            cstd = np.mean([r["cte_std"] for r in rs])
+            fsp = [r["steer_period"] for r in rs if np.isfinite(r["steer_period"])]
+            fcp = [r["cte_period"] for r in rs if np.isfinite(r["cte_period"])]
+            sp = np.mean(fsp) if fsp else float("inf")
+            cp = np.mean(fcp) if fcp else float("inf")
+            print(f"{label:>12} | {sd:>8.3f} | {cstd:>8.3f} | {sp:>9.1f}st | {cp:>7.1f}st")
 
-    # ---- weave summary (steering oscillation; lower |dsteer|/cte_std = calmer) ----
-    print(f"\n{'model':>12} | {'|dsteer|':>8} | {'cte_std':>8} | {'steer_period':>12} | {'cte_period':>10}")
-    print("-" * 62)
-    for label in labels:
-        rs = results[label]
-        sd = np.mean([r["steer_delta"] for r in rs])
-        cstd = np.mean([r["cte_std"] for r in rs])
-        fsp = [r["steer_period"] for r in rs if np.isfinite(r["steer_period"])]
-        fcp = [r["cte_period"] for r in rs if np.isfinite(r["cte_period"])]
-        sp = np.mean(fsp) if fsp else float("inf")
-        cp = np.mean(fcp) if fcp else float("inf")
-        print(f"{label:>12} | {sd:>8.3f} | {cstd:>8.3f} | {sp:>9.1f}st | {cp:>7.1f}st")
+        # ---- per-layout truncation matrix (shows the comparison is paired) ----
+        print("\n--- per-layout truncation (T=trunc, .=out) ---")
+        header = "layout | " + " ".join(f"{lb:>12}" for lb in labels)
+        print(header)
+        for i, row in enumerate(trunc_matrix, 1):
+            cells = " ".join(f"{'T' if row[lb] else '.':>12}" for lb in labels)
+            print(f"{i:>6} | {cells}")
 
-    # ---- per-layout truncation matrix (shows the comparison is paired) ----
-    print("\n--- per-layout truncation (T=trunc, .=out) ---")
-    header = "layout | " + " ".join(f"{lb:>12}" for lb in labels)
-    print(header)
-    for i, row in enumerate(trunc_matrix, 1):
-        cells = " ".join(f"{'T' if row[lb] else '.':>12}" for lb in labels)
-        print(f"{i:>6} | {cells}")
-
-    env.close()
+        record.finish({label: {
+            "layouts": len(rs), "time_limit_completions": sum(r["trunc"] for r in rs),
+            "mean_steps": float(np.mean([r["steps"] for r in rs])),
+            "mean_abs_cte": float(np.mean([r["mean_cte"] for r in rs])),
+            "max_abs_cte": max(r["max_cte"] for r in rs),
+            "mean_speed": float(np.mean([r["mean_speed"] for r in rs])),
+            "total_laps": sum(r["laps"] for r in rs),
+            "mean_lap": float(np.mean([t for r in rs for t in r["lap_times"]])) if any(r["lap_times"] for r in rs) else None,
+        } for label, rs in results.items()})
+    finally:
+        env.close()
 
 
 if __name__ == "__main__":

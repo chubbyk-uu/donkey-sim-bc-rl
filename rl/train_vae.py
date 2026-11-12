@@ -170,6 +170,7 @@ def main() -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     start_epoch = 0
     metrics: list[dict] = []
+    best_val = float("inf")
 
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
@@ -177,6 +178,12 @@ def main() -> None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = int(checkpoint["epoch"])
         metrics = list(checkpoint.get("metrics", []))
+        best_val = min((float(row["val"]["loss"]) for row in metrics), default=float("inf"))
+        # A newer best.pt may exist when resuming an older checkpoint in-place.
+        best_path = args.output_dir / "best.pt"
+        if best_path.exists():
+            previous = torch.load(best_path, map_location="cpu", weights_only=False)
+            best_val = min(best_val, min((float(row["val"]["loss"]) for row in previous.get("metrics", [])), default=float("inf")))
         print(f"Resumed VAE from {args.resume} at epoch {start_epoch}")
 
     print(
@@ -198,7 +205,6 @@ def main() -> None:
         )
     )
 
-    best_val = float("inf")
     best_path = args.output_dir / "best.pt"
     for epoch in range(start_epoch + 1, args.epochs + 1):
         train_metrics = run_epoch(

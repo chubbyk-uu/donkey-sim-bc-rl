@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import torch
 from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.utils import set_random_seed
 
 try:
     from rl.train_vae_sac import (
+        ConfigCheckpointCallback,
         CappedDynamicGradientStepsCallback,
         DonkeyInfoCallback,
         MAX_STEERING,
@@ -19,8 +20,11 @@ try:
         build_env,
         make_encoder,
     )
+    from rl.experiment import (algorithm_config, environment_config, save_replay_metadata,
+                               validate_args, validate_model_config, validate_replay, write_json)
 except ImportError:
     from train_vae_sac import (
+        ConfigCheckpointCallback,
         CappedDynamicGradientStepsCallback,
         DonkeyInfoCallback,
         MAX_STEERING,
@@ -29,10 +33,12 @@ except ImportError:
         build_env,
         make_encoder,
     )
+    from experiment import (algorithm_config, environment_config, save_replay_metadata,
+                            validate_args, validate_model_config, validate_replay, write_json)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train VAE+SAC on the generated_track loop.")
+    parser = argparse.ArgumentParser(description="Train VAE+SAC on the generated_track loop.", allow_abbrev=False)
     parser.add_argument("--env-id", default="donkey-generated-track-v0")
     parser.add_argument("--host", default=os.environ.get("DONKEY_SIM_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("DONKEY_SIM_PORT", "9091")))
@@ -55,7 +61,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("models/rl_loop_vae_sac_v1"))
     parser.add_argument("--resume-model", type=Path, default=None)
     parser.add_argument("--resume-replay-buffer", type=Path, default=None)
-    parser.add_argument("--timesteps", type=int, default=100_000)
+    parser.add_argument("--allow-legacy-replay-buffer", action="store_true",
+                        help="Allow a buffer without configuration metadata; only use when its rewards and encoder are known to match.")
+    parser.add_argument("--timesteps", type=int, default=100_000,
+                        help="Steps to collect in this invocation; on resume these are ADDITIONAL steps.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
 
@@ -135,6 +144,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    validate_args(args)
+    current_config = environment_config(args)
+    if args.resume_replay_buffer is not None:
+        validate_replay(args.resume_replay_buffer, current_config, args.allow_legacy_replay_buffer)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     set_random_seed(args.seed)
     if args.device == "auto":
@@ -148,11 +161,17 @@ def main() -> None:
     env = build_env(args, vae)
     env.action_space.seed(args.seed)
 
+    try:
+        _train(args, env, device, current_config)
+    finally:
+        env.close()
+
+
+def _train(args, env, device, current_config) -> None:
     hidden = args.hidden_size
     policy_kwargs = {
         "net_arch": {"pi": [hidden, hidden], "qf": [hidden, hidden]},
     }
-    print(f"SAC MLP net_arch: pi/qf = [{hidden}, {hidden}]")
 
     if args.resume_model is not None:
         model = SAC.load(
@@ -161,12 +180,14 @@ def main() -> None:
             device=device,
             tensorboard_log=str(args.output_dir / "tensorboard"),
         )
+        validate_model_config(model, current_config)
         if args.resume_replay_buffer is not None:
             model.load_replay_buffer(str(args.resume_replay_buffer))
             print(f"Loaded replay buffer from {args.resume_replay_buffer}")
         if args.override_learning_rate:
             from stable_baselines3.common.utils import get_schedule_fn
             new_lr = args.learning_rate
+            model.learning_rate = new_lr
             model.lr_schedule = get_schedule_fn(new_lr)
             for opt in [model.actor.optimizer, model.critic.optimizer]:
                 for pg in opt.param_groups:
@@ -196,8 +217,39 @@ def main() -> None:
             device=device,
         )
 
+    model.donkey_config = current_config
+    effective = algorithm_config(model)
+    if args.resume_model is not None:
+        provided = {token.split("=", 1)[0] for token in sys.argv[1:]}
+        for key in ("batch_size", "buffer_size", "learning_starts", "gamma", "tau", "seed"):
+            if "--" + key.replace("_", "-") in provided and getattr(args, key) != effective[key]:
+                raise ValueError(f"On resume --{key.replace('_', '-')} is inherited as {effective[key]}, not {getattr(args, key)}. Remove this flag; changing it requires a fresh run.")
+        inherited = {
+            "learning-rate": (args.learning_rate, effective["learning_rate"]),
+            "train-freq": (args.train_freq, effective["train_freq"][0]),
+            "train-freq-unit": (args.train_freq_unit, effective["train_freq"][1]),
+            "ent-coef": (args.ent_coef, model.ent_coef),
+        }
+        if model.train_freq.unit.value != "episode" or args.gradient_steps_cap <= 0:
+            inherited["gradient-steps"] = (args.gradient_steps, model.gradient_steps)
+        saved_arch = model.policy_kwargs.get("net_arch")
+        inherited["hidden-size"] = (policy_kwargs["net_arch"], saved_arch)
+        for flag, (requested, saved) in inherited.items():
+            if "--" + flag in provided and requested != saved:
+                raise ValueError(f"On resume --{flag} is inherited as {saved!r}, not {requested!r}.")
+    effective["dynamic_gradient_steps"] = {
+        "enabled": model.train_freq.unit.value == "episode" and args.gradient_steps_cap > 0,
+        "floor": args.gradient_steps_min, "cap": args.gradient_steps_cap, "scale": args.gradient_steps_scale,
+    }
+    print(f"Effective SAC configuration: {effective}", flush=True)
+    print(f"Training {args.timesteps} additional steps from {model.num_timesteps}", flush=True)
+    write_json(args.output_dir / "run_config.json", {
+        "requested": vars(args), "environment": current_config, "effective_algorithm": effective,
+        "start_timesteps": model.num_timesteps, "additional_timesteps": args.timesteps,
+    })
+
     callbacks = [
-        CheckpointCallback(
+        ConfigCheckpointCallback(
             save_freq=args.checkpoint_freq,
             save_path=str(args.output_dir),
             name_prefix="sac_loop_vae" if args.encoder == "vae" else f"sac_{args.encoder}",
@@ -206,7 +258,7 @@ def main() -> None:
         ),
         DonkeyInfoCallback(),
     ]
-    if args.gradient_steps_cap is not None and args.gradient_steps_cap > 0:
+    if model.train_freq.unit.value == "episode" and args.gradient_steps_cap is not None and args.gradient_steps_cap > 0:
         callbacks.append(CappedDynamicGradientStepsCallback(
             cap=args.gradient_steps_cap,
             floor=args.gradient_steps_min,
@@ -224,7 +276,7 @@ def main() -> None:
         model.save(str(args.output_dir / "final_model"))
         if args.save_final_replay_buffer:
             model.save_replay_buffer(str(args.output_dir / "final_replay_buffer"))
-        env.close()
+            save_replay_metadata(args.output_dir / "final_replay_buffer.pkl", model)
 
 
 if __name__ == "__main__":

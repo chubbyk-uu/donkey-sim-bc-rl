@@ -20,6 +20,7 @@ Random light + tree-shadow domain randomization §6.14-6.15
 Operational pitfalls and monitoring rules     §7
 Current recommendations                       §8
 Data/model inventory and TODOs                §9-10
+Runtime revalidation / captured failures      §11
 ```
 
 README is the source of truth for current deployment commands and the short model
@@ -1734,9 +1735,11 @@ A/B at the same batch on the same env / seed is still pending.
 
 ### Task-adapted encoder for randomized-environment robustness
 
-§6.14 capped DINOv2's random-layout truncate rate at ~50% with a frozen encoder,
-and showed neither reward tuning nor a bigger frozen encoder (ViT-B) helps. The
-identified next lever: a **task-adapted encoder** — fine-tune DINOv2 (warm-start
+Small historical batches in §6.14 reached ~50% truncate with a frozen encoder;
+reward tuning and a bigger frozen encoder did not improve those runs. This is
+not a proven encoder-only ceiling: §11 adds repeated-layout and captured-failure
+evidence, and state/control limitations remain to be isolated. A candidate lever
+is a **task-adapted encoder** — fine-tune DINOv2 (warm-start
 from a competent policy, low LR, partial unfreeze; needs storing raw images in
 the buffer + encoding in the SB3 features_extractor), or swap in a depth /
 driving-segmentation model that is inherently shadow/lighting-invariant.
@@ -1756,3 +1759,90 @@ seg net (B4 itself fails on the densest dappled shadow and is too slow for the
 - No further reward-weight ablations planned on loop (§6.5 closed the loop).
 - No further hidden-size ablations planned on loop (h64 → h80 → h128 path
   fully explored).
+
+
+## 11. Runtime revalidation and control diagnostics (2026-11-12)
+
+All numbers below were measured locally; no policy was retrained. Simulator
+settings, source snapshots, hashes, telemetry and plots are local-only artifacts
+under `logs/`. The runs do not share reproducible Unity layout seeds.
+
+### Baseline rechecks and recording infrastructure
+
+- WSL2 NAT to the Windows simulator on TCP 9091 works; RTX 5080 CUDA inference
+  works. No network-mode or firewall changes were needed.
+- Fixed-light VAE `v3_h80` 90k: 5/5 at 3000 steps, 76 laps, mean speed 2.826,
+  mean absolute CTE 0.311, mean lap 9.40s. This repeats one fixed scene, not a
+  generalization test. Artifact: `logs/baseline_fixedlight_20261112_093541/`.
+- DINOv2 randomtree v2 50k: 8/12 fresh random-light/tree layouts at 2000 steps,
+  68 laps, layout-mean absolute CTE 0.397, mean lap 13.84s. Artifact:
+  `logs/randomtree_baseline_12layouts_v2_50k/`. This small batch does not establish
+  an improvement over historical batches on different random layouts.
+- Evaluation now records JSON/CSV, exact encoder-input snapshots and optional
+  telemetry/tail clips. Loop resume saves effective settings and checks replay
+  configuration/hash; changed rewards require a fresh buffer. Historical
+  checkpoints remain usable with an explicit missing-metadata warning. VAE
+  resume preserves historical best validation loss. See README for CLI details.
+
+### Repeated-layout diagnostic protocol
+
+Same DINOv2 checkpoint twice per layout (`repeat_a`, `repeat_b`), shuffled order,
+6 fresh layouts, 2000-step cap, CTE limit 2.0, steering-difference parameter 0.2.
+Random light and trees on; random cones off. No scene reload between the two
+repeats. Tail capture retains 120 returned encoder-input frames per episode;
+image writing happens after the episode. These are repeats of one policy,
+not competing models.
+
+| Layout | repeat_a | repeat_b |
+|---|---:|---:|
+| 1 | 2000 / limit | 2000 / limit |
+| 2 | 2000 / limit | 2000 / limit |
+| 3 | 2000 / limit | 911 / CTE |
+| 4 | 2000 / limit | 2000 / limit |
+| 5 | 1502 / CTE | 964 / CTE |
+| 6 | 2000 / limit | 2000 / limit |
+
+9/12 episodes reach the cap, 74 laps total; four layouts succeed twice, one is
+mixed, one fails twice. Do not treat this as twelve independent-layout trials or
+rank `repeat_a` above `repeat_b`: their checkpoint hashes are identical.
+Artifact: `logs/randomtree_control_repeat6_tail120/` (21,377 steps, 1,440 PNG tail
+frames, 12 GIFs, plots/contact sheets under `control_analysis/`).
+
+### Observed evidence and limits
+
+- All three captured failures cross the negative CTE boundary, with no collision
+  telemetry. The visible road/lane lines persist in the terminal images; CTE
+  termination is not equivalent to leaving the whole paved road. Both layout-5
+  failures occur at the same corner (terminal positions about 0.17 Unity units
+  apart), but at different laps/steps. Layout 3 succeeds once and fails once.
+- Tail P95 policy times are about 0.81–0.86ms, encoder 4.7–4.94ms, env step
+  50.5–51.1ms across failures. No failure-adjacent client stall is evident. Env
+  step includes telemetry waiting and encoding: these times do **not** measure
+  network RTT, constant actuation delay or Unity acknowledgement latency.
+- The mapped command often approaches +1 during the final departure. It is a
+  command submitted to the client, not a measured wheel angle. The asynchronous
+  simulator does not acknowledge per-command execution; frame k is returned by
+  `env.step(command k)` and used for the next decision.
+- Offline replay using saved frames plus the previous 20 mapped commands exactly
+  reproduces all 15 sampled next actions (max absolute difference 0). This
+  validates camera/history/policy alignment for those samples, not simulator
+  command-to-frame causality. Script/output: `verify_policy_alignment.py`,
+  `alignment_check.json` inside the artifact directory.
+- A limited offline sensitivity probe freezes command history and applies RGB
+  gains 0.9/1.1 to those 15 frames. Across 30 perturbations, median absolute steer
+  change is 0.0034, maximum 0.536, and no sign flips occur when the original
+  magnitude exceeds 0.2. This is neither a closed-loop result nor a test of local
+  tree-shadow invariance. Script/output: `probe_visual_sensitivity.py`,
+  `brightness_probe.json` in the same directory.
+
+**Interpretation:** current evidence does not establish perception as the sole
+bottleneck, and does not establish control as the sole cause either. Keep the
+segmentation/fine-tuning path as a candidate. Prioritize a probe of whether frozen
+features predict lane deviation/heading, plus a controlled state/speed-input
+comparison, before committing to a heavier encoder training branch. A road-only
+mask should not be assumed to preserve the right-lane target or yellow line.
+
+**Validation:** 17 pytest tests pass, including bounded capture, image-copy and
+index alignment, context isolation, exception capture, and the earlier resume
+regressions. Live Unity capture and offline plot generation also pass. The
+simulator remains in random-light/tree mode after these experiments.
