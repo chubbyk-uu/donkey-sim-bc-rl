@@ -20,9 +20,11 @@ from stable_baselines3.common.utils import set_random_seed
 try:
     from rl.vae import ConvVAE
     from rl.experiment import save_replay_metadata
+    from rl.track_state import TrackState
 except ImportError:
     from vae import ConvVAE
     from experiment import save_replay_metadata
+    from track_state import TrackState
 
 
 CAMERA_HEIGHT = 120
@@ -204,7 +206,7 @@ class FrozenDinoGridEncoder(FrozenPretrainedCnnEncoder):
 
 
 def make_encoder(encoder_name: str, device: torch.device, vae_checkpoint: Path | None = None,
-                 crop_top: int = 0, projection: Path | None = None):
+                 crop_top: int = 0, projection: Path | None = None, track: Path | None = None):
     """Factory: build an encoder by name. Returns object with .encode(obs) and .z_size.
 
     `crop_top` applies to all frozen pretrained encoders (DINOv2, ResNet, MobileNet).
@@ -222,6 +224,10 @@ def make_encoder(encoder_name: str, device: torch.device, vae_checkpoint: Path |
         if projection is None:
             raise ValueError("--encoder-projection is required when --encoder=dinov2_vits14_grid")
         return FrozenDinoGridEncoder(device=device, crop_top=crop_top, projection=projection)
+    if encoder_name == "sim_state":
+        if track is None:
+            raise ValueError("--track-centerline is required when --encoder=sim_state")
+        return TrackState.load(track)
     raise ValueError(f"unsupported encoder: {encoder_name}")
 
 
@@ -370,7 +376,7 @@ class DonkeyVaeSACEnv(gym.Wrapper):
 
         obs, info = self.env.reset(**kwargs)
         self._prev_lap_count = int(info.get("lap_count", 0))
-        return self._build_obs(obs), info
+        return self._build_obs(obs, info), info
 
     def step(self, action):
         self._episode_steps += 1
@@ -403,7 +409,7 @@ class DonkeyVaeSACEnv(gym.Wrapper):
                 "termination_reason": ("simulator" if base_terminated else "cte_limit") if terminated else None,
             }
         )
-        encoded_obs = self._build_obs(obs)
+        encoded_obs = self._build_obs(obs, info)
         info["encoder_seconds"] = self.last_encode_seconds
         return encoded_obs, reward, terminated, truncated, info
 
@@ -427,10 +433,13 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         self.command_history[:-1] = self.command_history[1:]
         self.command_history[-1] = action
 
-    def _build_obs(self, obs: np.ndarray) -> np.ndarray:
+    def _build_obs(self, obs: np.ndarray, info: dict) -> np.ndarray:
         self.last_raw_obs = np.array(obs, copy=True)
         started = time.perf_counter()
-        z = self.vae.encode(self.last_raw_obs)
+        if getattr(self.vae, "uses_telemetry", False):  # ground-truth state instead of the image
+            z = self.vae.encode(self.last_raw_obs, info)
+        else:
+            z = self.vae.encode(self.last_raw_obs)
         self.last_encode_seconds = time.perf_counter() - started
         # Newest first; right after a reset every earlier latent is the first frame.
         self._latents.appendleft(z)

@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--host", default=os.environ.get("DONKEY_SIM_HOST", "127.0.0.1"))
     p.add_argument("--port", type=int, default=int(os.environ.get("DONKEY_SIM_PORT", "9091")))
     p.add_argument("--encoder",
-                   choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14", "dinov2_vits14_grid"],
+                   choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14", "dinov2_vits14_grid", "sim_state"],
                    default="dinov2_vits14")
     p.add_argument("--encoder-crop-top", type=int, default=0)
     p.add_argument("--encoder-projection", type=Path, default=None,
@@ -67,6 +67,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--latent-lags", type=parse_lags, default=(),
                     help="Also give the policy the latent from this many steps ago, e.g. '2,4'. "
                          "MUST match training.")
+    p.add_argument("--track-centerline", type=Path, default=None,
+                   help="Centre line from tools/fit_track_centerline.py; required for sim_state, "
+                        "which feeds the policy simulator ground truth instead of the image.")
     p.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_fixedlight_v1/best.pt"))
     p.add_argument("--model-dir", type=Path, default=None,
                    help="Directory holding sac_{encoder}_{step}_steps.zip checkpoints. "
@@ -201,6 +204,8 @@ def main() -> None:
         files["vae_encoder"] = args.vae_model
     if args.encoder_projection is not None:
         files["encoder_projection"] = args.encoder_projection
+    if args.track_centerline is not None:
+        files["track_centerline"] = args.track_centerline
     for _, path, crop in specs:
         if not 0 <= crop < CAMERA_HEIGHT:
             raise ValueError("Model crop_top must be in [0, 120)")
@@ -229,7 +234,8 @@ def _evaluate(args, specs, record) -> None:
         key = (model_args.encoder, model_args.encoder_crop_top)
         if key not in encoders:
             encoders[key] = make_encoder(key[0], device=device, vae_checkpoint=args.vae_model,
-                                         crop_top=key[1], projection=args.encoder_projection)
+                                         crop_top=key[1], projection=args.encoder_projection,
+                                         track=args.track_centerline)
             record.encoder(encoders[key])
         observation[label] = (encoders[key], model_args.latent_lags)
         print(f"loaded [{label}] encoder={key[0]} crop={key[1]} latent_lags={model_args.latent_lags} {path}")

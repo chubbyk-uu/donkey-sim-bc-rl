@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate VAE+SAC on the generated_track loop.")
     parser.add_argument("--model", type=Path, default=Path("models/rl_loop_vae_sac_fixedlight_v3_h80/sac_loop_vae_90000_steps.zip"))
     parser.add_argument("--encoder",
-                        choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14", "dinov2_vits14_grid"],
+                        choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14", "dinov2_vits14_grid", "sim_state"],
                         default="vae",
                         help="Image encoder. Must match what the SAC model was trained with.")
     parser.add_argument("--encoder-crop-top", type=int, default=0,
@@ -66,6 +66,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-lags", type=parse_lags, default=(),
                          help="Also give the policy the latent from this many steps ago, e.g. '2,4'. "
                               "MUST match training.")
+    parser.add_argument("--track-centerline", type=Path, default=None,
+                        help="Centre line from tools/fit_track_centerline.py; required for sim_state, "
+                             "which feeds the policy simulator ground truth instead of the image.")
     parser.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_fixedlight_v1/best.pt"),
                         help="Only used when --encoder=vae.")
     parser.add_argument("--env-id", default="donkey-generated-track-v0")
@@ -125,7 +128,8 @@ def _evaluate(args, record) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     vae = make_encoder(args.encoder, device=device, vae_checkpoint=args.vae_model,
-                       crop_top=args.encoder_crop_top, projection=args.encoder_projection)
+                       crop_top=args.encoder_crop_top, projection=args.encoder_projection,
+                       track=args.track_centerline)
     record.encoder(vae)
     print(f"Encoder: {args.encoder}  z_size={vae.z_size}  crop_top={args.encoder_crop_top}")
     conf = {"host": args.host, "port": args.port, "cam_resolution": (CAMERA_HEIGHT, CAMERA_WIDTH, 3)}

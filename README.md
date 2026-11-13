@@ -504,6 +504,8 @@ rl/
                                       mix dirs/crops in one paired run; also reports weave
   experiment.py                       argument/checkpoint/replay contracts and the
                                       evaluation record (JSON/CSV, telemetry, tail capture)
+  track_state.py                      --encoder sim_state: simulator ground truth (position on the
+                                      road, speed, road ahead) as the observation; a diagnostic
   eval_vae_sac.py                     legacy single generated-road evaluation
   vae.py, vae_dataset.py              ConvVAE model and memmap dataset
 
@@ -524,6 +526,8 @@ tools/
   summarize_paired_eval.py            confidence intervals / paired tests for a paired-eval run
   probe_state_from_features.py        can cte / lateral drift be regressed from encoder features
                                       (CLS vs patch tokens) on unseen layouts; uses captured frames
+  fit_grid_projection.py              PCA projection for --encoder dinov2_vits14_grid
+  fit_track_centerline.py             recover the track centre line from telemetry (for sim_state)
   probe_depth_seg.py                  depth + Cityscapes segmentation probe on sim frames
   extract_cornering_segments.py       BC: cut cornering segments out of tubs
   diag_official_categorical.py        BC: categorical model diagnostics

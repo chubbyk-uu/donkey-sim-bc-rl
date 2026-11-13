@@ -479,6 +479,8 @@ rl/
   eval_paired_randomized.py           在同一批 random layouts 上比较模型，避免 layout luck
   experiment.py                       参数/检查点/replay 校验，以及评估记录
                                       （JSON/CSV、遥测、尾部画面捕获）
+  track_state.py                      --encoder sim_state：用 simulator 真值（车在路上的位置、
+                                      车速、前方道路）作观测；仅用于诊断
   eval_vae_sac.py                     legacy single generated-road 评估
   vae.py, vae_dataset.py              ConvVAE 模型与 memmap 数据集
 
@@ -499,6 +501,8 @@ tools/
   summarize_paired_eval.py            paired 评估结果的置信区间 / 配对检验
   probe_state_from_features.py        在未见过的布局上，从编码器特征（CLS / patch token）
                                       线性回归 CTE 和横向漂移；使用评估捕获的画面
+  fit_grid_projection.py              为 --encoder dinov2_vits14_grid 拟合 PCA 投影
+  fit_track_centerline.py             从遥测数据恢复赛道中心线（供 sim_state 使用）
   probe_depth_seg.py                  在 sim 画面上跑深度 + Cityscapes 分割探针
   extract_cornering_segments.py       BC：从 tub 中截取弯道片段
   diag_official_categorical.py        BC：categorical 模型诊断

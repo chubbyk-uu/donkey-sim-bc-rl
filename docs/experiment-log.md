@@ -22,6 +22,7 @@ Current recommendations                       §8
 Data/model inventory and TODOs                §9-10
 Runtime revalidation / captured failures      §11
 Laps baseline, state probe, simulator speed-up §12
+Ground-truth state policy against vision, paired evaluation §13
 ```
 
 README is the source of truth for current deployment commands and the short model
@@ -1771,6 +1772,11 @@ projection from `tools/fit_grid_projection.py`). One run of it
 (`models/rl_loop_dinov2_grid_lags_v1`) and one class-token control with the same
 recipe and simulator setting (`models/rl_loop_dinov2_cls_ctrl_ts2_v1`) are
 trained to 60k steps. **Neither has been evaluated**; there is no result yet.
+Evaluated 2026-11-13 (§13): grid + lags 50k is **not** better than v2 50k (5.04
+against 6.08 laps, 10/24 against 31/40 completed). It beats its own control, but
+that control checkpoint is far below v2 50k with the same recipe, so the pair
+says little about the observation. A run with simulator ground truth as the
+observation laps 32% faster than v2 50k (§13); next is using it as a teacher.
 
 ### Reproducible layouts and more throughput
 
@@ -2024,3 +2030,122 @@ pooled patch tokens are a second, independent lever.
   (`--port`), the protocol's synchronous `step_mode`.
 
 **Validation:** 25 pytest tests pass (paired statistics, latent lags and per-model observation in paired evaluation added).
+
+---
+
+## 13. Ground-truth state policy: is perception the limit? (2026-11-12/13)
+
+**Status: trained and evaluated once (one seed per run, 24 paired layouts).**
+Short answer: perception limits speed; it is not shown to limit completion.
+
+### Question and setup
+
+Two observation changes in one day (§10 status) gave similar training curves, so
+the limit might be the SAC and control setup rather than what the policy sees.
+Test: same recipe, simulator setting and seed as the class-token control, but
+the observation is ground truth instead of the image
+(`--encoder sim_state --track-centerline models/track_centerline/generated_track.npz`,
+`rl/track_state.py`): CTE, heading error, forward and sideways speed, yaw rate,
+and six centre-line points 0.3 to 3.0 position units ahead in the car's frame
+(18 numbers) plus the usual 20-step command history. The run configurations
+differ only in the encoder.
+
+The simulator does not report the track, so `tools/fit_track_centerline.py`
+recovers the centre line from telemetry of four §12 runs (223,542 points): 534
+points, 26.7 position units per lap, 360 degrees of turning, tightest radius
+0.85. Its signed distance times 7.98 reproduces the simulator's CTE with
+R2 = 0.967 (MAE 0.06, up to about 0.15 off inside bends, exact on straights).
+So the CTE limit of 2.0 is 0.25 position units. Telemetry conventions found on
+the way: `vel` is in the car's frame (x sideways, z forward), yaw is `car[2]`
+(0 faces +z, grows towards +x), `gyro[1]` is the yaw rate, positive CTE is right
+of centre, and the track geometry is identical in every layout.
+
+### Training-time comparison (stochastic actions; not an evaluation)
+
+| Run (60k steps each) | Laps logged | Lap time, steps 50-60k (median / best in run) | Steps 50-60k spent in full 2000-step episodes | Mean throttle / forward speed, steps 40-50k |
+|---|---:|---:|---:|---:|
+| Ground truth (`models/rl_loop_sim_state_ts2_v1`) | 203 | 9.27 s / 8.98 s | 88% (4 of 5 episodes) | 0.47 / 2.56 |
+| Class token control (`models/rl_loop_dinov2_cls_ctrl_ts2_v1`) | 146 | 11.88 s / 10.82 s | 40% (2 of 17) | 0.28 / 1.89 |
+| Grid + lags 2,4 (`models/rl_loop_dinov2_grid_lags_v1`) | 132 | 12.89 s / 11.78 s | 39% (2 of 14) | 0.27 / 1.92 |
+
+Source: `monitor.csv` and `train.log` in each model directory.
+
+- The ground-truth run was **behind** both vision runs until about 40k steps
+  (mean episode length 214 against 320 and 366 at 20-30k). No episode passed 255
+  steps before 34k; at 20-30k, 32 of 47 episodes ended at 225-255 steps, one lap
+  (about 10.6 s from standstill, 212 steps) plus about 28 steps. At its speed that is the first
+  right-hand bend after the start line taken at full speed, the tightest on the
+  track and the largest cluster of v2 50k failures (§12 runs: centre-line index
+  71-79 of 534). The position is inferred from timing, not telemetry. Minimum
+  throttle is 0.2, so slowing for that bend means lifting early on the straight.
+- Once past it, the last six episodes are 2000, 1126, 2000, 2000, 2000, 2000
+  steps, at lap times about 22% below the control.
+- The vision policies sit near minimum throttle (0.27-0.28); the ground-truth
+  policy uses 0.47. Mean |steering change| per step is about 0.28-0.32 in all
+  three, so the jerky steering is not caused by vision.
+- All 22 v2 50k failures in the two 40-layout §12 runs end at CTE of about -2:
+  off the outside of a right-hand bend.
+
+### Paired evaluation of the 50k checkpoints (2026-11-13)
+
+`logs/paired_state_vs_vision_24layouts/`: 24 fresh random-light/tree layouts,
+each model once per layout in random order, 2000-step cap, time scale 2 with FPS
+limit 120 (step interval median 25.0 ms, p5-p95 23.7-26.2 for all three).
+
+| Model | Laps (95% CI) | Completed (95% CI) | Flying lap time | Mean speed | Mean throttle | Mean abs steering change |
+|---|---:|---:|---:|---:|---:|---:|
+| Ground truth 50k | 9.42 (8.50-10.00) | 21/24 = 88% (69-96%) | 9.18 s | 2.89 | 0.44 | 0.26 |
+| Grid + lags 50k | 5.04 (4.04-5.96) | 10/24 = 42% (24-61%) | 12.97 s | 1.99 | 0.25 | 0.29 |
+| Class token control 50k | 1.92 (0.92-3.04) | 4/24 = 17% (7-36%) | 12.29 s | 1.97 | 0.29 | 0.31 |
+| v2 50k, §12 run at the same setting (unpaired, 40 layouts) | 6.08 (5.42-6.62) | 31/40 = 78% (62-88%) | 13.47 s | | | |
+
+Flying lap time excludes each episode's first lap (standing start).
+
+- Ground truth against the vision models on the same layouts: +4.38 laps over
+  grid + lags (CI +2.96 to +5.67; 13 layouts only it completed, 2 only the
+  other, p=0.007) and +7.50 over the control (CI +5.92 to +8.79; 18 against 1).
+- Ground truth against v2 50k (unpaired): +3.34 laps (CI +2.28 to +4.28) and
+  lap time 32% lower. **Completion is not distinguishable**: 21/24 against
+  31/40, Fisher p=0.51. Every completed ground-truth episode is exactly 10 laps;
+  the gain is speed.
+- How it is faster: it lifts to throttle 0.22-0.26 from about 1 position unit
+  before the start line until the apex of the first bend (speed 3.4 down to
+  2.4), then uses 0.6-0.7 on exits. Before that bend it moves from the right
+  (+0.5 CTE) to the left (-0.8 mean). The vision policies hold throttle near the
+  0.2 floor all lap.
+- Its three failures are the same event: CTE -2.03 at centre-line index 41-48
+  of 534, on that move to the left just before the first bend, at speed 2.8,
+  after 2, 4 and 10 laps (3 of about 230 passes). The fitted centre line agrees
+  with the simulator's CTE to 0.01 there, so a wrong lateral offset is not the
+  cause; the 3-degree heading kink at the start line 2 units earlier is not
+  excluded as a contributor.
+- Steering stays jerky with perfect perception (0.26 per step against
+  0.29-0.31), so that belongs to the control setup.
+- Grid + lags 50k against v2 50k (unpaired): laps -1.03 (CI -2.16 to +0.10),
+  completion 10/24 against 31/40 (Fisher p=0.007). No support for that
+  observation change. 10 of its 14 failures are at CTE +2 (right side); every
+  control and v2 50k failure is at -2.
+- The control 50k has the v2 recipe yet scores 1.92 laps against 6.08. It was
+  trained at time scale 2 (v2 at 1) and its 40-50k training window was its worst
+  (no full episode). Run or checkpoint variance and training time scale are not
+  separated. A single trained run per variant cannot rank observation changes.
+- The ground-truth policy's own compute is 0.08 ms per step against 3.8-3.9 ms
+  for the image encoders (about 8 ms of simulated time at time scale 2).
+
+### What it does and does not show
+
+- Shown (one seed): with the same SAC recipe, action limits and reward, perfect
+  perception gives a policy that brakes for bends and laps 32% faster than the
+  best vision checkpoint. The speed ceiling of the vision policies is on the
+  perception side, not in SAC or the reward.
+- Not shown: that perfect perception makes driving more reliable. 88% against
+  78% is within noise, and the failures come from one aggressive spot.
+- Open: hidden size was left at 256 (a smaller network was not tried); the
+  ground-truth run stalled for about 20k steps at the first bend before learning
+  to lift early; one seed.
+
+**Next:** use the ground-truth policy as a teacher for a vision policy (it can
+label any state reached during training from telemetry). First check offline
+whether the frozen image features can predict the teacher's action.
+
+**Validation:** 27 pytest tests pass (track state and its checkpoint contract added).

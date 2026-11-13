@@ -189,6 +189,8 @@ def validate_args(args) -> None:
         raise ValueError("--latent-lags must be positive step counts")
     if getattr(args, "encoder", "vae").endswith("_grid") and getattr(args, "encoder_projection", None) is None:
         raise ValueError("--encoder-projection is required for a grid encoder")
+    if getattr(args, "encoder", "vae") == "sim_state" and getattr(args, "track_centerline", None) is None:
+        raise ValueError("--track-centerline is required for the sim_state encoder")
     if getattr(args, "resume_replay_buffer", None) and not getattr(args, "resume_model", None):
         raise ValueError("--resume-replay-buffer requires --resume-model")
     if getattr(args, "gradient_steps_cap", 0) > 0:
@@ -214,6 +216,8 @@ def environment_config(args) -> dict:
     # Added only when used, so configurations saved before these existed still compare equal.
     if encoder.endswith("_grid"):
         observation["projection_sha256"] = sha256(args.encoder_projection)
+    if encoder == "sim_state":
+        observation["centerline_sha256"] = sha256(args.track_centerline)
     if getattr(args, "latent_lags", ()):
         observation["latent_lags"] = list(args.latent_lags)
     return {
@@ -345,7 +349,7 @@ class EvalRecord:
     def encoder(self, encoder):
         """Record the actual tensors, including cached pretrained weights."""
         digest = hashlib.sha256()
-        for name, tensor in sorted(encoder.model.state_dict().items()):
+        for name, tensor in sorted(getattr(encoder, "model", encoder).state_dict().items()):
             array = tensor.detach().cpu().contiguous().numpy()
             digest.update(f"{name}:{array.dtype}:{array.shape}".encode())
             digest.update(array.tobytes())

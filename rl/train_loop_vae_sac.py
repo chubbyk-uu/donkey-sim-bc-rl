@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=os.environ.get("DONKEY_SIM_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("DONKEY_SIM_PORT", "9091")))
     parser.add_argument("--encoder",
-                        choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14", "dinov2_vits14_grid"],
+                        choices=["vae", "resnet18", "mobilenet_v3_small", "dinov2_vits14", "dinov2_vitb14", "dinov2_vits14_grid", "sim_state"],
                         default="vae",
                         help="Image encoder. 'vae' uses --vae-model checkpoint; "
                              "'resnet18' / 'mobilenet_v3_small' use frozen ImageNet-pretrained weights; "
@@ -61,6 +61,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-lags", type=parse_lags, default=(),
                          help="Also give the policy the latent from this many steps ago, e.g. '2,4'. "
                               "MUST match training.")
+    parser.add_argument("--track-centerline", type=Path, default=None,
+                        help="Centre line from tools/fit_track_centerline.py; required for sim_state, "
+                             "which feeds the policy simulator ground truth instead of the image.")
     parser.add_argument("--vae-model", type=Path, default=Path("models/vae_loop_cones_fixedlight_v1/best.pt"),
                         help="Only used when --encoder=vae.")
     parser.add_argument("--output-dir", type=Path, default=Path("models/rl_loop_vae_sac_v1"))
@@ -167,7 +170,8 @@ def main() -> None:
         device = torch.device(args.device)
 
     vae = make_encoder(args.encoder, device=device, vae_checkpoint=args.vae_model,
-                       crop_top=args.encoder_crop_top, projection=args.encoder_projection)
+                       crop_top=args.encoder_crop_top, projection=args.encoder_projection,
+                       track=args.track_centerline)
     print(f"Encoder: {args.encoder}  z_size={vae.z_size}  crop_top={args.encoder_crop_top}  latent_lags={args.latent_lags}")
     env = build_env(args, vae)
     env.action_space.seed(args.seed)

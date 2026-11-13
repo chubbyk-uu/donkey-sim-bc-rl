@@ -14,6 +14,7 @@ from rl.experiment import (
     validate_model_config, validate_replay,
 )
 from rl.train_vae_sac import CappedDynamicGradientStepsCallback, ConfigCheckpointCallback, DonkeyVaeSACEnv
+from rl.track_state import LOOKAHEAD, TrackState
 from rl.eval_paired_randomized import run_episode
 
 
@@ -24,7 +25,7 @@ def arguments(tmp_path):
         env_id="test", host="127.0.0.1", port=9091, encoder="vae", vae_model=vae, encoder_crop_top=0,
         n_command_history=20, min_throttle=.2, max_throttle=.7,
         max_steering=1., max_steering_diff=.2, max_cte_error=2., cte_target=0.,
-        cte_speed_penalty_weight=.25, encoder_projection=None, latent_lags=(),
+        cte_speed_penalty_weight=.25, encoder_projection=None, latent_lags=(), track_centerline=None,
         output_dir=tmp_path / "eval", save_telemetry=True, episodes=1,
     )
 
@@ -448,3 +449,53 @@ def test_paired_evaluation_gives_each_model_its_own_observation(tmp_path, monkey
             paired._evaluate(args, [("old", "old.zip", 0), ("new", "new.zip", 0)], record)
     assert shapes == {"old": (3 + 40,), "new": (9 + 40,)}
     assert made == [("dinov2_vits14", 0)]  # same encoder and crop: built once, shared
+
+
+def circle_track(radius=5.0, points=628):  # 0.05 apart, like the fitted line
+    """Clockwise circle seen from above, the direction the generated track runs."""
+    angle = np.linspace(0, 2 * np.pi, points, endpoint=False)
+    return TrackState(np.stack([radius * np.sin(angle), radius * np.cos(angle)], axis=1), cte_per_unit=8.0)
+
+
+def test_track_state_reports_offset_heading_and_road_ahead_in_the_car_frame():
+    track = circle_track()
+    # At the top of the circle the track runs towards +x (yaw 90). Car 0.1 outside it, on the left of a right-hand bend.
+    index, right, heading = track.locate([0.0, 5.1], 90.0)
+    assert index == 0 and right == pytest.approx(-0.1) and heading == pytest.approx(0.0, abs=0.02)
+    assert track.locate([0.0, 5.1], 100.0)[2] == pytest.approx(np.radians(10.0), abs=0.02)  # nose pointing right
+    assert abs(track.locate([0.0, 5.1], 270.0)[2]) == pytest.approx(np.pi, abs=0.02)  # facing backwards, same spot
+    info = {"pos": (0.0, 0.0, 5.1), "car": (0.0, 0.0, 90.0), "cte": -0.8, "vel": (0.05, 0.0, 2.0), "gyro": (0.0, 0.5, 0.0)}
+    features = track.encode(None, info)
+    assert features.shape == (track.z_size,) and features.dtype == np.float32
+    assert features[:6] == pytest.approx([-0.4, 0.0, 1.0, 1.0, 0.2, 0.25], abs=0.02)
+    ahead = features[6:].reshape(-1, 2)
+    assert (ahead[:, 0] > 0).all()  # the road is to the right of a car that is left of centre in a right-hand bend
+    centred = track.encode(None, dict(info, pos=(0.0, 0.0, 5.0)))[6:].reshape(-1, 2)
+    # On the centre line of a circle of radius 5 a point d ahead is about d*d/10 to the right and d forward.
+    assert centred[:, 0] == pytest.approx([d / 10 for d in LOOKAHEAD], abs=0.03)
+    assert centred[:3, 1] == pytest.approx(1.0, abs=0.05)
+
+
+def test_ground_truth_observation_reaches_the_policy_and_is_part_of_the_contract(tmp_path):
+    track = circle_track()
+    infos = iter([{"pos": (0.0, 0.0, 5.0), "car": (0.0, 0.0, 90.0), "cte": 0.0, "vel": (0.0, 0.0, 0.0), "gyro": (0.0, 0.0, 0.0)},
+                  {"pos": (0.2, 0.0, 5.05), "car": (0.0, 0.0, 95.0), "cte": -0.5, "vel": (0.0, 0.0, 2.0), "gyro": (0.0, 0.2, 0.0)}])
+    base = Mock(spec=gym.Env)
+    base.reset.side_effect = lambda **kwargs: (np.zeros((120, 160, 3), np.uint8), next(infos))
+    base.step.side_effect = lambda action: (np.zeros((120, 160, 3), np.uint8), 0.0, False, False, next(infos))
+    env = DonkeyVaeSACEnv(base, vae=track, n_command_history=2)
+    first, _ = env.reset()
+    second, *_ = env.step(np.zeros(2, np.float32))
+    assert env.observation_space.shape == (track.z_size + 4,) == first.shape
+    assert first[0] == 0.0 and second[0] == pytest.approx(-0.25) and second[3] == pytest.approx(1.0)
+
+    args = arguments(tmp_path)
+    args.encoder = "sim_state"
+    with pytest.raises(ValueError, match="track-centerline"):
+        validate_args(args)
+    args.track_centerline = tmp_path / "track.npz"
+    args.track_centerline.write_bytes(b"one track")
+    saved = SimpleNamespace(donkey_config=environment_config(args))
+    args.track_centerline.write_bytes(b"another track")
+    with pytest.raises(ValueError, match="observation mismatch"):
+        validate_model_config(saved, environment_config(args))
