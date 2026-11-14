@@ -117,6 +117,10 @@ def main() -> None:
     files = {"policy": args.model}
     if args.encoder == "vae":
         files["vae"] = args.vae_model
+    if args.encoder_projection is not None:
+        files["encoder_projection"] = args.encoder_projection
+    if args.track_centerline is not None:
+        files["track_centerline"] = args.track_centerline
     for path in files.values():
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -131,7 +135,7 @@ def _evaluate(args, record) -> None:
                        crop_top=args.encoder_crop_top, projection=args.encoder_projection,
                        track=args.track_centerline)
     record.encoder(vae)
-    print(f"Encoder: {args.encoder}  z_size={vae.z_size}  crop_top={args.encoder_crop_top}")
+    print(f"Encoder: {args.encoder}  z_size={vae.z_size}  crop_top={args.encoder_crop_top}  latent_lags={args.latent_lags}")
     conf = {"host": args.host, "port": args.port, "cam_resolution": (CAMERA_HEIGHT, CAMERA_WIDTH, 3)}
     base_env = gym.make(args.env_id, conf=conf)
     env = DonkeyVaeSACEnv(

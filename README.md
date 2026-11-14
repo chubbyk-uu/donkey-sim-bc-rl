@@ -10,17 +10,14 @@ camera image → (crop) → encoder → SAC policy → steer / throttle
 Detailed experiment history and design decisions: [docs/experiment-log.md](docs/experiment-log.md)
 Chinese README: [README-CN.md](README-CN.md)
 
-**Status (2026-11-12): baselines rechecked; control diagnostics added.** The project now has working BC
+**Status (2026-11-13): random-layout baselines, feature probes, and ground-truth state ceiling completed.** The project has working BC
 baselines, a single generated-road VAE+SAC baseline, fixed-light loop deployments,
-a Mountain DINOv2 deployment, and a documented domain-randomization study for
+a Mountain DINOv2 deployment, and a domain-randomization study for
 random light + tree shadows. The strongest fixed-light loop policies still use a
 track-specific VAE; DINOv2 is the best frozen encoder for lighting/domain changes.
-Random-layout reliability remains partial. A task-adapted encoder is a candidate,
-but repeated-layout tests also show trajectory variability and difficult corners;
-perception versus state/control limitations have not been isolated. The latest
-fresh-layout batch reached 8/12 time limits; a separate six-layout repeat
-probe reached 9/12 episodes (correlated repeats, not twelve independent layouts).
-See [the dated diagnostic results](docs/experiment-log.md#11-runtime-revalidation-and-control-diagnostics-2026-11-12).
+At the standard simulator setting (Time scale 2, FPS limit 120), `rl_loop_dinov2_randomtree_v2` 50k averages 6.08 laps per episode (31/40 = 78% completed).
+Offline feature probes show that 4x4 pooled DINOv2 patch tokens halve CTE error compared to the class token, and a diagnostic policy trained on simulator ground-truth state (`--encoder sim_state`) laps 32% faster (9.18s vs 13.47s, 9.42 laps, 21/24 completed) while still exhibiting control-side steering weave on the start straight.
+See [experiment log §11–§13](docs/experiment-log.md#11-runtime-revalidation-and-control-diagnostics-2026-11-12).
 
 ---
 
@@ -528,6 +525,7 @@ tools/
                                       (CLS vs patch tokens) on unseen layouts; uses captured frames
   fit_grid_projection.py              PCA projection for --encoder dinov2_vits14_grid
   fit_track_centerline.py             recover the track centre line from telemetry (for sim_state)
+  probe_teacher_action.py             offline probe: can image features + motion predict the sim_state teacher's action
   probe_depth_seg.py                  depth + Cityscapes segmentation probe on sim frames
   extract_cornering_segments.py       BC: cut cornering segments out of tubs
   diag_official_categorical.py        BC: categorical model diagnostics

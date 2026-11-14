@@ -9,15 +9,14 @@ camera image -> (crop) -> encoder -> SAC policy -> steer / throttle
 
 详细实验过程、失败分支和设计原因见：[docs/experiment-log.md](docs/experiment-log.md)。
 
-**当前状态（2026-11-12）：基线已复测，已补充控制诊断。** 项目已有可运行的 BC 基线、最早
+**当前状态（2026-11-13）：已完成大样本随机布局基线、视觉特征探针与真值状态上限验证。** 项目已有可运行的 BC 基线、最早
 single generated-road VAE+SAC 基线、fixed-light loop 部署模型、Mountain DINOv2
 部署模型，以及 random light + tree shadows 的 domain-randomization 实验记录。
 fixed-light loop 上最强模型仍是 track-specific VAE；需要光照/外观泛化时，DINOv2
-是目前最好的 frozen encoder。随机场景可靠性仍未解决。任务适配编码器值得尝试，
-但重复布局测试也发现轨迹变化和困难弯道，尚未分离感知与状态/控制方面的限制。
-最新一批重新加载的12个布局中8个跑满；另一组六布局双次复测为9/12 episode跑满，
-后者存在组内相关性，不能当作12个独立布局。详见
-[本次诊断记录](docs/experiment-log.md#11-runtime-revalidation-and-control-diagnostics-2026-11-12)。
+是目前最好的 frozen encoder。在标准模拟器设置（Time scale 2, FPS limit 120）下，
+`rl_loop_dinov2_randomtree_v2` 50k 在 40 个随机布局上平均跑出 6.08 圈/episode（完赛率 31/40 = 78%）。
+离线特征探针表明，DINOv2 4x4 池化 patch 特征相比 CLS token 将 CTE 预测误差减半；使用模拟器真值状态（`--encoder sim_state`）训练的诊断策略圈速比视觉策略快 32%（9.18s vs 13.47s，平均 9.42 圈，21/24 完赛），但仍在起点直道存在控制侧引起的转向摆头（weave）。详见
+[实验记录 §11–§13](docs/experiment-log.md#11-runtime-revalidation-and-control-diagnostics-2026-11-12)。
 
 ---
 
@@ -503,6 +502,7 @@ tools/
                                       线性回归 CTE 和横向漂移；使用评估捕获的画面
   fit_grid_projection.py              为 --encoder dinov2_vits14_grid 拟合 PCA 投影
   fit_track_centerline.py             从遥测数据恢复赛道中心线（供 sim_state 使用）
+  probe_teacher_action.py             离线探针：检验图像特征 + 运动状态能否预测真值 teacher 的动作
   probe_depth_seg.py                  在 sim 画面上跑深度 + Cityscapes 分割探针
   extract_cornering_segments.py       BC：从 tub 中截取弯道片段
   diag_official_categorical.py        BC：categorical 模型诊断

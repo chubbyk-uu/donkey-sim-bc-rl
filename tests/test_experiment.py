@@ -499,3 +499,71 @@ def test_ground_truth_observation_reaches_the_policy_and_is_part_of_the_contract
     args.track_centerline.write_bytes(b"another track")
     with pytest.raises(ValueError, match="observation mismatch"):
         validate_model_config(saved, environment_config(args))
+
+
+def test_eval_record_hashes_grid_projection_and_records_auxiliary_files(tmp_path, monkeypatch):
+    from rl import eval_loop_vae_sac as loop_eval
+    args = arguments(tmp_path)
+    trunk = torch.nn.Linear(2, 2)
+    first = SimpleNamespace(model_name="dinov2_vits14_grid", z_size=2, crop_top=0, model=trunk,
+                            projection=(torch.zeros(2), torch.eye(2), torch.ones(2)))
+    second = SimpleNamespace(model_name="dinov2_vits14_grid", z_size=2, crop_top=0, model=trunk,
+                             projection=(torch.ones(2), torch.eye(2), torch.ones(2)))
+    with EvalRecord(args, {}) as record:
+        record.encoder(first)
+        record.encoder(second)
+    encoders = json.loads((args.output_dir / "metadata.json").read_text())["encoders"]
+    assert encoders[0]["state_sha256"] != encoders[1]["state_sha256"]
+
+    policy = tmp_path / "policy.zip"
+    projection = tmp_path / "pca.pt"
+    track = tmp_path / "track.npz"
+    for path in (policy, projection, track):
+        path.write_bytes(path.name.encode())
+    loop_args = argparse.Namespace(**dict(vars(args), model=policy, encoder="dinov2_vits14_grid",
+                                          encoder_projection=projection, track_centerline=track,
+                                          output_dir=tmp_path / "loop_eval"))
+    monkeypatch.setattr(loop_eval, "parse_args", lambda: loop_args)
+    monkeypatch.setattr(loop_eval, "_evaluate", lambda a, r: None)
+    loop_eval.main()
+    files = json.loads((loop_args.output_dir / "metadata.json").read_text())["files"]
+    assert set(files) == {"policy", "encoder_projection", "track_centerline"}
+
+
+def test_verify_policy_alignment_handles_lagged_and_telemetry_encoders(tmp_path, monkeypatch):
+    import sys
+    from tools import verify_policy_alignment as verify
+    run = tmp_path / "run"
+    args = arguments(tmp_path)
+    args.output_dir = run
+    args.capture_tail_steps = 5
+    args.n_command_history = 1
+    args.encoder = "dinov2_vits14_grid"
+    args.latent_lags = [1, 2]
+    args.encoder_projection = tmp_path / "pca.pt"
+    args.encoder_projection.write_bytes(b"pca")
+    policy = tmp_path / "policy.zip"
+    policy.write_bytes(b"policy")
+    with EvalRecord(args, {"policy": policy, "encoder_projection": args.encoder_projection}) as record:
+        for step in range(1, 5):
+            # Observation for step+1 is [z(step), z(step-1), z(step-2), steer(step), throttle(step)].
+            expected_obs = np.array([step * 10, max(1, step - 1) * 10, max(1, step - 2) * 10, 0.1 * step, 0.2], np.float32)
+            next_action = [float(expected_obs.sum()), -0.5]
+            action = [0.0, 0.0] if step == 1 else prev_next_action  # noqa: F821
+            prev_next_action = next_action
+            image = np.full((4, 4, 3), step * 10, np.uint8)
+            record.step({"episode": 1}, step, action, 1.0, step == 4, False,
+                        {"cte": 0.0, "rl_steer": 0.1 * step, "rl_throttle": 0.2}, image=image)
+        record.episode({"episode": 1, "steps": 4, "outcome": "OUT"})
+        record.finish({"episodes": 1})
+
+    encoder = SimpleNamespace(z_size=1, uses_telemetry=False,
+                              encode=lambda frame: np.array([float(frame[0, 0, 0])], np.float32))
+    model = SimpleNamespace(donkey_config=environment_config(args),
+                            predict=lambda obs, deterministic=True: (np.array([float(obs.sum()), -0.5], np.float32), None))
+    monkeypatch.setattr(verify, "make_encoder", lambda *a, **k: encoder)
+    monkeypatch.setattr(verify.SAC, "load", lambda *a, **k: model)
+    monkeypatch.setattr(sys, "argv", ["verify", str(run)])
+    verify.main()
+    alignment = json.loads((run / "alignment_check.json").read_text())
+    assert alignment["passed"] is True and alignment["max_abs_error"] == 0.0

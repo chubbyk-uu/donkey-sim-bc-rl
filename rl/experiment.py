@@ -347,9 +347,13 @@ class EvalRecord:
         return name
 
     def encoder(self, encoder):
-        """Record the actual tensors, including cached pretrained weights."""
+        """Record the actual tensors, including cached pretrained weights and projections."""
         digest = hashlib.sha256()
-        for name, tensor in sorted(getattr(encoder, "model", encoder).state_dict().items()):
+        state = dict(getattr(encoder, "model", encoder).state_dict())
+        if getattr(encoder, "projection", None) is not None:
+            mean, components, scale = encoder.projection
+            state.update(_projection_mean=mean, _projection_components=components, _projection_scale=scale)
+        for name, tensor in sorted(state.items()):
             array = tensor.detach().cpu().contiguous().numpy()
             digest.update(f"{name}:{array.dtype}:{array.shape}".encode())
             digest.update(array.tobytes())

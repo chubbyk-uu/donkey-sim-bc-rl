@@ -1776,7 +1776,8 @@ Evaluated 2026-11-13 (§13): grid + lags 50k is **not** better than v2 50k (5.04
 against 6.08 laps, 10/24 against 31/40 completed). It beats its own control, but
 that control checkpoint is far below v2 50k with the same recipe, so the pair
 says little about the observation. A run with simulator ground truth as the
-observation laps 32% faster than v2 50k (§13); next is using it as a teacher.
+observation laps 32% faster than v2 50k (§13); next is removing its start-line
+weave and then using it as a teacher.
 
 ### Reproducible layouts and more throughput
 
@@ -2132,6 +2133,31 @@ Flying lap time excludes each episode's first lap (standing start).
 - The ground-truth policy's own compute is 0.08 ms per step against 3.8-3.9 ms
   for the image encoders (about 8 ms of simulated time at time scale 2).
 
+### Why the ground-truth policy still fails 3 of 24 (telemetry, 226 passes)
+
+- It weaves on the start straight every lap, phase-locked to the track: median
+  steering -0.59 at 30 centre-line points before the start line, +0.58 at 10
+  before, -0.67 at 20 after; heading error swings between about +8 and -15
+  degrees on a straight road. Heading-error spread is 9.5-10.9 degrees around
+  the start line against 4.1-6.1 on the other straights.
+- The last left swing comes just before the first right-hand bend. In the three
+  failed passes it is full lock (-1.0) and the heading error reaches -24 to -28
+  degrees (median pass -14, 5th percentile -22); full right lock from there does
+  not bring the car back. 16 of the 223 successful passes also went below CTE
+  -1.6 and 3 below -1.8, so the margin is thin every lap.
+- The simulator's own CTE has a small jog at the start line (its zero line
+  moves about 0.15 CTE and turns 2.75 degrees over about 1 position unit; the
+  fitted line follows it to 0.01). Whether it sets off the larger weave there is
+  not tested. The vision policy also weaves slightly more there (9.0-9.7
+  degrees against 6.0-8.4 elsewhere).
+- This settles the question left open in §6.14: the steering weave is present
+  with perfect perception, so it comes from the control side, not from a noisy
+  lateral estimate. Reward penalties on steering change did not remove it
+  (§6.14); tightening `max_steering_diff` is still untried.
+- Consequence: 88% is not good enough for a teacher. Fix the weave on the
+  ground-truth policy first; each try costs one 36-minute training run without
+  any vision in the loop.
+
 ### What it does and does not show
 
 - Shown (one seed): with the same SAC recipe, action limits and reward, perfect
@@ -2144,8 +2170,48 @@ Flying lap time excludes each episode's first lap (standing start).
   ground-truth run stalled for about 20k steps at the first bend before learning
   to lift early; one seed.
 
-**Next:** use the ground-truth policy as a teacher for a vision policy (it can
-label any state reached during training from telemetry). First check offline
-whether the frozen image features can predict the teacher's action.
+### Can image features predict the teacher's action? (offline, 2026-11-13)
 
-**Validation:** 27 pytest tests pass (track state and its checkpoint contract added).
+`tools/probe_teacher_action.py`, output `logs/probe_teacher_action_state_50k/`.
+The ground-truth 50k policy labels 18,020 captured frames (150 layouts, the five
+§12 runs with tail capture) with the action it would take there; a 2x256 network
+predicts that action from each candidate input plus the command history, scored
+on layouts held out of its training.
+
+| Input (+ command history) | Steering R2 | Steering MAE | Throttle R2 | Throttle MAE |
+|---|---:|---:|---:|---:|
+| Command history only | 0.03 | 0.57 | 0.36 | 0.28 |
+| Teacher's own state (ceiling of the procedure) | 0.97 | 0.10 | 0.91 | 0.11 |
+| Class token (v2 input) | 0.76 | 0.28 | 0.66 | 0.22 |
+| Grid, PCA 128 | 0.86 | 0.22 | 0.68 | 0.21 |
+| Grid + lags 2,4 | 0.85 | 0.22 | 0.66 | 0.22 |
+| Grid, all 6144 | 0.80 | 0.26 | 0.55 | 0.26 |
+| Grid + speed, sideways speed, yaw rate from telemetry | 0.87 | 0.21 | 0.72 | 0.20 |
+
+Actions are in [-1, 1]; the teacher's steering has a standard deviation of 0.79.
+
+- The grid features carry most of the teacher's steering decision (0.86 of a
+  possible 0.97) and are clearly better than the class token (0.76). Earlier
+  frames add nothing here.
+- Linear read-out of the teacher's state from the grid features: sideways
+  position of the road 0.6 to 3.0 units ahead R2 0.94-0.97, CTE 0.84, heading
+  error 0.67, yaw rate 0.41, forward speed about 0. With lags: CTE 0.94, heading
+  0.87, yaw rate 0.82, speed still 0.
+- **The throttle part is not a fair test.** These frames come from v2 50k, which
+  drives at 1.97 +/- 0.09; the teacher drives at 2.92 +/- 0.32 (2.3 to 3.4).
+  Its braking decisions happen at speeds the frames never show, and speed
+  cannot be judged readable or not when it barely varies. No frames of the
+  teacher's own driving exist yet.
+- An offline action error does not predict closed-loop driving. This only says
+  imitation is not ruled out by missing information in the image features.
+
+**Next:** first remove the start-line weave and first-bend failures on the
+ground-truth (`sim_state`) policy (e.g. tighter `max_steering_diff`, smaller MLP
+hidden size, or smooth centre-line CTE at the start line) so the teacher is calm
+and reliable; then teach a vision policy from that teacher (it can label any
+state from telemetry): record frames of the teacher driving, fit the student to
+them, then let the student drive while the teacher labels and refit. Student
+input to try first: grid features, command history, and measured speed and yaw
+rate.
+
+**Validation:** 29 pytest tests pass (track state, projection hashing and alignment verification contracts added).

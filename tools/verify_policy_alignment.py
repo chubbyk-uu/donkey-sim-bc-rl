@@ -74,39 +74,66 @@ def main() -> None:
         if item.strip():
             label, _, crop = item.rsplit(":", 2)
             crops[label.strip()] = int(crop)
-    encoders, models, checks, probes = {}, {}, [], []
+    encoders, models, observations, checks, probes = {}, {}, {}, [], []
     history_length = run_args["n_command_history"]
+    default_lags = tuple(run_args.get("latent_lags") or ())
+    vae = run_args.get("vae_model")
+    projection = run_args.get("encoder_projection")
+    track = run_args.get("track_centerline")
 
     for episode in episodes:
         failed = not episode.get("trunc", episode.get("outcome", "").startswith("TRUNC"))
         if not failed or not episode.get("capture"):
             continue
         label = episode.get("model", "policy")
-        crop = crops.get(label, run_args["encoder_crop_top"])
-        if crop not in encoders:
-            vae = run_args.get("vae_model")
-            encoders[crop] = make_encoder(run_args["encoder"], device, crop_top=crop,
-                                          vae_checkpoint=recorded_path(vae) if vae else None)
         if label not in models:
             models[label] = SAC.load(recorded_path(meta["files"][label]["path"]), device=device)
+            saved = (getattr(models[label], "donkey_config", None) or {}).get("observation", {})
+            enc_name = saved.get("encoder", run_args["encoder"])
+            crop = saved.get("crop_top", crops.get(label, run_args["encoder_crop_top"]))
+            lags = tuple(saved.get("latent_lags", default_lags))
+            key_enc = (enc_name, crop)
+            if key_enc not in encoders:
+                encoders[key_enc] = make_encoder(
+                    enc_name, device, crop_top=crop,
+                    vae_checkpoint=recorded_path(vae) if vae else None,
+                    projection=recorded_path(projection) if projection else None,
+                    track=recorded_path(track) if track else None,
+                )
+            observations[label] = (encoders[key_enc], lags)
+        encoder, lags = observations[label]
         trace = traces[key(episode)]
         folder = run / episode["capture"]["directory"]
         frames = json.loads((folder / "index.json").read_text())["frames"]
-        for index in sorted({0, len(frames) // 2, len(frames) - 10, len(frames) - 5, len(frames) - 2}):
-            if not 0 <= index < len(frames):
+        first = max(lags, default=0)
+        for index in sorted({first, len(frames) // 2, len(frames) - 10, len(frames) - 5, len(frames) - 2}):
+            if not first <= index < len(frames):
                 continue
             step = frames[index]["step"]  # frame k is the input to action k+1 = trace[k]
             if step >= len(trace):
                 continue
-            with Image.open(folder / frames[index]["file"]) as image:
-                original = np.asarray(image.convert("RGB"))
+
+            def load_rgb(frame_index: int) -> np.ndarray:
+                with Image.open(folder / frames[frame_index]["file"]) as image:
+                    return np.asarray(image.convert("RGB"))
+
+            def encode_at(frame: np.ndarray, step_num: int) -> np.ndarray:
+                if getattr(encoder, "uses_telemetry", False):
+                    return encoder.encode(frame, trace[step_num - 1])
+                return encoder.encode(frame)
+
+            original = load_rgb(index)
+            earlier = [encode_at(load_rgb(index - lag), step - lag) for lag in lags]
             history = np.zeros((history_length, 2), np.float32)
             previous = trace[max(0, step - history_length):step] if history_length else []
             if previous:
                 history[-len(previous):] = [[r["rl_steer"], r["rl_throttle"]] for r in previous]
 
-            def act(frame, history=history, crop=crop, label=label):
-                obs = np.concatenate([encoders[crop].encode(frame), history.reshape(-1)], dtype=np.float32)
+            def act(frame, history=history, earlier=earlier, label=label, step=step):
+                parts = [encode_at(frame, step), *earlier]
+                if history_length:
+                    parts.append(history.reshape(-1))
+                obs = parts[0] if len(parts) == 1 else np.concatenate(parts, dtype=np.float32)
                 return models[label].predict(obs, deterministic=True)[0]
 
             predicted = act(original)
@@ -115,12 +142,13 @@ def main() -> None:
                        "episode": episode.get("episode"), "frame_step": step}
             checks.append(dict(context, action_step=step + 1, max_abs_error=error))
             print(checks[-1], flush=True)
-            for gain in args.brightness_gains:
-                changed = act(np.clip(original.astype(np.float32) * gain, 0, 255).astype(np.uint8))
-                probes.append(dict(context, gain=gain, original_steer=float(predicted[0]),
-                                   changed_steer=float(changed[0]),
-                                   steer_delta=abs(float(changed[0] - predicted[0])),
-                                   sign_flip=bool(abs(predicted[0]) > .2 and predicted[0] * changed[0] < 0)))
+            if not getattr(encoder, "uses_telemetry", False):
+                for gain in args.brightness_gains:
+                    changed = act(np.clip(original.astype(np.float32) * gain, 0, 255).astype(np.uint8))
+                    probes.append(dict(context, gain=gain, original_steer=float(predicted[0]),
+                                       changed_steer=float(changed[0]),
+                                       steer_delta=abs(float(changed[0] - predicted[0])),
+                                       sign_flip=bool(abs(predicted[0]) > .2 and predicted[0] * changed[0] < 0)))
 
     if not checks:
         raise ValueError("No failed episode with a capture to verify")
