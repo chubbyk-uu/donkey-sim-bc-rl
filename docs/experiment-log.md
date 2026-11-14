@@ -2284,3 +2284,78 @@ via teacher rollout collection + online DAgger in the simulator, using `grid`
 closed-loop driving stays responsive to visual features).
 
 **Validation:** 29 pytest tests pass (track state, projection hashing and alignment verification contracts added).
+
+### Stage 3.1: 15-dim geometry perception benchmark (offline, 2026-11-14)
+
+`tools/probe_geometry_15d.py` (single-frame Round 1) and
+`tools/probe_geometry_15d_lags.py` (multi-frame `lags=(2, 4)` Round 2), output
+`logs/probe_geometry_15d_v1/`. Across all 174 `(run, layout)` groups (150 vision
+episodes from §12 + 24 `sdiff01 60k` teacher episodes; 23,924 total frames, 23,204
+valid lagged frames), each model predicts the 15 geometric dimensions of
+`TrackState.encode` (`[0]=cte/2`, `[1:3]=sin/cos(heading_error)`,
+`[6:18]=6 lookaheads (right, forward)/lookahead`) under strict 5-fold `GroupKFold`
+by `(run, layout)`. All feature standardizations, PCA projections, ridge tuning, and
+MLP early stopping are fit strictly inside each training fold. Predicted geometry is
+spliced into `[0:3]` and `[6:18]` alongside ground-truth motion `[3:6]`
+(`vel[2]/2, vel[0]*4, gyro[1]/2`) and the 40-dim command history to evaluate
+teacher-controller action substitution error (both raw pre-clamp and executed
+post-clamp command error under `max_steering_diff=0.1`).
+
+| Candidate | CTE MAE / P95 (m) | CTE `w20` Bias P95 (m) | Heading MAE / P95 (deg) | Lookahead 1.0m MAE / P95 (m) | ExecSteer MAE / P95 | ExecThrot MAE / P95 | `\|CTE\|>=1` CTE MAE / P95 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `cls_ridge (1f)` (`384 -> 15`) | 0.193 / 0.517 | 0.506 | 3.74 / 10.17 | 0.056 / 0.122 | 0.044 / 0.289 | 0.031 / 0.104 | 0.483 / 1.158 |
+| `pca128_ridge (1f)` (fold-fit `PCA-128 -> 15`) | 0.159 / 0.425 | 0.434 | 3.12 / 8.36 | 0.046 / 0.098 | 0.037 / 0.258 | 0.025 / 0.087 | 0.397 / 0.966 |
+| `raw6144_ridge (1f)` (`6144 -> 15`) | 0.090 / 0.243 | 0.244 | 2.17 / 5.94 | 0.035 / 0.075 | 0.023 / 0.163 | 0.016 / 0.059 | 0.205 / 0.550 |
+| `raw6144_b64_mlp (1f)` (`6144 -> 64 -> 15`) | 0.087 / 0.243 | 0.245 | 1.95 / 5.60 | 0.030 / 0.066 | 0.022 / 0.160 | 0.015 / 0.056 | 0.204 / 0.583 |
+| `pca128_lags_ridge` (`3x128=384 -> 15`) | 0.119 / 0.323 | 0.349 | 2.13 / 5.83 | 0.038 / 0.082 | 0.032 / 0.228 | 0.020 / 0.072 | 0.303 / 0.779 |
+| `proj15_lags_ridge` (`3x15=45 -> 15` linear) | 0.055 / 0.151 | **0.168** | **1.21 / 3.24** | 0.025 / 0.052 | 0.021 / 0.148 | 0.012 / 0.043 | 0.126 / 0.342 |
+| `shared64_lags_mlp` (per-frame `6144->64`, `3x64->64->15`) | **0.052 / 0.146** | 0.175 | 1.22 / 3.40 | **0.022 / 0.049** | **0.020 / 0.145** | **0.011 / 0.040** | **0.122 / 0.324** |
+| `raw18432_lags_ridge` (`3x6144=18432 -> 15`) | 0.055 / 0.146 | 0.167 | 1.22 / 3.30 | 0.025 / 0.052 | 0.021 / 0.153 | 0.012 / 0.042 | 0.124 / 0.328 |
+
+- **Unsupervised `PCA-128` drops ~44% of geometric precision:** Replacing fold-fit
+  `PCA-128` with a supervised linear projection on the full `6144`-dim `4x4` patch
+  grid cuts single-frame CTE P95 from `0.425 m` to `0.243 m` (`0.966 m -> 0.550 m`
+  on `|CTE| >= 1.0`) and heading P95 from `8.36 deg` to `5.94 deg`.
+- **Multi-frame `lags=(2, 4)` cuts error by another ~40% without runtime dimensionality
+  blow-up:** Both factorized lagged models (`proj15_lags_ridge` and
+  `shared64_lags_mlp`) match or beat full `18,432`-dim Ridge while only projecting
+  the current `6144`-dim frame into `15` or `64` dims and buffering that compact
+  vector across lags. On the teacher's own 24 layouts, `shared64_lags_mlp` reaches
+  `CTE MAE/P95 = 0.046 / 0.119 m` (`w20` bias P95 `0.111 m`) and
+  `Heading MAE/P95 = 1.01 / 2.74 deg`.
+
+### Stage 3.2: Empirical closed-loop tolerance screen on the frozen teacher (2026-11-14)
+
+`tools/eval_teacher_tolerance.py`, output
+`logs/teacher_tolerance_screen_v1/tolerance_results.json`. Evaluated the frozen
+`sdiff01 60k` teacher across 4 randomized light/tree layouts x 6 conditions in
+shuffled order per layout (2000 steps max). Multi-step 15-dim residual blocks (length
+80) are sampled from the held-out OOF predictions of Stage 3.1 to preserve
+cross-dimension and temporal correlation; heading residuals are added as circular
+angles on the unit circle.
+
+| Condition | Geom Delay | Residual Source | Comp | Mean Steps | Mean Laps | Mean \|CTE\| | Max \|CTE\| | Speed | Eff. CTE P95 | Eff. Head P95 |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `baseline` | 0 steps | None (exact `TrackState`) | **4/4** | 2000.0 | 9.00 | 0.159 | 0.743 | 2.53 | 0.000 m | 0.00 deg |
+| `delay1_only` | 1 step | None (1-step geom buffer) | **4/4** | 2000.0 | 9.00 | 0.236 | 1.691 | 2.50 | 0.181 m | 4.25 deg |
+| `shared64_lags_1x_d1` | 1 step | `shared64_lags_mlp` (`1.0x`) | **2/4** | 1289.2 | 5.50 | 0.270 | 2.227 | 2.37 | 0.258 m | 5.96 deg |
+| `raw6144_1f_1x_d1` | 1 step | `raw6144_ridge (1f)` (`1.0x`) | **0/4** | 1539.5 | 6.75 | 0.289 | 2.223 | 2.47 | 0.309 m | 7.36 deg |
+| `pca128_1f_1x_d1` | 1 step | `pca128_ridge (1f)` (`1.0x`) | **0/4** | 240.0 | 0.50 | 0.333 | 2.150 | 2.07 | 0.497 m | 9.87 deg |
+| `pca128_1f_1.5x_d1` | 1 step | `pca128_ridge (1f)` (`1.5x`) | **0/4** | 224.5 | 0.25 | 0.381 | 2.253 | 2.02 | 0.616 m | 12.55 deg |
+
+- **1-step geometry delay alone (`delay1_only`) consumes most of the CTE margin:**
+  At `2.50 m/s`, a 1-step geometry lag introduces an effective error of
+  `CTE P95 = 0.181 m` and `Heading P95 = 4.25 deg` in corners, raising `max_abs_cte`
+  from `0.743` to `1.691` (4/4 completed).
+- **Clear stratification across visual representations under `1.0x + 1-step delay`:**
+  `pca128_1f` (`eff P95: 0.50 m / 9.9 deg`) crashes on the first bend on every layout
+  (`240` mean steps, `0/4`); `raw6144_1f` (`0.31 m / 7.4 deg`) survives `6.4x` longer
+  (`1539.5` mean steps, `6.75` laps) before exceeding `|CTE|=2.0`; `shared64_lags_mlp`
+  (`0.26 m / 6.0 deg`) completes **2/4** full 2000-step episodes (9 laps each on L2/L3
+  where `eff P95 <= 0.25 m / 5.5 deg`).
+- **Implication for Stage 3.3:** Synchronous in-step visual inference (`<2 ms` on GPU,
+  0 extra frame buffer delay) keeps `shared64_lags_mlp`'s nominal cruising error
+  (`0.12-0.15 m / 2.7-3.4 deg`) inside the teacher's safe zone (`<= 0.22 m / 5.3 deg`),
+  but its off-center error at `|CTE| >= 1.0` (`0.32 m / 7.0 deg` when trained only on
+  tail cruising data) sits in the failure transition zone — confirming the need for
+  broad-coverage/recovery data collection and online DAgger in Stage 3.3.
