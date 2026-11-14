@@ -62,7 +62,7 @@ def teacher_inputs(runs: list[Path], records: list[dict], track: TrackState) -> 
         with (run / "telemetry.jsonl").open() as stream:
             for line in stream:
                 row = json.loads(line)
-                traces[run.name, row.get("layout"), row.get("model")][row["step"]] = row
+                traces[run.name, row.get("layout") or row.get("episode"), row.get("model")][row["step"]] = row
     states, histories = [], []
     for record in records:
         trace = traces[record["run"], record["layout"], record["model"]]
@@ -108,7 +108,9 @@ def network_predictions(x: np.ndarray, y: np.ndarray, groups: np.ndarray, device
     return prediction
 
 
-def r2(truth: np.ndarray, predicted: np.ndarray) -> float:
+def r2(truth: np.ndarray, predicted: np.ndarray) -> float | None:
+    if len(truth) < 2:
+        return None
     return float(1 - np.sum((predicted - truth) ** 2) / np.sum((truth - truth.mean(0)) ** 2))
 
 
@@ -127,17 +129,20 @@ def main() -> None:
     records = [record for run in args.runs for record in load_frames(run)]
     state, history = teacher_inputs(args.runs, records, TrackState.load(args.track_centerline))
     teacher = SAC.load(str(args.teacher), device="cpu")
+    saved = torch.load(args.encoder_projection, map_location="cpu", weights_only=True)
     action, _ = teacher.predict(np.concatenate([state, history], axis=1), deterministic=True)  # steer, throttle in [-1, 1]
 
     features = extract_features(records, device, crop_top=0)
-    saved = torch.load(args.encoder_projection, map_location="cpu", weights_only=True)
     grid = ((features["patch_grid"] - saved["mean"].numpy()) @ saved["components"].numpy().T / saved["scale"].numpy()).astype(np.float32)
     grid_lags, valid = lagged(grid, records)
-    inputs = {"commands only": history[:, :0], "state": state, "cls": features["cls"], "grid": grid,
-              "grid + lags": grid_lags, "grid full": features["patch_grid"],
-              "cls + motion": np.concatenate([features["cls"], state[:, 3:6]], axis=1),
-              "grid + motion": np.concatenate([grid, state[:, 3:6]], axis=1),
-              "grid+lags+motion": np.concatenate([grid_lags, state[:, 3:6]], axis=1)}
+    inputs = {"commands only": (history[:, :0], True), "state": (state, True), "cls": (features["cls"], True), "grid": (grid, True),
+              "grid + lags": (grid_lags, True), "grid full": (features["patch_grid"], True),
+              "cls + motion": (np.concatenate([features["cls"], state[:, 3:6]], axis=1), True),
+              "grid + motion": (np.concatenate([grid, state[:, 3:6]], axis=1), True),
+              "grid+lags+motion": (np.concatenate([grid_lags, state[:, 3:6]], axis=1), True),
+              "cls (no hist)": (features["cls"], False),
+              "grid (no hist)": (grid, False),
+              "grid+motion (no hist)": (np.concatenate([grid, state[:, 3:6]], axis=1), False)}
 
     # Same frames for every input: those whose earlier frames were captured too.
     groups = np.array([f"{r['run']}/{r['layout']}" for r in records])[valid]
@@ -146,19 +151,21 @@ def main() -> None:
     result = {"runs": [str(run) for run in args.runs], "teacher": str(args.teacher), "frames": int(valid.sum()),
               "layouts": len(set(groups)), "teacher_action_std": action.std(0).tolist(), "action": {}, "state_from_features": {}}
     print(f"{valid.sum()} frames, {len(set(groups))} layouts; teacher action std: steer {action[:, 0].std():.3f}, throttle {action[:, 1].std():.3f}")
-    print(f"{'input':<17} {'steer R2':>9} {'steer MAE':>10} {'throttle R2':>12} {'throttle MAE':>13} {'steer R2 when |cte|>=1':>23}")
-    for name, x in inputs.items():
-        predicted = network_predictions(np.concatenate([x[valid], history], axis=1), action, groups, device)
+    print(f"{'input':<21} {'steer R2':>9} {'steer MAE':>10} {'throttle R2':>12} {'throttle MAE':>13} {'steer R2 when |cte|>=1':>23}")
+    for name, (x, use_hist) in inputs.items():
+        net_in = np.concatenate([x[valid], history], axis=1) if use_hist else x[valid]
+        predicted = network_predictions(net_in, action, groups, device)
         row = {"steer_r2": r2(action[:, 0], predicted[:, 0]), "steer_mae": float(np.abs(predicted[:, 0] - action[:, 0]).mean()),
                "throttle_r2": r2(action[:, 1], predicted[:, 1]), "throttle_mae": float(np.abs(predicted[:, 1] - action[:, 1]).mean()),
                "steer_r2_abs_cte_ge_1": r2(action[far, 0], predicted[far, 0]), "frames_abs_cte_ge_1": int(far.sum())}
         result["action"][name] = row
-        print(f"{name:<17} {row['steer_r2']:>9.3f} {row['steer_mae']:>10.3f} {row['throttle_r2']:>12.3f} "
-              f"{row['throttle_mae']:>13.3f} {row['steer_r2_abs_cte_ge_1']:>23.3f}", flush=True)
+        far_r2 = f"{row['steer_r2_abs_cte_ge_1']:>23.3f}" if row["steer_r2_abs_cte_ge_1"] is not None else f"{'n/a':>23}"
+        print(f"{name:<21} {row['steer_r2']:>9.3f} {row['steer_mae']:>10.3f} {row['throttle_r2']:>12.3f} "
+              f"{row['throttle_mae']:>13.3f} {far_r2}", flush=True)
 
     print("\nteacher state read from image features (ridge, unseen layouts), R2:")
     print(f"{'state number':<28} {'cls':>7} {'grid':>7} {'grid + lags':>12}")
-    readable = {name: np.stack([held_out_predictions(inputs[name][valid], state[:, i], groups) for i in range(state.shape[1])], axis=1)
+    readable = {name: np.stack([held_out_predictions(inputs[name][0][valid], state[:, i], groups) for i in range(state.shape[1])], axis=1)
                 for name in ("cls", "grid", "grid + lags")}
     for i, label in enumerate(STATE_NAMES):
         scores = {name: r2(state[:, i], predicted[:, i]) for name, predicted in readable.items()}

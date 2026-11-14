@@ -533,6 +533,7 @@ docs/
 | `rl_loop_dinov2_randomtree_v2` | `sac_dinov2_vits14_50000_steps.zip` | DINOv2-S | ~50% rand | random light + trees/shadows domain-randomized 分支 |
 | `rl_loop_dinov2_randomtree_crop40_v1` | `sac_dinov2_vits14_130000_steps.zip`, `170000_steps.zip` | DINOv2-S | artifact | crop40 randomtree probe，未提升为部署模型 |
 | `rl_loop_vae_sac_resnet_v4_notrees` | `sac_resnet18_50000_steps.zip` | ResNet18 | 3/3 | 备份模型，评估需要 `--encoder-crop-top 40` |
+| `rl_loop_sim_state_ts2_sdiff01_v1` | `sac_sim_state_60000_steps.zip` | `sim_state` | **24/24** rand | **真值状态教师模型**（`--max-steering-diff 0.1`，`--track-centerline models/track_centerline/generated_track.npz`）：24 个随机树影/光照布局 100% 跑满（216 圈，`mean_abs_cte=0.158`，`max_abs_cte=0.770`；见 `docs/experiment-log.md` §13） |
 
 所有 loop VAE 模型共享 encoder：
 

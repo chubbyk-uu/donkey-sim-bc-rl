@@ -556,6 +556,7 @@ repo — regenerate by resuming training with `--save-replay-buffer`.
 | `rl_loop_dinov2_randomtree_v2` | `sac_dinov2_vits14_50000_steps.zip` | DINOv2-S | ~50% rand | Domain-randomized: robust to random light + trees/shadows ([§6.14](docs/experiment-log.md#614-domain-randomization-random-light--tree-shadows-on-loop-2026-05-28); the old "3/6" was measured under the §6.15 eval-clamp bug — ~4/6 at matched params) |
 | `rl_loop_dinov2_randomtree_crop40_v1` | `sac_dinov2_vits14_130000_steps.zip`, `170000_steps.zip` | DINOv2-S | artifact | Crop40 randomtree probe; not promoted because crop benefit was not isolated ([§6.15](docs/experiment-log.md#615-crop--steering-clamp--cte-tolerance-probes-2026-05-29)) |
 | `rl_loop_vae_sac_resnet_v4_notrees` | `sac_resnet18_50000_steps.zip` | ResNet18 | 3/3 | Backup, needs `--encoder-crop-top 40` |
+| `rl_loop_sim_state_ts2_sdiff01_v1` | `sac_sim_state_60000_steps.zip` | `sim_state` | **24/24** rand | **Ground-truth teacher** (`--max-steering-diff 0.1`, `--track-centerline models/track_centerline/generated_track.npz`): 100% completion across 24 random-tree/light layouts (216 laps, `mean_abs_cte=0.158`, `max_abs_cte=0.770`; [§13](docs/experiment-log.md#13-separating-perception-from-control-with-a-ground-truth-track-state-2026-11-12)) |
 
 VAE encoder shared by all VAE-based loop models: `vae_loop_cones_fixedlight_v1/best.pt`
 New `--encoder vae` training checkpoints are written with the historical

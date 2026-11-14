@@ -79,7 +79,7 @@ def load_frames(run: Path) -> list[dict]:
                 if distance[-1] > 0.02 * DRIFT_WINDOW:
                     lateral = float(np.polyfit(distance, [w["cte"] for w in window], 1)[0])
             records.append({
-                "run": run.name, "layout": episode.get("layout"), "model": episode.get("model"),
+                "run": run.name, "layout": episode.get("layout") or episode.get("episode"), "model": episode.get("model"),
                 "step": step, "failed": failed, "steps_to_end": episode["steps"] - step,
                 "image": folder / frame["file"], "cte": float(row["cte"]), "lateral": lateral,
             })
