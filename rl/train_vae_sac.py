@@ -18,10 +18,12 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import set_random_seed
 
 try:
+    from rl.donkey_sync import add_control_fix_args, configure_env_control_fixes
     from rl.vae import ConvVAE
     from rl.experiment import save_replay_metadata
     from rl.track_state import TrackState
 except ImportError:
+    from donkey_sync import add_control_fix_args, configure_env_control_fixes
     from vae import ConvVAE
     from experiment import save_replay_metadata
     from track_state import TrackState
@@ -281,6 +283,10 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         scene_reload_alpha: float = 0.0,
         scene_reload_kmin: int = 200,
         scene_reload_kmax: int = 2000,
+        reversal_unwind_scale: float = 1.0,
+        reversal_cte_threshold: float = 0.40,
+        reversal_head_deg_threshold: float = 8.0,
+        reversal_min_last_steer: float = 0.30,
     ) -> None:
         super().__init__(env)
         self.vae = vae
@@ -293,6 +299,13 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         self.command_history = np.zeros((self.n_command_history, 2), dtype=np.float32)
         self.last_steer = 0.0
         self._prev_lap_count = 0
+        self.reversal_unwind_scale = float(reversal_unwind_scale)
+        self.reversal_cte_threshold = float(reversal_cte_threshold)
+        self.reversal_head_deg_threshold = float(reversal_head_deg_threshold)
+        self.reversal_min_last_steer = float(reversal_min_last_steer)
+        self._last_geom_cte_abs = 0.0
+        self._last_geom_head_abs_deg = 0.0
+        self._last_reversal_unwind_active = False
         # Scene-reload (domain randomization). Two mutually exclusive modes:
         #   adaptive step-based (scene_reload_alpha > 0): reload after the car has
         #     spent ~K steps on the current scene, K = clamp(alpha * recent_ep_len,
@@ -337,12 +350,48 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         obs_dim = encoder.z_size * (1 + len(self.latent_lags)) + 2 * self.n_command_history
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
+    def set_control_fixes(
+        self,
+        *,
+        reversal_unwind_scale: float | None = None,
+        reversal_cte_threshold: float | None = None,
+        reversal_head_deg_threshold: float | None = None,
+        reversal_min_last_steer: float | None = None,
+    ) -> None:
+        """Configure gated opposite-sign steering unwind between episodes."""
+        if reversal_unwind_scale is not None:
+            self.reversal_unwind_scale = float(reversal_unwind_scale)
+        if reversal_cte_threshold is not None:
+            self.reversal_cte_threshold = float(reversal_cte_threshold)
+        if reversal_head_deg_threshold is not None:
+            self.reversal_head_deg_threshold = float(reversal_head_deg_threshold)
+        if reversal_min_last_steer is not None:
+            self.reversal_min_last_steer = float(reversal_min_last_steer)
+
+    def attach_sync_controller(self, sync_controller) -> None:
+        prev = getattr(self, "_sync_controller", None)
+        if prev is not None and prev is not sync_controller:
+            prev.close()
+        self._sync_controller = sync_controller
+
+    def close(self) -> None:
+        sync = getattr(self, "_sync_controller", None)
+        self._sync_controller = None
+        try:
+            if sync is not None:
+                sync.close()
+        finally:
+            super().close()
+
     def reset(self, **kwargs):
         self.command_history.fill(0.0)
         self._latents.clear()
         self.last_steer = 0.0
         self.last_throttle = self.min_throttle
         self._prev_lap_count = 0
+        self._last_geom_cte_abs = 0.0
+        self._last_geom_head_abs_deg = 0.0
+        self._last_reversal_unwind_active = False
         self._reset_count += 1
         # update episode-length EMA from the episode that just ended
         if self._episode_steps > 0:
@@ -406,6 +455,7 @@ class DonkeyVaeSACEnv(gym.Wrapper):
                 "rl_throttle": float(executed[1]),
                 "abs_cte": abs(cte - self.reward_config.cte_target),
                 "vae_reward": reward,
+                "reversal_unwind_active": bool(self._last_reversal_unwind_active),
                 "termination_reason": ("simulator" if base_terminated else "cte_limit") if terminated else None,
             }
         )
@@ -421,7 +471,23 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         # Rate limit against the last executed command; it must not depend on
         # how much command history the observation carries.
         max_diff = (self.max_steering_diff - 1e-5) * (2.0 * self.max_steering)
-        steer = self.last_steer + float(np.clip(steer - self.last_steer, -max_diff, max_diff))
+        eff_max_diff = max_diff
+        unwind_active = False
+        if (
+            self.reversal_unwind_scale > 1.0
+            and steer * self.last_steer < 0.0
+            and abs(self.last_steer) >= self.reversal_min_last_steer
+            and (
+                self._last_geom_cte_abs >= self.reversal_cte_threshold
+                or self._last_geom_head_abs_deg >= self.reversal_head_deg_threshold
+            )
+        ):
+            # Asymmetric unwind-to-zero only: speed return toward 0 when stuck at large
+            # opposite steering under excursion, without crossing 0 or causing ping-pong.
+            eff_max_diff = max(max_diff, min(self.reversal_unwind_scale * max_diff, abs(self.last_steer)))
+            unwind_active = eff_max_diff > max_diff + 1e-7 and abs(steer - self.last_steer) > max_diff + 1e-7
+        self._last_reversal_unwind_active = unwind_active
+        steer = self.last_steer + float(np.clip(steer - self.last_steer, -eff_max_diff, eff_max_diff))
 
         self.last_steer = float(np.float32(steer))  # as stored in the command history
         self.last_throttle = float(throttle)
@@ -441,6 +507,16 @@ class DonkeyVaeSACEnv(gym.Wrapper):
         else:
             z = self.vae.encode(self.last_raw_obs)
         self.last_encode_seconds = time.perf_counter() - started
+        geom = getattr(self.vae, "last_pred_geom", None)
+        if geom is not None and len(geom) >= 3:
+            self._last_geom_cte_abs = abs(float(geom[0])) * 2.0
+            self._last_geom_head_abs_deg = abs(float(np.degrees(np.arctan2(geom[1], geom[2]))))
+        elif getattr(self.vae, "uses_telemetry", False) and len(z) >= 3:
+            self._last_geom_cte_abs = abs(float(z[0])) * 2.0
+            self._last_geom_head_abs_deg = abs(float(np.degrees(np.arctan2(z[1], z[2]))))
+        else:
+            self._last_geom_cte_abs = 0.0
+            self._last_geom_head_abs_deg = 0.0
         # Newest first; right after a reset every earlier latent is the first frame.
         self._latents.appendleft(z)
         while len(self._latents) < self._latents.maxlen:
@@ -650,6 +726,7 @@ def build_env(args: argparse.Namespace, vae: FrozenVaeEncoder) -> gym.Env:
         scene_reload_kmin=getattr(args, "scene_reload_kmin", 200),
         scene_reload_kmax=max(1, args.max_episode_steps - 1),
     )
+    configure_env_control_fixes(env, args)
     env = TimeLimit(env, max_episode_steps=args.max_episode_steps)
     # Resuming into the same directory appends to its episode log.
     return Monitor(env, filename=str(args.output_dir / "monitor.csv"),
@@ -724,6 +801,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save-replay-buffer", action="store_true")
     parser.add_argument("--save-final-replay-buffer", action="store_true")
+    add_control_fix_args(parser)
     return parser.parse_args()
 
 

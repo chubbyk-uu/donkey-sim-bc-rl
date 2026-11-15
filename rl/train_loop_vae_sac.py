@@ -20,9 +20,11 @@ try:
         build_env,
         make_encoder,
     )
+    from rl.donkey_sync import add_control_fix_args
     from rl.experiment import (algorithm_config, environment_config, parse_lags, save_replay_metadata, simulator_saved_settings,
                                validate_args, validate_model_config, validate_replay, write_json)
 except ImportError:
+    from donkey_sync import add_control_fix_args
     from train_vae_sac import (
         ConfigCheckpointCallback,
         CappedDynamicGradientStepsCallback,
@@ -153,6 +155,7 @@ def parse_args() -> argparse.Namespace:
                              "per scene before a reload).")
     parser.add_argument("--save-replay-buffer", action="store_true")
     parser.add_argument("--save-final-replay-buffer", action="store_true")
+    add_control_fix_args(parser)
     return parser.parse_args()
 
 

@@ -35,6 +35,7 @@ from stable_baselines3 import SAC
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from rl.donkey_sync import add_control_fix_args, configure_env_control_fixes
 from rl.eval_loop_vae_sac import _osc_period
 from rl.experiment import (
     EvalRecord, environment_config, format_paired_statistics, paired_statistics, parse_lags,
@@ -117,6 +118,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alive-scale-floor", type=float, default=0.0)
     p.add_argument("--lap-completion-bonus", type=float, default=0.0)
     p.add_argument("--cte-speed-penalty-weight", type=float, default=0.25)
+    add_control_fix_args(p)
     return p.parse_args()
 
 
@@ -254,6 +256,7 @@ def _evaluate(args, specs, record) -> None:
         scene_reload_every=0,   # reloads are driven manually here (once per layout)
         scene_reload_alpha=0.0,
     )
+    configure_env_control_fixes(dk_env, args)
     env = TimeLimit(dk_env, max_episode_steps=args.max_episode_steps)
     controller = env.unwrapped.viewer
     scene = controller.handler.SceneToLoad

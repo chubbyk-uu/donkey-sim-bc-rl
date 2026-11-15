@@ -2451,3 +2451,148 @@ block schedules across conditions).
 layouts (`dagger_train_pool` only; never `locked_eval_holdout`), combine with Round A
 train-pool frames to enrich `|CTE| in [0.5, 1.9]`, retrain/compare the geometry perception
 head, and verify recovery + lateral tracking gains on `locked_eval_holdout`.
+
+### Round A Layout 7 Root-Cause Diagnosis & Minimal Control-Loop Fixes
+
+#### 1. Root-Cause Evidence (Teacher vs. Vision on Layout 7)
+Deep inspection of `logs/round_a_vision_24layouts_v1/telemetry.jsonl` and `gym_donkeycar`
+(`donkey_sim.py`, `client.py`) showed that `layout_07_baseline` (`step 1297`, `cte=-2.086`,
+Lap 6) and `layout_07_vision_proj15_lags_live` (`step 153`, `cte=+2.061`, Lap 0) failed at
+different times and trajectories from **distinct upstream triggers** feeding into a **shared
+downstream rate-limit reversal bottleneck**, rather than an unavoidable corner physics limit:
+
+- **`layout_07_baseline` (Step 1297, Lap 6) — Control-Cycle Stall + TCP Burst Replay +
+  Persistent `dt` Beating -> Rate-Limited Reversal Trap:**
+  - Across Laps 0–4 (`steps 249..268, 456..475, 664..683, 868..887, 1074..1093`) on the
+    exact same corner (`pos=(6.15..6.19, 4.30..6.90)`), `baseline` tracked cleanly with
+    `step_dt_ms in [23.48, 26.81] ms` (`std = 0.53..0.88 ms`), mild steering (`[-0.34, +0.29]`),
+    and `max|CTE| <= 0.311` across all 5 laps — ruling out a physical corner limit.
+  - Only `layout_07_baseline` among all 12 `dagger_train_pool` baseline episodes exhibited
+    elevated cycle jitter (`bad_dt = 22` steps outside `[18, 32] ms`, `dt_std = 2.70 ms` vs
+    `0.73..0.87 ms` in the 11 surviving layouts).
+  - At `step 1263`, `step_dt_ms` spiked to `93.42 ms` (`sim_wait_ms = 92.69 ms`), followed at
+    `steps 1264..1266` by 3 buffered telemetry packets draining in `5.58, 4.40, 2.87 ms`.
+    Because `dp / (speed * 0.05)` stayed `0.99..1.00`, Unity had stepped `0.05 s` sim-time per
+    packet while `SDClient` (`time.sleep(0.001)` + per-frame loop) replayed all 3 stale buffered
+    frames back-to-back, advancing `last_steer` and `command_history` on stale states. From
+    `step 1267..1297`, `step_dt_ms` remained trapped in `11.80..36.51 ms` beating
+    (`dt_std = 14.81 ms`), amplifying lateral swing (`+0.227 -> -0.146 -> -0.307 -> +0.079`).
+  - At `step 1286` (`cte=+0.069`), `executed steer` peaked at `-0.72` (left). Over `steps
+    1287..1290`, as `cte` crossed `-0.011 -> -0.449` and heading flipped `-2.9° -> -17.4°`,
+    raw policy demanded `+0.10 -> -0.20 -> +0.49 -> +0.85`, **but `max_steering_diff=0.1`
+    (`0.20/step`) held executed steering negative (`-0.52, -0.32, -0.12`) for 3 steps**
+    (two with `step_dt_ms = 35.40, 32.11 ms`), taking 9 steps (`1286..1295`) to go
+    `-0.72 -> +0.99` and exiting at `-2.086`.
+- **`layout_07_vision_proj15_lags_live` (Step 153, Lap 0) — Visual Oscillation + Underestimate
+  -> Same Downstream Reversal Lag:**
+  - Had an early timing disturbance (`steps 11..18`), then `105` consecutive normal-timing steps
+    (`steps 49..153`, `step_dt_ms in [23.44, 26.49] ms`) before crashing.
+  - Its excursion arose from Lap-0 curve tracking oscillation (`+0.707` at `s=121` -> `-1.098`
+    at `s=144` with `+0.117 CTE` visual underestimate at `s=143`), followed by the same
+    downstream `max_steering_diff=0.1` reversal bottleneck (`exe = +0.66 -> +0.46 -> +0.26 ->
+    +0.06` across `s=144..146` while raw policy commanded `-0.46, -0.91, -1.00`, overshooting
+    zero at `+25.1°` heading to `+2.061`).
+- **`gym_donkeycar` race & polling bugs found (`donkey_sim.py` / `client.py`):**
+  1. `on_telemetry` assigns `self.time_received = time.time()` at line 508 **before** updating
+     `pos / speed / vel / yaw / cte / image_array` (torn-read race).
+  2. `observe()` and `SDClient.proc_msg()` spin on `time.sleep(0.001)` polling and replay all
+     stale queued `"telemetry"` frames inside a burst instead of coalescing TCP bursts.
+
+#### 2. Minimal Fixes Implemented (Teacher & Vision Head Weights Frozen)
+- **Fix A — Event-Driven, Torn-Read-Free, Burst-Coalescing Sync (`rl/donkey_sync.py`):**
+  `LowJitterSyncController` (toggleable via `set_enabled(bool)` for paired A/B eval):
+  - Updates `image_array` and all state fields atomically under `threading.Condition` before
+    incrementing `_telemetry_seq` and notifying `observe()` (zero `1 ms` sleep polling, zero torn reads).
+  - Uses non-blocking socket + pipe wakeup fd (`os.pipe()`) for sub-millisecond `control` sends.
+  - Within each TCP `recv()` burst, preserves `"hit"` / `"over"` / non-telemetry events from
+    superseded packets via `coalesce_telemetry_messages()` while decoding and waking `observe()`
+    only on the latest telemetry frame (`coalesced_dropped`, `max_burst_seen`).
+- **Fix B — Gated Asymmetric Opposite-Sign Unwind-to-Zero (`rl/train_vae_sac.py`):**
+  Added configurable `DonkeyVaeSACEnv` parameters (`reversal_unwind_scale=2.0`,
+  `reversal_cte_threshold=0.40`, `reversal_head_deg_threshold=8.0`, `reversal_min_last_steer=0.30`):
+  - Uses **only observation geometry** (`last_pred_geom` for vision or telemetry `[0:3]` for
+    teacher — zero privileged ground-truth leakage for vision).
+  - Activates **only** when `(steer * last_steer < 0)`, `|last_steer| >= 0.30`, and
+    `(|cte_obs| >= 0.40 or |head_obs| >= 8.0°)`.
+  - Computes `eff_max_diff = max(max_diff, min(scale * max_diff, abs(last_steer)))`:
+    speeds return **only toward `0.0`** without skipping past `0.0` in a single step, leaving
+    centered driving (`98%+` of steps), same-sign turning, and small-angle dithering (`<0.30`)
+    untouched (`100%` identical to baseline). Notice an initial `v1` variant without
+    `reversal_min_last_steer=0.30` and with `|last_steer| + max_diff` caused `±0.40`
+    zero-crossing ping-pong under stress (`logs/teacher_fix_recovery_stress_v1`), which `v2`
+    eliminated (`logs/teacher_fix_recovery_stress_v2`).
+
+#### 3. Paired Closed-Loop Verification (`useSeed=0` Fresh Random Layouts; Round A Holdout Untouched)
+**Caveat (`useSeed=0`):** With `useSeed=0`, Unity generates fresh random track geometry per reload;
+new evaluations cannot replay the exact Round A Layout 7 geometry, so paired comparisons evaluate all
+conditions on the same freshly loaded layouts per run. Unit tests: `pytest -q` -> **38 passed**
+(including `tests/test_donkey_sync_and_ctrl.py`).
+
+**A. Paired Natural Evaluation (`--mode teacher_fix_paired --layouts 12`, 48 episodes, `logs/teacher_fix_paired_v2`):**
+
+| Condition | Comp | Mean Steps | Mean Laps | Mean \|CTE\| (CTE) | P95 / Max \|CTE\| | Speed | `step_dt_ms` P50/P95 | `bad_dt` Total / 11-ep `dt_std` (excl. L03 freeze) | `coal` / `unwind` | Excursions Recovered |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `baseline` (stock sync, no unwind) | 12/12 | 2000.0 | 9.00 | 0.1599 | 0.464 / 0.858 | 2.526 | 24.75 / 25.89 | 16 / 0.845 ms | 0 / 0 | 1/1 (med 5.0 st) |
+| `teacher_sync_only` (Fix A only) | 12/12 | 2000.0 | 9.00 | 0.1586 | 0.460 / 1.437 | 2.522 | 25.00 / 25.69 | 14 / 0.636 ms | 2 / 0 | 6/6 (med 7.5 st) |
+| `teacher_fixed` (Fix A + Fix B v2) | **12/12** | **2000.0** | **9.00** | 0.1643 | 0.482 / 1.425 | 2.520 | **25.00 / 25.69** | 86 (17 excl. L03)* / **0.540 ms** | 2 / 220 | **9/9** (med **5.0 st**) |
+| `vision_fixed_ctrl` (frozen head + A + B v2) | 11/12 | 1950.0 | 8.75 | 0.1851 | 0.497 / 2.153 | 2.531 | 25.00 / 25.69 | 61 / 1.139 ms | 2 / 277 | 23/24 (med 6.0 st) |
+
+- \*Note: `teacher_fixed` on `L03` experienced an external `2295.8 ms` (`2.3 s`) stall (`step 1709`)
+  and 50-step host jitter storm (`bad_dt=69`, `coal=2, burst=3`), recovered **8/8** excursions,
+  and still completed all 2000 steps (`max|CTE|=1.425`). Across the other 11 layouts, Fix A + Fix B
+  cut `step_dt_ms` episode `std` by **36%** (`0.845 -> 0.540 ms`) and locked P50 cleanly onto `25.00 ms`.
+- **GPU contention sensitivity finding (`logs/teacher_fix_paired_v1`):** In an earlier `v1` run
+  when the Windows host GPU (RTX 5080) was at `82–94%` load (`234–255 W`), `vision_fixed_ctrl`
+  DINOv2 `encoder_ms` P50/P95 degraded 3–5x (`15.39 / 24.51 ms`, up to `33 ms`), pushing
+  `obs_to_act > 25 ms` step period and causing `3/12` completion (`teacher_fixed` still went `12/12`,
+  `max|CTE| = 1.024` vs `baseline` `1.465` and `teacher_sync_only` `11/12`). Once host GPU load
+  returned to idle (`v2`), `vision_fixed_ctrl` ran at `enc P50/P95 = 4.33 / 5.33 ms`, improving
+  `mean|CTE|` from `0.1979` (Round A) to `0.1851` (`11/12` PASS).
+- **Remaining vision bottleneck:** The single `vision_fixed_ctrl` failure (`L04 step 1400`,
+  `cte=-2.153`) still showed large-offset visual underestimation (`err=+0.238` at `cte=-1.170`
+  growing to `+0.513` at `-2.153`), confirming Round B perception retraining remains necessary.
+
+**B. Paired Recovery Stress Evaluation (`--mode teacher_fix_recovery_stress --layouts 8`, 24 episodes, `logs/teacher_fix_recovery_stress_v2`):**
+Deterministic paired disturbance schedule on every layout (`Kick 1`: steps `320..322` `±0.70` steer;
+`95 ms` TCP stall: step `900`; `Kick 2`: steps `1300..1302` `∓0.70` steer). Note `nvidia-smi` was at
+`~94%` host GPU load during this run (`vision_fixed_ctrl` `enc P50/P95 = 19.36 / 30.26 ms`):
+
+| Condition | Comp | Mean Steps | Mean Laps | Mean \|CTE\| | Speed | Post-Stall (step 900) Deaths | Excursions Recovered |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `baseline` | 0/8 | 779.2 | 3.12 | 0.1995 | 2.350 | **4 / 5** reaching s=900 | `15/23` (`65.2%`) |
+| `teacher_fixed` | **3/8** | **1199.4** (+420.1) | **5.25** (+2.12) | **0.1973** | **2.394** | **0 / 5** reaching s=900 | **`23/28` (`82.1%`)** |
+| `vision_fixed_ctrl` *(host GPU 94%)* | 0/8 | 369.2 | 1.00 | 0.3618 | 2.170 | — | `56/64` (`87.5%`) |
+
+Under identical disturbances, `teacher_fixed` survived Kick 1, the `95 ms` stall, and Kick 2
+completely on 3 layouts (`L01`, `L03`, `L06`), eliminated all post-stall deaths (`0/5` vs `4/5` in
+`baseline`), and raised overall excursion recovery from `65.2%` to `82.1%` without harming steady-state
+tracking or speed.
+
+#### 4. Audit Follow-Up: Non-Blocking Send Fix, Real TCP Backlog Smoke Test & Entrypoint Wiring
+Addressing post-`v2` review findings before full 24-layout / Round B runs:
+1. **Non-blocking socket send correctness (`rl/donkey_sync.py`):** Replaced `sock.sendall()`
+   inside `_proc_msg_loop` with `sock.send(memoryview(_inflight_bytes)[_inflight_offset:])`, tracking
+   unsent payload bytes and byte offset under `_send_lock` (across both `enabled=True` and
+   `enabled=False`). Verified in `tests/test_donkey_sync_and_ctrl.py` (`42 passed` in `pytest -q`)
+   under chunked partial sends + `BlockingIOError`, mid-flight second-message queueing, real kernel
+   `SO_SNDBUF`/`SO_RCVBUF` backpressure, and `pause_recv` coalescing.
+2. **Control stall vs. real TCP receive-backlog stress (`tools/eval_teacher_tolerance.py`):**
+   Clarified that the earlier `v2` step-900 stall (`time.sleep(0.095)`) paused only the control thread
+   (`coalesced_dropped = 0`), leaving the socket reader active. Added `--stress-type {ctrl_stall,tcp_backlog,both}`,
+   per-episode `sync_controller.reset_stats()`, `max_burst_seen` tracking for `enabled=False`, and
+   `pause_recv(0.095)`. In a 1-layout live simulator smoke test (`logs/smoke_tcp_backlog_v1`,
+   `1050` steps, GPU idle `5%`, `enc P95 = 4.84–5.15 ms`), `pause_recv(0.095)` produced genuine
+   TCP bursts (`max_burst_seen = 3..4`): sync-enabled conditions coalesced and dropped `2–3` stale
+   frames (`coalesced_dropped = 2..3`) whereas stock `baseline` had `coalesced_dropped = 0` and
+   replayed stale buffered frames in `1.28 ms` / `1.77 ms` bursts (`steps 901..902`).
+3. **Complete within-run paired ablations & opt-in entrypoint integration:**
+   - Added `--mode teacher_fix_paired_full` and upgraded `teacher_fix_recovery_stress` to run all
+     5 conditions side-by-side (`baseline`, `teacher_sync_only`, `teacher_fixed`, `vision_baseline`,
+     `vision_fixed_ctrl`) on identical tracks.
+   - Wired opt-in control flags (`--low-jitter-sync` default `False`, `--reversal-unwind-scale`
+     default `1.0`) via shared `add_control_fix_args` / `configure_env_control_fixes` helpers into
+     `rl/train_vae_sac.py`, `rl/train_loop_vae_sac.py`, `rl/eval_vae_sac.py`,
+     `rl/eval_loop_vae_sac.py`, and `rl/eval_paired_randomized.py`, preserving `environment_config()`
+     and `validate_model_config()` compatibility for existing checkpoints.
+   - **Deferred to next session (paused by user):** Running `--mode teacher_fix_paired_full --layouts 24`
+     and 12-layout 5-condition stress evaluations under idle GPU before moving to Round B.

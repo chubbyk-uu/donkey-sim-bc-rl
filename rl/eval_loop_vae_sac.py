@@ -16,6 +16,7 @@ from stable_baselines3 import SAC
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from rl.donkey_sync import add_control_fix_args, configure_env_control_fixes
 from rl.experiment import EvalRecord, environment_config, parse_lags, validate_args, validate_model_config
 
 from rl.train_vae_sac import (
@@ -108,6 +109,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True,
                         help="Use deterministic policy actions. Pass --no-deterministic "
                              "to sample stochastic SAC actions.")
+    add_control_fix_args(parser)
     return parser.parse_args()
 
 
@@ -150,6 +152,7 @@ def _evaluate(args, record) -> None:
         reward_config=reward_config_from_args(args),
         scene_reload_every=args.scene_reload_every,
     )
+    configure_env_control_fixes(env, args)
     env = TimeLimit(env, max_episode_steps=args.max_episode_steps)
 
     try:

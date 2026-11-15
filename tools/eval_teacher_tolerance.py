@@ -37,6 +37,7 @@ from stable_baselines3 import SAC
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
+from rl.donkey_sync import LowJitterSyncController  # noqa: E402
 from rl.experiment import (  # noqa: E402
     bootstrap_mean_interval,
     paired_statistics,
@@ -256,6 +257,10 @@ def _summarize_step_pool(step_pool: list[dict]) -> dict:
         "step_dt_ms_p95": float(np.percentile(dt_ms, 95)),
         "step_dt_ms_p99": float(np.percentile(dt_ms, 99)),
         "step_dt_ms_max": float(np.max(dt_ms)),
+        "step_dt_ms_std": float(np.std(dt_ms)),
+        "bad_dt_steps": int(np.sum((dt_ms < 18.0) | (dt_ms > 32.0))),
+        "bad_dt_fraction": float(np.mean((dt_ms < 18.0) | (dt_ms > 32.0))),
+        "reversal_unwind_steps": int(sum(1 for s in step_pool if s.get("reversal_unwind_active", False))),
         "cte_positive_mean_err_units": float(np.mean(eff_cte[cte_signed >= 0.5])) if np.any(cte_signed >= 0.5) else 0.0,
         "cte_negative_mean_err_units": float(np.mean(eff_cte[cte_signed <= -0.5])) if np.any(cte_signed <= -0.5) else 0.0,
     }
@@ -300,7 +305,24 @@ def summarize_episodes(
             "mean_eff_la1_p95_pos": float(np.mean([r["eff_la1_err_p95_pos"] for r in rows])),
             "encoder_ms_p50": float(np.mean([r["encoder_ms_p50"] for r in rows])),
             "encoder_ms_p95": float(np.mean([r["encoder_ms_p95"] for r in rows])),
+            "max_encoder_ms_p95": float(np.max([r["encoder_ms_p95"] for r in rows])),
+            "mean_decision_obs_to_act_ms_p95": float(np.mean([r.get("decision_obs_to_act_ms_p95", 0.0) for r in rows])),
+            "mean_step_dt_ms_p95": float(np.mean([r.get("step_dt_ms_p95", 0.0) for r in rows])),
+            "bad_dt_steps_total": int(sum(r.get("bad_dt_steps", 0) for r in rows)),
+            "coalesced_dropped_total": int(sum(r.get("coalesced_dropped", 0) for r in rows)),
+            "max_burst_seen": int(max((r.get("max_burst_seen", 1) for r in rows), default=1)),
+            "reversal_unwind_steps_total": int(sum(r.get("reversal_unwind_steps", 0) for r in rows)),
         }
+        ep_excursions = [exc for r in rows for exc in r.get("excursions", [])]
+        rec_durations = [exc["duration_steps"] for exc in ep_excursions if exc.get("recovered")]
+        cond_entry["excursion_count"] = len(ep_excursions)
+        cond_entry["excursion_recovered_count"] = int(sum(1 for exc in ep_excursions if exc.get("recovered")))
+        cond_entry["excursion_recovery_rate"] = (
+            float(cond_entry["excursion_recovered_count"] / len(ep_excursions)) if ep_excursions else None
+        )
+        cond_entry["excursion_median_recovery_steps"] = (
+            float(np.median(rec_durations)) if rec_durations else None
+        )
 
         if step_pools_by_cond and cname in step_pools_by_cond:
             pool = step_pools_by_cond[cname]
@@ -340,6 +362,31 @@ def summarize_episodes(
     return summary
 
 
+def _paired_trajectory_delta(eps: list[dict], ref_name: str, cand_name: str) -> dict | None:
+    ref_by_l = {e["layout"]: e for e in eps if e["condition"] == ref_name}
+    cand_by_l = {e["layout"]: e for e in eps if e["condition"] == cand_name}
+    shared = sorted(ref_by_l.keys() & cand_by_l.keys())
+    if not shared:
+        return None
+    cte_diffs = [cand_by_l[k]["mean_abs_cte"] - ref_by_l[k]["mean_abs_cte"] for k in shared]
+    max_cte_diffs = [cand_by_l[k]["max_abs_cte"] - ref_by_l[k]["max_abs_cte"] for k in shared]
+    spd_diffs = [cand_by_l[k]["mean_speed"] - ref_by_l[k]["mean_speed"] for k in shared]
+    ref_mean_cte = float(np.mean([ref_by_l[k]["mean_abs_cte"] for k in shared]))
+    cand_mean_cte = float(np.mean([cand_by_l[k]["mean_abs_cte"] for k in shared]))
+    return {
+        "candidate": cand_name,
+        "reference": ref_name,
+        "shared_layouts": len(shared),
+        "mean_abs_cte_diff_units": float(np.mean(cte_diffs)),
+        "mean_abs_cte_diff_ci95_units": list(bootstrap_mean_interval(cte_diffs)),
+        "mean_abs_cte_ratio": float(cand_mean_cte / max(ref_mean_cte, 1e-8)),
+        "max_abs_cte_diff_units": float(np.mean(max_cte_diffs)),
+        "max_abs_cte_diff_ci95_units": list(bootstrap_mean_interval(max_cte_diffs)),
+        "mean_speed_diff": float(np.mean(spd_diffs)),
+        "mean_speed_diff_ci95": list(bootstrap_mean_interval(spd_diffs)),
+    }
+
+
 def compute_paired_vs_baseline(all_episodes: list[dict], condition_names: list[str]) -> dict:
     """Compute paired layout-by-layout comparisons (overall and per split)."""
     if "baseline" not in condition_names or len(condition_names) < 2:
@@ -364,33 +411,30 @@ def compute_paired_vs_baseline(all_episodes: list[dict], condition_names: list[s
             for e in eps
         ]
         p_stats = paired_statistics(formatted_for_exp)
-        base_by_l = {e["layout"]: e for e in eps if e["condition"] == "baseline"}
         extra_pairs = []
         for cname in condition_names:
             if cname == "baseline":
                 continue
-            cand_by_l = {e["layout"]: e for e in eps if e["condition"] == cname}
-            shared = sorted(base_by_l.keys() & cand_by_l.keys())
-            if not shared:
-                continue
-            cte_diffs = [cand_by_l[k]["mean_abs_cte"] - base_by_l[k]["mean_abs_cte"] for k in shared]
-            max_cte_diffs = [cand_by_l[k]["max_abs_cte"] - base_by_l[k]["max_abs_cte"] for k in shared]
-            spd_diffs = [cand_by_l[k]["mean_speed"] - base_by_l[k]["mean_speed"] for k in shared]
-            base_mean_cte = float(np.mean([base_by_l[k]["mean_abs_cte"] for k in shared]))
-            cand_mean_cte = float(np.mean([cand_by_l[k]["mean_abs_cte"] for k in shared]))
-            extra_pairs.append({
-                "candidate": cname,
-                "reference": "baseline",
-                "shared_layouts": len(shared),
-                "mean_abs_cte_diff_units": float(np.mean(cte_diffs)),
-                "mean_abs_cte_diff_ci95_units": list(bootstrap_mean_interval(cte_diffs)),
-                "mean_abs_cte_ratio_vs_baseline": float(cand_mean_cte / max(base_mean_cte, 1e-8)),
-                "max_abs_cte_diff_units": float(np.mean(max_cte_diffs)),
-                "max_abs_cte_diff_ci95_units": list(bootstrap_mean_interval(max_cte_diffs)),
-                "mean_speed_diff": float(np.mean(spd_diffs)),
-                "mean_speed_diff_ci95": list(bootstrap_mean_interval(spd_diffs)),
-            })
+            pair = _paired_trajectory_delta(eps, "baseline", cname)
+            if pair is not None:
+                pair["mean_abs_cte_ratio_vs_baseline"] = pair.pop("mean_abs_cte_ratio")
+                extra_pairs.append(pair)
         p_stats["trajectory_deltas_vs_baseline"] = extra_pairs
+
+        control_pairs = []
+        for ref_c, cand_c in (
+            ("baseline", "teacher_sync_only"),
+            ("teacher_sync_only", "teacher_fixed"),
+            ("vision_baseline", "vision_fixed_ctrl"),
+            ("baseline", "vision_baseline"),
+            ("teacher_fixed", "vision_fixed_ctrl"),
+        ):
+            if ref_c in condition_names and cand_c in condition_names:
+                pair = _paired_trajectory_delta(eps, ref_c, cand_c)
+                if pair is not None:
+                    control_pairs.append(pair)
+        if control_pairs:
+            p_stats["paired_control_deltas"] = control_pairs
         out[scope_name] = p_stats
     return out
 
@@ -424,11 +468,80 @@ def build_conditions(mode: str) -> tuple[list[tuple[str, str | None, float, int]
             ("pca128_1f_1.5x_d1", "pred_pca128_ridge_1f", 1.5, 1),
             ("vision_proj15_lags_live", "__LIVE_VISION__", 0.0, 0),
         ]
+    elif mode == "teacher_fix_paired":
+        specs = [
+            ("baseline", None, 0.0, 0),
+            ("teacher_sync_only", None, 0.0, 0),
+            ("teacher_fixed", None, 0.0, 0),
+            ("vision_fixed_ctrl", "__LIVE_VISION__", 0.0, 0),
+        ]
+    elif mode == "teacher_fix_paired_full":
+        specs = [
+            ("baseline", None, 0.0, 0),
+            ("teacher_sync_only", None, 0.0, 0),
+            ("teacher_fixed", None, 0.0, 0),
+            ("vision_baseline", "__LIVE_VISION__", 0.0, 0),
+            ("vision_fixed_ctrl", "__LIVE_VISION__", 0.0, 0),
+        ]
+    elif mode == "teacher_fix_recovery_stress":
+        specs = [
+            ("baseline", None, 0.0, 0),
+            ("teacher_sync_only", None, 0.0, 0),
+            ("teacher_fixed", None, 0.0, 0),
+            ("vision_baseline", "__LIVE_VISION__", 0.0, 0),
+            ("vision_fixed_ctrl", "__LIVE_VISION__", 0.0, 0),
+        ]
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
     pred_keys = sorted({k for _, k, _, _ in specs if k is not None and k != "__LIVE_VISION__"})
     return specs, pred_keys
+
+
+def condition_control_config(condition_name: str) -> dict:
+    """Return control-loop sync and bounded reversal unwind parameters per condition."""
+    if condition_name in ("baseline", "vision_baseline"):
+        return {"sync_enabled": False, "reversal_unwind_scale": 1.0}
+    if condition_name == "teacher_sync_only":
+        return {"sync_enabled": True, "reversal_unwind_scale": 1.0}
+    if condition_name in ("teacher_fixed", "vision_fixed_ctrl"):
+        return {"sync_enabled": True, "reversal_unwind_scale": 2.0}
+    return {"sync_enabled": False, "reversal_unwind_scale": 1.0}
+
+
+def apply_recovery_stress(
+    action: np.ndarray,
+    next_step: int,
+    layout_idx: int,
+    stress_type: str = "ctrl_stall",
+) -> tuple[np.ndarray, float, str | None]:
+    """Deterministic paired lateral kick + stall/TCP-backlog schedule for stress testing.
+
+    Returns `(action_to_step, stall_or_pause_sec, disturbance_tag)`:
+    - Steps 320..322: 3-step steering kick (`+/-0.70` alternating by layout parity).
+    - Step 900 (`ctrl_stall`): `95 ms` control-thread `sleep` while recv thread runs.
+    - Step 900 (`tcp_backlog`): `95 ms` real TCP socket `recv()` pause so packets queue in OS buffer.
+    - `both`: `stall_95ms` at step 600 + `tcp_recv_pause_95ms` at step 900 (plus both kicks).
+    - Steps 1300..1302: 3-step steering kick in the opposite direction.
+    """
+    act = np.array(action, dtype=np.float32, copy=True)
+    sign_1 = 1.0 if (layout_idx % 2 == 1) else -1.0
+    if 320 <= next_step <= 322:
+        act[0] = sign_1 * 0.70
+        return act, 0.0, "kick_1"
+    if stress_type == "ctrl_stall" and next_step == 900:
+        return act, 0.095, "stall_95ms"
+    if stress_type == "tcp_backlog" and next_step == 900:
+        return act, 0.095, "tcp_recv_pause_95ms"
+    if stress_type == "both":
+        if next_step == 600:
+            return act, 0.095, "stall_95ms"
+        if next_step == 900:
+            return act, 0.095, "tcp_recv_pause_95ms"
+    if 1300 <= next_step <= 1302:
+        act[0] = -sign_1 * 0.70
+        return act, 0.0, "kick_2"
+    return act, 0.0, None
 
 
 def main() -> None:
@@ -437,8 +550,21 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=9091)
     parser.add_argument(
         "--mode",
-        choices=("round_a_vision_paired", "vision_and_d0", "tolerance_d0_vs_d1"),
+        choices=(
+            "round_a_vision_paired",
+            "vision_and_d0",
+            "tolerance_d0_vs_d1",
+            "teacher_fix_paired",
+            "teacher_fix_paired_full",
+            "teacher_fix_recovery_stress",
+        ),
         default="vision_and_d0",
+    )
+    parser.add_argument(
+        "--stress-type",
+        choices=("ctrl_stall", "tcp_backlog", "both"),
+        default="ctrl_stall",
+        help="Disturbance type at stall window when --mode=teacher_fix_recovery_stress.",
     )
     parser.add_argument("--regime", choices=("all", "cruising", "corner", "high_cte"), default="all")
     parser.add_argument("--teacher", type=Path, default=Path("models/rl_loop_sim_state_ts2_sdiff01_v1/sac_sim_state_60000_steps.zip"))
@@ -535,6 +661,7 @@ def main() -> None:
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "git_commit": get_git_commit(),
         "mode": args.mode,
+        "stress_type": args.stress_type if args.mode == "teacher_fix_recovery_stress" else None,
         "regime_filter": args.regime,
         "layouts": args.layouts,
         "max_episode_steps": args.max_episode_steps,
@@ -620,6 +747,7 @@ def main() -> None:
         SPLIT_LOCKED_EVAL_HOLDOUT: [],
     }
     controller = env.env.unwrapped.viewer
+    sync_controller = LowJitterSyncController(controller, enabled=False).install()
     scene = controller.handler.SceneToLoad
     ep_counter = 0
 
@@ -643,6 +771,9 @@ def main() -> None:
             for cond_idx in order:
                 ep_counter += 1
                 cname, pkey, scale, d_steps = condition_specs[cond_idx]
+                ctrl_cfg = condition_control_config(cname)
+                sync_controller.set_enabled(ctrl_cfg["sync_enabled"])
+                env.set_control_fixes(reversal_unwind_scale=ctrl_cfg["reversal_unwind_scale"])
                 if pkey == "__LIVE_VISION__":
                     assert live_vision_enc is not None
                     enc = live_vision_enc
@@ -660,6 +791,7 @@ def main() -> None:
                 env.set_observation(enc, latent_lags=())
 
                 obs, info = env.reset()
+                sync_controller.reset_stats()
                 init_image_0 = np.array(env.last_raw_obs, dtype=np.uint8, copy=True)
                 init_true_state_0 = enc.last_true_state.copy()
                 init_pred_geom_0 = enc.last_pred_geom.copy()
@@ -715,6 +847,15 @@ def main() -> None:
 
                     t_pol0 = time.perf_counter()
                     action, _ = teacher.predict(obs, deterministic=True)
+                    disturb_tag = None
+                    if args.mode == "teacher_fix_recovery_stress":
+                        action, stress_dur_s, disturb_tag = apply_recovery_stress(
+                            action, steps + 1, layout_idx, stress_type=args.stress_type
+                        )
+                        if disturb_tag == "stall_95ms" and stress_dur_s > 0.0:
+                            time.sleep(stress_dur_s)
+                        elif disturb_tag == "tcp_recv_pause_95ms" and stress_dur_s > 0.0:
+                            sync_controller.pause_recv(stress_dur_s)
                     t_act_sent = time.perf_counter()
 
                     obs, reward, terminated, truncated, info = env.step(action)
@@ -808,6 +949,8 @@ def main() -> None:
                         "decision_obs_to_act_ms": obs_to_act_ms,
                         "sim_wait_ms": sim_wait_ms,
                         "step_dt_ms": step_dt_ms,
+                        "reversal_unwind_active": bool(info.get("reversal_unwind_active", False)),
+                        "disturbance": disturb_tag,
                     })
 
                     if terminated:
@@ -923,12 +1066,20 @@ def main() -> None:
                 enc_p95 = float(np.percentile(enc_ms_list, 95)) if enc_ms_list else 0.0
                 obs_act_p95 = float(np.percentile(obs_to_act_ms_list, 95)) if obs_to_act_ms_list else 0.0
                 dt_p95 = float(np.percentile(step_dt_ms_list, 95)) if step_dt_ms_list else 0.0
+                dt_arr = np.asarray(step_dt_ms_list, dtype=np.float32) if step_dt_ms_list else np.zeros(0, dtype=np.float32)
+                bad_dt_steps = int(np.sum((dt_arr < 18.0) | (dt_arr > 32.0))) if len(dt_arr) else 0
+                dt_std = float(np.std(dt_arr)) if len(dt_arr) else 0.0
+                unwind_steps = int(sum(1 for s in ep_step_dicts if s.get("reversal_unwind_active", False)))
+                coalesced_dropped = int(sync_controller.coalesced_dropped)
+                max_burst_seen = int(sync_controller.max_burst_seen)
 
                 ep_row = {
                     "episode": ep_counter,
                     "layout": layout_idx,
                     "split": split_name,
                     "condition": cname,
+                    "sync_enabled": ctrl_cfg["sync_enabled"],
+                    "reversal_unwind_scale": ctrl_cfg["reversal_unwind_scale"],
                     "completed": completed,
                     "steps": steps,
                     "laps": laps,
@@ -939,6 +1090,7 @@ def main() -> None:
                     "mean_speed": float(np.mean(speeds)),
                     "mean_abs_dsteer": float(np.mean(dsteers)),
                     "rate_limit_sat_steps": int(np.sum(np.asarray(dsteers) >= 0.199)),
+                    "reversal_unwind_steps": unwind_steps,
                     "reward": total_reward,
                     "eff_cte_err_p95_units": eff_cte_p95,
                     "eff_head_deg_p95": eff_head_p95,
@@ -949,6 +1101,10 @@ def main() -> None:
                     "encoder_ms_p95": enc_p95,
                     "decision_obs_to_act_ms_p95": obs_act_p95,
                     "step_dt_ms_p95": dt_p95,
+                    "step_dt_ms_std": dt_std,
+                    "bad_dt_steps": bad_dt_steps,
+                    "coalesced_dropped": coalesced_dropped,
+                    "max_burst_seen": max_burst_seen,
                     "wall_seconds": elapsed,
                     "capture_npz": capture_rel_path,
                     "excursions": excursions,
@@ -986,6 +1142,7 @@ def main() -> None:
                     flush=True,
                 )
     finally:
+        sync_controller.close()
         env.close()
 
     summary = summarize_episodes(condition_names, all_episodes, step_pools_by_cond)

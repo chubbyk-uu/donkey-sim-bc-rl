@@ -15,6 +15,7 @@ from stable_baselines3 import SAC
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from rl.donkey_sync import add_control_fix_args, configure_env_control_fixes
 from rl.train_vae_sac import (
     CAMERA_HEIGHT,
     CAMERA_WIDTH,
@@ -42,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-throttle", type=float, default=MIN_THROTTLE)
     p.add_argument("--max-throttle", type=float, default=MAX_THROTTLE)
     p.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
+    add_control_fix_args(p)
     return p.parse_args()
 
 
@@ -62,6 +64,7 @@ def main() -> None:
         n_command_history=N_COMMAND_HISTORY,
         reward_config=RaffinRewardConfig(),
     )
+    configure_env_control_fixes(env, args)
     env = TimeLimit(env, max_episode_steps=args.max_episode_steps)
 
     model = SAC.load(str(args.model), env=env, device=device)
