@@ -37,6 +37,7 @@ from probe_geometry_15d import (  # noqa: E402
     map_and_clip_batch,
     svd_ridge_fit_predict,
 )
+from rl.geometry_encoder import MOTION_IDX, verify_cache_fingerprint  # noqa: E402
 
 LAGS = (2, 4)
 FAST_ALPHAS = np.array([1e1, 1e2, 1e3, 1e4, 3e4, 1e5, 3e5, 1e6], dtype=np.float32)
@@ -306,12 +307,14 @@ def cv_shared64_lags_mlp(
     groups_all: np.ndarray,
     device: torch.device,
     max_epochs: int = 35,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (single_model_oof, inner3_ensemble_oof) for SharedFrameLagMLP."""
     valid_idx = np.flatnonzero(valid)
     y_val = y_all[valid_idx]
     groups_val = groups_all[valid_idx]
     idx_val = idx_mat[valid_idx]
-    out = np.zeros_like(y_all, dtype=np.float32)
+    out_single = np.zeros_like(y_all, dtype=np.float32)
+    out_ens3 = np.zeros_like(y_all, dtype=np.float32)
 
     for fold, (train_v, test_v) in enumerate(GroupKFold(5).split(valid_idx, y_val, groups_val)):
         train_groups = set(groups_val[train_v])
@@ -351,9 +354,140 @@ def cv_shared64_lags_mlp(
             model.eval()
             with torch.no_grad():
                 p_norm = model(frame_bank, idx_te_t).cpu().numpy()
-            fold_preds += (p_norm * y_std + y_mean) / len(inner_splits)
-        out[valid_idx[test_v]] = fold_preds
-    return out
+            pred_unnorm = (p_norm * y_std + y_mean).astype(np.float32)
+            if inner_id == 0:
+                out_single[valid_idx[test_v]] = pred_unnorm
+            fold_preds += pred_unnorm / len(inner_splits)
+        out_ens3[valid_idx[test_v]] = fold_preds
+    return out_single, out_ens3
+
+
+def fit_and_export_proj15_lags_ridge(
+    grid: np.ndarray,
+    y_all: np.ndarray,
+    idx_mat: np.ndarray,
+    valid: np.ndarray,
+    groups_all: np.ndarray,
+    device: torch.device,
+    export_path: Path,
+    cache_meta: dict,
+) -> None:
+    """Fit full-dataset deployable `proj15_lags_ridge` head and export to `export_path`."""
+    valid_idx = np.flatnonzero(valid)
+    y_val = y_all[valid_idx]
+    groups_val = groups_all[valid_idx]
+
+    # 1. Stage 1 (6144 -> 15): 5-fold GroupKFold to select per-target alpha1 and get OOF z1
+    mu1 = grid.mean(0).astype(np.float64)
+    std1 = (grid.std(0) + 1e-6).astype(np.float64)
+    x_norm_all = torch.from_numpy(((grid - mu1) / std1).astype(np.float32)).to(device=device)
+    y_all_t = torch.from_numpy(y_all.astype(np.float32)).to(device=device)
+
+    val_sse1 = np.zeros((len(FAST_ALPHAS), y_all.shape[1]), dtype=np.float64)
+    split1_cache = []
+    for fit, val in GroupKFold(5).split(grid, y_all, groups_all):
+        fit_t = torch.tensor(fit, device=device)
+        val_t = torch.tensor(val, device=device)
+        preds = primal_cholesky_ridge(x_norm_all[fit_t], y_all_t[fit_t], x_norm_all[val_t], FAST_ALPHAS)
+        val_sse1 += ((preds - y_all[val][None, :, :]) ** 2).sum(axis=1)
+        split1_cache.append((val, preds))
+
+    best_a1_idx = np.argmin(val_sse1, axis=0)
+    alpha1 = np.array([float(FAST_ALPHAS[i]) for i in best_a1_idx], dtype=np.float32)
+    oof_z1 = np.zeros_like(y_all, dtype=np.float32)
+    for val, preds in split1_cache:
+        for j in range(y_all.shape[1]):
+            oof_z1[val, j] = preds[best_a1_idx[j], :, j]
+
+    # Fit Stage 1 weights on all frames for each selected alpha1[j]
+    b1_std = y_all_t.mean(0)  # (15,)
+    yc1 = y_all_t - b1_std.unsqueeze(0)
+    gram1 = x_norm_all.T @ x_norm_all
+    xty1 = x_norm_all.T @ yc1
+    eye1 = torch.eye(gram1.shape[0], device=device, dtype=torch.float32)
+    w1_std = torch.zeros((grid.shape[1], y_all.shape[1]), device=device, dtype=torch.float32)
+    for j in range(y_all.shape[1]):
+        chol, _ = torch.linalg.cholesky_ex(gram1 + float(alpha1[j]) * eye1)
+        w1_std[:, j] = torch.cholesky_solve(xty1[:, j : j + 1], chol).squeeze(1)
+
+    w1_std_np = w1_std.cpu().numpy().astype(np.float64)
+    b1_std_np = b1_std.cpu().numpy().astype(np.float64)
+    w1_folded = (w1_std_np / std1[:, None]).astype(np.float32)
+    b1_folded = (b1_std_np - mu1 @ w1_folded.astype(np.float64)).astype(np.float32)
+
+    # 2. Stage 2 (45 -> 15) on stacked Stage-1 OOF predictions [z_t, z_{t-2}, z_{t-4}]
+    stacked_45 = np.concatenate([oof_z1[idx_mat[valid_idx, k]] for k in range(idx_mat.shape[1])], axis=1)
+    mu2 = stacked_45.mean(0).astype(np.float64)
+    std2 = (stacked_45.std(0) + 1e-6).astype(np.float64)
+    s_norm_all = ((stacked_45 - mu2) / std2).astype(np.float32)
+
+    val_sse2 = np.zeros((len(ALPHAS), y_val.shape[1]), dtype=np.float64)
+    for fit, val in GroupKFold(5).split(s_norm_all, y_val, groups_val):
+        preds2 = svd_ridge_fit_predict(s_norm_all[fit], y_val[fit], s_norm_all[val], ALPHAS, device).cpu().numpy()
+        val_sse2 += ((preds2 - y_val[val][None, :, :]) ** 2).sum(axis=1)
+    best_a2_idx = np.argmin(val_sse2, axis=0)
+    alpha2 = np.array([float(ALPHAS[i]) for i in best_a2_idx], dtype=np.float32)
+
+    s_norm_t = torch.from_numpy(s_norm_all).to(device=device, dtype=torch.float32)
+    y_val_t = torch.from_numpy(y_val).to(device=device, dtype=torch.float32)
+    b2_std = y_val_t.mean(0)
+    yc2 = y_val_t - b2_std.unsqueeze(0)
+    gram2 = s_norm_t.T @ s_norm_t
+    xty2 = s_norm_t.T @ yc2
+    eye2 = torch.eye(gram2.shape[0], device=device, dtype=torch.float32)
+    w2_std = torch.zeros((s_norm_all.shape[1], y_val.shape[1]), device=device, dtype=torch.float32)
+    for j in range(y_val.shape[1]):
+        chol, _ = torch.linalg.cholesky_ex(gram2 + float(alpha2[j]) * eye2)
+        w2_std[:, j] = torch.cholesky_solve(xty2[:, j : j + 1], chol).squeeze(1)
+
+    w2_std_np = w2_std.cpu().numpy().astype(np.float64)
+    b2_std_np = b2_std.cpu().numpy().astype(np.float64)
+    w2_folded = (w2_std_np / std2[:, None]).astype(np.float32)
+    b2_folded = (b2_std_np - mu2 @ w2_folded.astype(np.float64)).astype(np.float32)
+
+    # Sanity check folded affine weights vs explicit standardized weights
+    sample_x = grid[:64].astype(np.float32)
+    z1_explicit = (((sample_x - mu1.astype(np.float32)) / std1.astype(np.float32)) @ w1_std_np.astype(np.float32) + b1_std_np.astype(np.float32))
+    z1_folded = sample_x @ w1_folded + b1_folded
+    if not np.allclose(z1_explicit, z1_folded, atol=1e-4):
+        raise RuntimeError("Stage 1 folded affine weights deviate from standardized weights")
+
+    sample_s = stacked_45[:64].astype(np.float32)
+    z2_explicit = (((sample_s - mu2.astype(np.float32)) / std2.astype(np.float32)) @ w2_std_np.astype(np.float32) + b2_std_np.astype(np.float32))
+    z2_folded = sample_s @ w2_folded + b2_folded
+    if not np.allclose(z2_explicit, z2_folded, atol=1e-4):
+        raise RuntimeError("Stage 2 folded affine weights deviate from standardized weights")
+
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format": "proj15_lags_ridge_v1",
+        "encoder_name": "dinov2_vits14_grid",
+        "crop_top": int(cache_meta.get("crop_top", 0)),
+        "grid_side": 4,
+        "lags": list(LAGS),
+        "geom_idx": list(GEOM_IDX),
+        "motion_idx": list(MOTION_IDX),
+        "w1": torch.from_numpy(w1_folded),
+        "b1": torch.from_numpy(b1_folded),
+        "w2": torch.from_numpy(w2_folded),
+        "b2": torch.from_numpy(b2_folded),
+        "mu1": torch.from_numpy(mu1.astype(np.float32)),
+        "std1": torch.from_numpy(std1.astype(np.float32)),
+        "w1_std": torch.from_numpy(w1_std_np.astype(np.float32)),
+        "b1_std": torch.from_numpy(b1_std_np.astype(np.float32)),
+        "alpha1": torch.from_numpy(alpha1),
+        "mu2": torch.from_numpy(mu2.astype(np.float32)),
+        "std2": torch.from_numpy(std2.astype(np.float32)),
+        "w2_std": torch.from_numpy(w2_std_np.astype(np.float32)),
+        "b2_std": torch.from_numpy(b2_std_np.astype(np.float32)),
+        "alpha2": torch.from_numpy(alpha2),
+        "cache_fingerprint_sha256": str(cache_meta.get("fingerprint_sha256", "")),
+        "track_centerline_sha256": str(cache_meta.get("track_centerline_sha256", "")),
+        "n_frames": int(len(grid)),
+        "n_valid_lagged_frames": int(len(valid_idx)),
+    }
+    torch.save(payload, export_path)
+    print(f"Exported deployable linear lag perception head to {export_path}", flush=True)
 
 
 def cv_raw18432_lags_ridge(
@@ -412,11 +546,35 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--probe-dir", type=Path, default=Path("logs/probe_geometry_15d_v1"))
     parser.add_argument("--teacher", type=Path, default=Path("models/rl_loop_sim_state_ts2_sdiff01_v1/sac_sim_state_60000_steps.zip"))
+    parser.add_argument("--export-head", type=Path, default=Path("models/dinov2_geometry_15d/proj15_lags_ridge.pt"))
+    parser.add_argument("--backfill-cache-meta", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     device = torch.device(args.device)
 
-    cache = np.load(args.probe_dir / "feature_cache.npz", allow_pickle=False)
+    cache_path = args.probe_dir / "feature_cache.npz"
+    meta_path = cache_path.with_suffix(".meta.json")
+    if args.backfill_cache_meta and not meta_path.exists():
+        from probe_state_from_features import load_frames
+        from probe_teacher_action import teacher_inputs
+        from rl.geometry_encoder import compute_cache_fingerprint
+        from rl.track_state import TrackState
+
+        r1_res = json.loads((args.probe_dir / "probe_geometry_results.json").read_text())
+        runs = [Path(p) for p in r1_res["runs"]]
+        centerline_path = Path("models/track_centerline/generated_track.npz")
+        records = [rec for r in runs for rec in load_frames(r)]
+        state_check, _ = teacher_inputs(runs, records, TrackState.load(centerline_path))
+        raw_cache = np.load(cache_path, allow_pickle=False)
+        if len(records) != len(raw_cache["state"]) or not np.allclose(state_check, raw_cache["state"], atol=1e-5):
+            raise RuntimeError("Cached state does not match current runs and centerline; cannot backfill metadata.")
+        meta = compute_cache_fingerprint(runs=runs, centerline_path=centerline_path, crop_top=0, encoder_name="dinov2_vits14")
+        meta["n_frames"] = len(records)
+        meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+        print(f"Verified and backfilled cache metadata to {meta_path} (sha256={meta['fingerprint_sha256'][:12]})", flush=True)
+
+    cache_meta = verify_cache_fingerprint(cache_path)
+    cache = np.load(cache_path, allow_pickle=False)
     oof_r1 = np.load(args.probe_dir / "oof_geometry_predictions.npz", allow_pickle=False)
 
     grid_feat = cache["patch_grid"]
@@ -446,15 +604,24 @@ def main() -> None:
     }
 
     header = (
-        f"{'candidate':<21} {'subset':<18} {'fit_s':>6} "
-        f"{'CTE MAE/P95':>13} {'CTE w20 P95':>11} "
-        f"{'Head MAE/P95':>14} {'LA1.0 MAE/P95':>15} "
+        f"{'candidate':<22} {'subset':<18} {'fit_s':>6} "
+        f"{'CTE(u) MAE/P95':>14} {'CTE w20 P95':>11} "
+        f"{'Head MAE/P95':>14} {'LA1.0(pos) M/P95':>16} "
         f"{'RawSteer MAE/P95':>16} {'ExecSteer MAE/P95':>17} {'ExecThrot MAE/P95':>17}"
     )
     print(header, flush=True)
     print("-" * len(header), flush=True)
 
-    results = {"valid_frames": int(valid.sum()), "candidates": {}}
+    results = {
+        "valid_frames": int(valid.sum()),
+        "cache_fingerprint_sha256": cache_meta.get("fingerprint_sha256"),
+        "units": {
+            "cte": "simulator CTE units (track termination limit is +/-2.0; ~7.98 CTE units per position unit)",
+            "heading": "degrees (circular angle difference after unit-circle normalization)",
+            "lookahead": "simulator position units (1 position unit is ~7.98 CTE units)",
+        },
+        "candidates": {},
+    }
     saved_preds = {k: oof_r1[k] for k in oof_r1.files}
     saved_preds["valid_lags_mask"] = valid
 
@@ -475,7 +642,7 @@ def main() -> None:
             w20 = c["window_bias"]["w20"]["p95_max_abs"]
             w20_str = f"{w20:.3f}" if w20 is not None else "n/a"
             print(
-                f"{name:<21} {sub_name:<18} {elapsed:>5.1f}s "
+                f"{name:<22} {sub_name:<18} {elapsed:>5.1f}s "
                 f"{c['mae']:>5.3f}/{c['p95']:<5.3f}   {w20_str:>11} "
                 f"{h['mae']:>5.2f}°/{h['p95']:<5.2f}° "
                 f"{la1['euclid_mae_pos']:>6.3f}/{la1['euclid_p95_pos']:<6.3f}   "
@@ -502,12 +669,27 @@ def main() -> None:
     report_candidate("proj15_lags_mlp", t_proj15, pred_proj15_mlp)
 
     t0 = time.perf_counter()
-    pred_shared64_mlp = cv_shared64_lags_mlp(grid_feat, y_geom, idx_mat, valid, groups, device)
-    report_candidate("shared64_lags_mlp", time.perf_counter() - t0, pred_shared64_mlp)
+    pred_shared64_1m, pred_shared64_ens3 = cv_shared64_lags_mlp(grid_feat, y_geom, idx_mat, valid, groups, device)
+    t_shared64 = time.perf_counter() - t0
+    report_candidate("shared64_lags_mlp_1m", t_shared64, pred_shared64_1m)
+    report_candidate("shared64_lags_mlp_ens3", t_shared64, pred_shared64_ens3)
+    saved_preds["pred_shared64_lags_mlp"] = pred_shared64_ens3
 
     t0 = time.perf_counter()
     pred_raw18432_ridge = cv_raw18432_lags_ridge(grid_feat, y_geom, idx_mat, valid, groups, device)
     report_candidate("raw18432_lags_ridge", time.perf_counter() - t0, pred_raw18432_ridge)
+
+    if args.export_head is not None:
+        fit_and_export_proj15_lags_ridge(
+            grid=grid_feat,
+            y_all=y_geom,
+            idx_mat=idx_mat,
+            valid=valid,
+            groups_all=groups,
+            device=device,
+            export_path=args.export_head,
+            cache_meta=cache_meta,
+        )
 
     np.savez(args.probe_dir / "oof_geometry_predictions_lags.npz", **saved_preds)
     (args.probe_dir / "probe_geometry_lags_results.json").write_text(json.dumps(results, indent=2) + "\n")

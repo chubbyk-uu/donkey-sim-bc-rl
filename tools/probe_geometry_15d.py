@@ -34,10 +34,14 @@ sys.path.insert(0, str(REPO / "tools"))
 
 from probe_state_from_features import extract_features, load_frames  # noqa: E402
 from probe_teacher_action import teacher_inputs  # noqa: E402
+from rl.geometry_encoder import (  # noqa: E402
+    GEOM_IDX,
+    MOTION_IDX,
+    compute_cache_fingerprint,
+    verify_cache_fingerprint,
+)
 from rl.track_state import LOOKAHEAD, TrackState  # noqa: E402
 
-GEOM_IDX = [0, 1, 2] + list(range(6, 18))  # 15 dims
-MOTION_IDX = [3, 4, 5]                     # 3 dims: vel[2]/2, vel[0]*4, gyro[1]/2
 ALPHAS = np.logspace(-1, 6, 16)
 
 
@@ -46,9 +50,29 @@ def load_or_build_cache(
     centerline_path: Path,
     cache_path: Path,
     device: torch.device,
+    crop_top: int = 0,
+    rebuild_cache: bool = False,
 ) -> dict[str, np.ndarray]:
-    if cache_path.exists():
-        print(f"Loading cached features from {cache_path} ...", flush=True)
+    meta_path = cache_path.with_suffix(".meta.json")
+    expected_meta = compute_cache_fingerprint(
+        runs=runs,
+        centerline_path=centerline_path,
+        crop_top=crop_top,
+        encoder_name="dinov2_vits14",
+    )
+    if cache_path.exists() and not rebuild_cache:
+        verify_cache_fingerprint(
+            cache_path=cache_path,
+            runs=runs,
+            centerline_path=centerline_path,
+            crop_top=crop_top,
+            encoder_name="dinov2_vits14",
+        )
+        print(
+            f"Loading cached features from {cache_path} "
+            f"(verified fingerprint {expected_meta['fingerprint_sha256'][:12]}) ...",
+            flush=True,
+        )
         data = np.load(cache_path, allow_pickle=False)
         return {k: data[k] for k in data.files}
 
@@ -56,7 +80,7 @@ def load_or_build_cache(
     records = [record for run in runs for record in load_frames(run)]
     track = TrackState.load(centerline_path)
     state, history = teacher_inputs(runs, records, track)
-    features = extract_features(records, device, crop_top=0)
+    features = extract_features(records, device, crop_top=crop_top)
 
     payload = {
         "cls": features["cls"].astype(np.float32),
@@ -71,6 +95,8 @@ def load_or_build_cache(
     }
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(cache_path, **payload)
+    expected_meta["n_frames"] = len(records)
+    meta_path.write_text(json.dumps(expected_meta, indent=2) + "\n")
     print(f"Cached {len(records)} frames to {cache_path} in {time.perf_counter() - t0:.1f}s", flush=True)
     return payload
 
@@ -399,12 +425,22 @@ def main() -> None:
     parser.add_argument("--teacher", type=Path, default=Path("models/rl_loop_sim_state_ts2_sdiff01_v1/sac_sim_state_60000_steps.zip"))
     parser.add_argument("--track-centerline", type=Path, default=Path("models/track_centerline/generated_track.npz"))
     parser.add_argument("--output-dir", type=Path, default=Path("logs/probe_geometry_15d_v1"))
+    parser.add_argument("--crop-top", type=int, default=0)
+    parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
-    cache = load_or_build_cache(args.runs, args.track_centerline, args.output_dir / "feature_cache.npz", device)
+    cache_path = args.output_dir / "feature_cache.npz"
+    cache = load_or_build_cache(
+        args.runs,
+        args.track_centerline,
+        cache_path,
+        device,
+        crop_top=args.crop_top,
+        rebuild_cache=args.rebuild_cache,
+    )
     cls_feat = cache["cls"]
     grid_feat = cache["patch_grid"]
     state = cache["state"]
@@ -441,6 +477,11 @@ def main() -> None:
     results = {
         "runs": [str(r) for r in args.runs],
         "teacher": str(args.teacher),
+        "units": {
+            "cte": "simulator CTE units (track termination limit is +/-2.0; ~7.98 CTE units per position unit)",
+            "heading": "degrees (circular angle difference after unit-circle normalization)",
+            "lookahead": "simulator position units (1 position unit is ~7.98 CTE units)",
+        },
         "frames": int(len(state)),
         "layouts": int(len(set(groups))),
         "candidates": {},
@@ -449,8 +490,8 @@ def main() -> None:
 
     header = (
         f"{'candidate':<17} {'subset':<18} {'fit_s':>6} "
-        f"{'CTE MAE/P95':>13} {'CTE w20 P95':>11} "
-        f"{'Head MAE/P95':>14} {'LA1.0 MAE/P95':>15} "
+        f"{'CTE(u) MAE/P95':>14} {'CTE w20 P95':>11} "
+        f"{'Head MAE/P95':>14} {'LA1.0(pos) M/P95':>16} "
         f"{'RawSteer MAE/P95':>16} {'ExecSteer MAE/P95':>17} {'ExecThrot MAE/P95':>17}"
     )
     print(header, flush=True)
