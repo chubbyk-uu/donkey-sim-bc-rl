@@ -1,0 +1,176 @@
+{
+  "source_run": "logs/visual_student_eval_10layouts_3000_v1",
+  "source_results_sha256": "abf9e37d453a6b903a31462354d79ba7e0ee6e4bcbf020ed7493ba0d4f372ccc",
+  "scope": "Recorded simulator evaluation; saved menu settings are not independent measurements of live engine state.",
+  "simulator_saved_settings": {
+    "fps": 120,
+    "timeScale": 2.0,
+    "generateTrees": 1,
+    "generateRandomCones": 0,
+    "randomLight": 1,
+    "useSeed": 0
+  },
+  "checkpoint_files": {
+    "student": {
+      "path": "models/visual_student_no_motion_v1/student.pt",
+      "sha256": "b00d7252e7a54041b7f34bba065188e02aaba13e606e5b332c21258e2532e6b2"
+    },
+    "geometry_head": {
+      "path": "models/dinov2_geometry_15d/proj15_lags_ridge.pt",
+      "sha256": "80b3b1b343f01b8ec6b90f17fb5bdc34a531f3f7a08cc9f28d9f3e8048b59628"
+    }
+  },
+  "input_contract": {
+    "format": "camera_geometry_history_85_v1",
+    "sources": [
+      "camera",
+      "self_commands"
+    ],
+    "geometry_dim": 15,
+    "geometry_lags": [
+      2,
+      4
+    ],
+    "history_steps": 20,
+    "observation_dim": 85,
+    "motion_truth": false
+  },
+  "summary": {
+    "episodes": 10,
+    "completed": 10,
+    "student_input_contract": {
+      "format": "camera_geometry_history_85_v1",
+      "sources": [
+        "camera",
+        "self_commands"
+      ],
+      "geometry_dim": 15,
+      "geometry_lags": [
+        2,
+        4
+      ],
+      "history_steps": 20,
+      "observation_dim": 85,
+      "motion_truth": false
+    }
+  },
+  "episodes": [
+    {
+      "episode": 1,
+      "steps": 3000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.18629896852653716,
+      "max_abs_cte": 1.13357698917389,
+      "mean_speed": 2.5491823267304334,
+      "laps": 14
+    },
+    {
+      "episode": 2,
+      "steps": 3000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.19477573090190223,
+      "max_abs_cte": 1.42319977283478,
+      "mean_speed": 2.5315976522232715,
+      "laps": 14
+    },
+    {
+      "episode": 3,
+      "steps": 3000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.1651668417006246,
+      "max_abs_cte": 0.826450943946838,
+      "mean_speed": 2.5329039222393184,
+      "laps": 14
+    },
+    {
+      "episode": 4,
+      "steps": 3000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.18141558605524188,
+      "max_abs_cte": 1.00876569747925,
+      "mean_speed": 2.5351524970935513,
+      "laps": 14
+    },
+    {
+      "episode": 5,
+      "steps": 3000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.17412153741268777,
+      "max_abs_cte": 0.975881218910217,
+      "mean_speed": 2.5374278005001445,
+      "laps": 14
+    },
+    {
+      "episode": 6,
+      "steps": 3000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.1856475658317213,
+      "max_abs_cte": 1.1197646856308,
+      "mean_speed": 2.539244211941026,
+      "laps": 14
+    },
+    {
+      "episode": 7,
+      "steps": 3000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.19708059367868797,
+      "max_abs_cte": 0.956948697566986,
+      "mean_speed": 2.553028685791388,
+      "laps": 14
+    },
+    {
+      "episode": 8,
+      "steps": 3000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.19286291739619385,
+      "max_abs_cte": 0.962454497814178,
+      "mean_speed": 2.548149854083158,
+      "laps": 14
+    },
+    {
+      "episode": 9,
+      "steps": 3000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.17649794401676627,
+      "max_abs_cte": 1.04629957675934,
+      "mean_speed": 2.530759729164795,
+      "laps": 14
+    },
+    {
+      "episode": 10,
+      "steps": 3000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.19283190807923015,
+      "max_abs_cte": 0.898865640163422,
+      "mean_speed": 2.5451974429984783,
+      "laps": 14
+    }
+  ],
+  "audit_passed": true,
+  "evaluation_elapsed_s": 793.5799514629998,
+  "audited_summary": {
+    "episodes": 10,
+    "completed": 10,
+    "completion_rate_ci95_wilson": [
+      0.7224671969739421,
+      0.9999999999999999
+    ],
+    "steps": 30000,
+    "laps": 140,
+    "mean_laps": 14.0,
+    "pooled_mean_abs_cte": 0.1846699593599593,
+    "max_abs_cte": 1.42319977283478,
+    "pooled_mean_speed": 2.5402644122765565,
+    "frames_abs_cte_ge_1": 27
+  }
+}

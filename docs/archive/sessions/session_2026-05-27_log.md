@@ -1,3 +1,5 @@
+> Archived session notes. Historical choices and pending tasks are superseded by [current status](../../status.md).
+
 # Session Log: 2026-05-27 — Mountain DINOv2 + training defaults
 
 Two focus areas today:

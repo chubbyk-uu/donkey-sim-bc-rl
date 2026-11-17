@@ -1,3 +1,5 @@
+> Archived session notes. Historical choices and pending tasks are superseded by [current status](../../status.md).
+
 # Session Log: 2026-05-29 — crop / weave / max_cte probes on the domain-randomized loop
 
 Follow-up to the 2026-05-28 domain-randomization work (experiment-log §6.14). Goal:

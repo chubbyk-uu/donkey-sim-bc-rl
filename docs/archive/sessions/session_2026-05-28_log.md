@@ -1,3 +1,5 @@
+> Archived session notes. Historical choices and pending tasks are superseded by [current status](../../status.md).
+
 # Session Log: 2026-05-28 — Mountain new-defaults + loop domain randomization
 
 Goal for the day: take the SAC defaults raised on 2026-05-27 (§6.11) for a test

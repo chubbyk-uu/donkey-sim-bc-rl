@@ -1,0 +1,270 @@
+{
+  "source_run": "logs/visual_student_bend_paired_4layouts_v1",
+  "source_results_sha256": "e2c6ff4df169db3cd29db9d81a2a21722537c50606bc5c0b04c7be0f09f16029",
+  "scope": "Recorded simulator evaluation; saved menu settings are not independent measurements of live engine state.",
+  "simulator_saved_settings": {
+    "fps": 120,
+    "timeScale": 2.0,
+    "generateTrees": 1,
+    "generateRandomCones": 0,
+    "randomLight": 1,
+    "useSeed": 0
+  },
+  "checkpoint_files": {
+    "baseline": {
+      "path": "models/visual_student_no_motion_v1/student.pt",
+      "sha256": "b00d7252e7a54041b7f34bba065188e02aaba13e606e5b332c21258e2532e6b2"
+    },
+    "candidate": {
+      "path": "models/visual_student_bend_recovery_v1/student.pt",
+      "sha256": "abf93346c99ea2e27dc3fdf9dee4347387535e4af6b4db023f526357bbf9a74c"
+    },
+    "geometry_head": {
+      "path": "models/dinov2_geometry_15d/proj15_lags_ridge.pt",
+      "sha256": "80b3b1b343f01b8ec6b90f17fb5bdc34a531f3f7a08cc9f28d9f3e8048b59628"
+    }
+  },
+  "input_contract": {
+    "format": "camera_geometry_history_85_v1",
+    "sources": [
+      "camera",
+      "self_commands"
+    ],
+    "geometry_dim": 15,
+    "geometry_lags": [
+      2,
+      4
+    ],
+    "history_steps": 20,
+    "observation_dim": 85,
+    "motion_truth": false
+  },
+  "summary": {
+    "models": {
+      "baseline": {
+        "layouts": 4,
+        "completed": 4,
+        "steps": 8000,
+        "laps": 36,
+        "mean_abs_cte": 0.18146679870995924,
+        "max_abs_cte": 1.22731256484985,
+        "mean_speed": 2.512908692275109,
+        "frames_abs_cte_ge_1": 13
+      },
+      "candidate": {
+        "layouts": 4,
+        "completed": 4,
+        "steps": 8000,
+        "laps": 36,
+        "mean_abs_cte": 0.18945016355974212,
+        "max_abs_cte": 1.16354751586914,
+        "mean_speed": 2.522993293011076,
+        "frames_abs_cte_ge_1": 10
+      }
+    },
+    "candidate_minus_baseline": {
+      "mean_abs_cte": {
+        "per_layout": [
+          0.02556276168537805,
+          0.0038640682920358937,
+          -0.003371631479174547,
+          0.0058782609008921904
+        ],
+        "mean": 0.007983364849782897,
+        "bootstrap_ci95": [
+          -0.0010591583841578628,
+          0.02013808833704251
+        ]
+      },
+      "max_abs_cte": {
+        "per_layout": [
+          -0.0701046586036661,
+          0.07646000385285001,
+          -0.1406884193420399,
+          0.236777663230895
+        ],
+        "mean": 0.02561114728450975,
+        "bootstrap_ci95": [
+          -0.105396538972853,
+          0.16005708277225472
+        ]
+      },
+      "mean_speed": {
+        "per_layout": [
+          0.0180170683283567,
+          0.009928663993569398,
+          -0.0015492740010301098,
+          0.013941944622972269
+        ],
+        "mean": 0.010084600735967064,
+        "bootstrap_ci95": [
+          0.002323530654970485,
+          0.015994967244659875
+        ]
+      },
+      "startup_mean_abs_cte": {
+        "per_layout": [
+          -0.036523519840091445,
+          -0.011276959141017895,
+          -0.040175180408870775,
+          -0.03346545990509911
+        ],
+        "mean": -0.030360279823769806,
+        "bootstrap_ci95": [
+          -0.03849775028292786,
+          -0.017588599315786282
+        ]
+      },
+      "laps": {
+        "per_layout": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "mean": 0.0,
+        "bootstrap_ci95": [
+          0.0,
+          0.0
+        ]
+      },
+      "frames_abs_cte_ge_1": {
+        "per_layout": [
+          -1,
+          1,
+          -8,
+          5
+        ],
+        "mean": -0.75,
+        "bootstrap_ci95": [
+          -5.75,
+          3.5
+        ]
+      }
+    }
+  },
+  "episodes": [
+    {
+      "layout": 1,
+      "model": "candidate",
+      "order": 1,
+      "episode": 1,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "laps": 9,
+      "mean_abs_cte": 0.18985157139455258,
+      "max_abs_cte": 0.941472947597504,
+      "mean_speed": 2.526778775715038,
+      "startup_mean_abs_cte": 0.18010223573073747,
+      "frames_abs_cte_ge_1": 0
+    },
+    {
+      "layout": 1,
+      "model": "baseline",
+      "order": 2,
+      "episode": 2,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "laps": 9,
+      "mean_abs_cte": 0.16428880970917453,
+      "max_abs_cte": 1.01157760620117,
+      "mean_speed": 2.5087617073866815,
+      "startup_mean_abs_cte": 0.21662575557082892,
+      "frames_abs_cte_ge_1": 1
+    },
+    {
+      "layout": 2,
+      "model": "baseline",
+      "order": 1,
+      "episode": 3,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "laps": 9,
+      "mean_abs_cte": 0.20110453934407269,
+      "max_abs_cte": 1.00396120548248,
+      "mean_speed": 2.517780047889906,
+      "startup_mean_abs_cte": 0.1988288425554056,
+      "frames_abs_cte_ge_1": 1
+    },
+    {
+      "layout": 2,
+      "model": "candidate",
+      "order": 2,
+      "episode": 4,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "laps": 9,
+      "mean_abs_cte": 0.20496860763610858,
+      "max_abs_cte": 1.08042120933533,
+      "mean_speed": 2.5277087118834753,
+      "startup_mean_abs_cte": 0.1875518834143877,
+      "frames_abs_cte_ge_1": 2
+    },
+    {
+      "layout": 3,
+      "model": "candidate",
+      "order": 1,
+      "episode": 5,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "laps": 9,
+      "mean_abs_cte": 0.17994666608150145,
+      "max_abs_cte": 1.08662414550781,
+      "mean_speed": 2.5151061551796814,
+      "startup_mean_abs_cte": 0.18198801034968345,
+      "frames_abs_cte_ge_1": 3
+    },
+    {
+      "layout": 3,
+      "model": "baseline",
+      "order": 2,
+      "episode": 6,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "laps": 9,
+      "mean_abs_cte": 0.183318297560676,
+      "max_abs_cte": 1.22731256484985,
+      "mean_speed": 2.5166554291807115,
+      "startup_mean_abs_cte": 0.22216319075855423,
+      "frames_abs_cte_ge_1": 11
+    },
+    {
+      "layout": 4,
+      "model": "baseline",
+      "order": 1,
+      "episode": 7,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "laps": 9,
+      "mean_abs_cte": 0.17715554822591367,
+      "max_abs_cte": 0.926769852638245,
+      "mean_speed": 2.508437584643137,
+      "startup_mean_abs_cte": 0.21396655838680453,
+      "frames_abs_cte_ge_1": 0
+    },
+    {
+      "layout": 4,
+      "model": "candidate",
+      "order": 2,
+      "episode": 8,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "laps": 9,
+      "mean_abs_cte": 0.18303380912680586,
+      "max_abs_cte": 1.16354751586914,
+      "mean_speed": 2.522379529266109,
+      "startup_mean_abs_cte": 0.18050109848170542,
+      "frames_abs_cte_ge_1": 5
+    }
+  ],
+  "audit_passed": true,
+  "evaluation_elapsed_s": 450.68319290600084
+}

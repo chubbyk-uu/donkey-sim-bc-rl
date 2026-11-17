@@ -1,0 +1,316 @@
+{
+  "source_run": "logs/visual_student_eval_24layouts_v1",
+  "source_results_sha256": "f5832373975de55445a0d722d8b4e8dbf9aaf2e0ea29dea98b31dbf4643a0ccc",
+  "scope": "Recorded simulator evaluation; saved menu settings are not independent measurements of live engine state.",
+  "simulator_saved_settings": {
+    "fps": 120,
+    "timeScale": 2.0,
+    "generateTrees": 1,
+    "generateRandomCones": 0,
+    "randomLight": 1,
+    "useSeed": 0
+  },
+  "checkpoint_files": {
+    "student": {
+      "path": "models/visual_student_no_motion_v1/student.pt",
+      "sha256": "b00d7252e7a54041b7f34bba065188e02aaba13e606e5b332c21258e2532e6b2"
+    },
+    "geometry_head": {
+      "path": "models/dinov2_geometry_15d/proj15_lags_ridge.pt",
+      "sha256": "80b3b1b343f01b8ec6b90f17fb5bdc34a531f3f7a08cc9f28d9f3e8048b59628"
+    }
+  },
+  "input_contract": {
+    "format": "camera_geometry_history_85_v1",
+    "sources": [
+      "camera",
+      "self_commands"
+    ],
+    "geometry_dim": 15,
+    "geometry_lags": [
+      2,
+      4
+    ],
+    "history_steps": 20,
+    "observation_dim": 85,
+    "motion_truth": false
+  },
+  "summary": {
+    "episodes": 24,
+    "completed": 24,
+    "student_input_contract": {
+      "format": "camera_geometry_history_85_v1",
+      "sources": [
+        "camera",
+        "self_commands"
+      ],
+      "geometry_dim": 15,
+      "geometry_lags": [
+        2,
+        4
+      ],
+      "history_steps": 20,
+      "observation_dim": 85,
+      "motion_truth": false
+    }
+  },
+  "episodes": [
+    {
+      "episode": 1,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.16880967537028482,
+      "max_abs_cte": 0.964033722877502,
+      "mean_speed": 2.530252879304904,
+      "laps": 9
+    },
+    {
+      "episode": 2,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.1941373117223975,
+      "max_abs_cte": 1.08611130714417,
+      "mean_speed": 2.5146438781614417,
+      "laps": 9
+    },
+    {
+      "episode": 3,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.21646763756249857,
+      "max_abs_cte": 0.984346389770508,
+      "mean_speed": 2.516799327106691,
+      "laps": 9
+    },
+    {
+      "episode": 4,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.18240906309214824,
+      "max_abs_cte": 0.94585919380188,
+      "mean_speed": 2.5213394598817596,
+      "laps": 9
+    },
+    {
+      "episode": 5,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.21880890494791674,
+      "max_abs_cte": 1.43440580368042,
+      "mean_speed": 2.5280494747568594,
+      "laps": 9
+    },
+    {
+      "episode": 6,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.1708777534145338,
+      "max_abs_cte": 1.34688901901245,
+      "mean_speed": 2.5094821011702306,
+      "laps": 9
+    },
+    {
+      "episode": 7,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.21223875603989564,
+      "max_abs_cte": 1.62820029258728,
+      "mean_speed": 2.528981376903597,
+      "laps": 9
+    },
+    {
+      "episode": 8,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.18689293185654787,
+      "max_abs_cte": 0.873600363731384,
+      "mean_speed": 2.5093269666209816,
+      "laps": 9
+    },
+    {
+      "episode": 9,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.17235368309404295,
+      "max_abs_cte": 0.924851953983307,
+      "mean_speed": 2.50425002346897,
+      "laps": 9
+    },
+    {
+      "episode": 10,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.1902172155512817,
+      "max_abs_cte": 0.934750854969025,
+      "mean_speed": 2.498051026254782,
+      "laps": 9
+    },
+    {
+      "episode": 11,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.20139306723028857,
+      "max_abs_cte": 1.03583157062531,
+      "mean_speed": 2.5418799868437203,
+      "laps": 9
+    },
+    {
+      "episode": 12,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.19109582666141614,
+      "max_abs_cte": 1.05718350410461,
+      "mean_speed": 2.5348211246427823,
+      "laps": 9
+    },
+    {
+      "episode": 13,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.17978240502663176,
+      "max_abs_cte": 0.878590762615204,
+      "mean_speed": 2.5190971162718494,
+      "laps": 9
+    },
+    {
+      "episode": 14,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.18352228067687065,
+      "max_abs_cte": 0.984771192073822,
+      "mean_speed": 2.4953817798547586,
+      "laps": 9
+    },
+    {
+      "episode": 15,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.18474218130201916,
+      "max_abs_cte": 1.23280763626099,
+      "mean_speed": 2.5179586123594846,
+      "laps": 9
+    },
+    {
+      "episode": 16,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.20815957204901497,
+      "max_abs_cte": 0.999070525169373,
+      "mean_speed": 2.524780335299205,
+      "laps": 9
+    },
+    {
+      "episode": 17,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.174603222603424,
+      "max_abs_cte": 0.9876708984375,
+      "mean_speed": 2.522651910429864,
+      "laps": 9
+    },
+    {
+      "episode": 18,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.18771442941085478,
+      "max_abs_cte": 0.972198128700256,
+      "mean_speed": 2.5256428599477516,
+      "laps": 9
+    },
+    {
+      "episode": 19,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.19916228520041476,
+      "max_abs_cte": 1.11287701129913,
+      "mean_speed": 2.504735008626048,
+      "laps": 9
+    },
+    {
+      "episode": 20,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.19157598988139216,
+      "max_abs_cte": 0.903401970863342,
+      "mean_speed": 2.523311188678257,
+      "laps": 9
+    },
+    {
+      "episode": 21,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.18049161440235184,
+      "max_abs_cte": 1.34892320632935,
+      "mean_speed": 2.4867611988109277,
+      "laps": 9
+    },
+    {
+      "episode": 22,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.20206142022715357,
+      "max_abs_cte": 0.998767197132111,
+      "mean_speed": 2.520204444451723,
+      "laps": 9
+    },
+    {
+      "episode": 23,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.17881112096182006,
+      "max_abs_cte": 0.943995356559753,
+      "mean_speed": 2.5085485428294327,
+      "laps": 9
+    },
+    {
+      "episode": 24,
+      "steps": 2000,
+      "completed": true,
+      "termination_reason": "time_limit",
+      "mean_abs_cte": 0.21162647759452374,
+      "max_abs_cte": 1.11719560623169,
+      "mean_speed": 2.515881084166933,
+      "laps": 9
+    }
+  ],
+  "audit_passed": true,
+  "evaluation_elapsed_s": 1328.476660544,
+  "audited_summary": {
+    "episodes": 24,
+    "completed": 24,
+    "completion_rate_ci95_wilson": [
+      0.862023793448672,
+      0.9999999999999998
+    ],
+    "steps": 48000,
+    "laps": 216,
+    "mean_laps": 9.0,
+    "pooled_mean_abs_cte": 0.19116478441165516,
+    "max_abs_cte": 1.62820029258728,
+    "pooled_mean_speed": 2.51678465445179,
+    "frames_abs_cte_ge_1": 60
+  }
+}
