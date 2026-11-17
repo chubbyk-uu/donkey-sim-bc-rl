@@ -174,9 +174,11 @@ def validate_args(args) -> None:
     for name in ("episodes", "layouts", "max_episode_steps", "batch_size", "buffer_size", "train_freq", "timesteps", "checkpoint_freq"):
         if hasattr(args, name) and getattr(args, name) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    for name in ("capture_tail_steps", "resume_warmup_steps"):
+    for name in ("capture_tail_steps", "resume_warmup_steps", "observation_timeout"):
         if getattr(args, name, 0) < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be nonnegative")
+    if getattr(args, "observation_timeout", 0) and not getattr(args, "low_jitter_sync", False):
+        raise ValueError("--observation-timeout requires --low-jitter-sync")
     if not 0 <= args.min_throttle <= args.max_throttle <= 1:
         raise ValueError("Require 0 <= min_throttle <= max_throttle <= 1")
     if not 0 < args.max_steering_diff <= 1 or args.max_steering <= 0:
@@ -410,6 +412,9 @@ class EvalRecord:
             self.telemetry.close()
         if exc and self.capture:
             self.metadata["partial_capture"] = self._flush_capture()
+        if getattr(exc, "runtime_event", None) is not None:
+            self.metadata["runtime_failure"] = exc.runtime_event
+            write_json(self.path / "runtime_failure.json", exc.runtime_event)
         self.metadata.update(status="failed" if exc else "completed", error=repr(exc) if exc else None,
                              finished_at=datetime.now(timezone.utc).isoformat(), elapsed_s=time.monotonic() - self.started)
         write_json(self.path / "metadata.json", self.metadata)

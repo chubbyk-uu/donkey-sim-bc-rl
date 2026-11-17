@@ -255,9 +255,9 @@ def reload_scene(
     handler.loaded = False
     handler.send_exit_scene()
     time.sleep(exit_settle)  # no exit signal exists — let the exit complete first
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     while not handler.loaded:
-        if time.time() > deadline:
+        if time.monotonic() >= deadline:
             return False
         handler.send_load_scene(scene)
         time.sleep(retry_every)

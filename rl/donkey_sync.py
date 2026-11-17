@@ -8,8 +8,10 @@ import codecs
 from io import BytesIO
 import json
 import logging
+import math
 import os
 import select
+import socket
 import threading
 import time
 from typing import Any, Callable
@@ -20,6 +22,32 @@ from PIL import Image
 from gym_donkeycar.core.util import replace_float_notation
 
 logger = logging.getLogger(__name__)
+
+
+class ObservationTimeoutError(TimeoutError):
+    """A runtime failure, never a synthetic model transition or CTE failure."""
+
+    def __init__(self, event: dict[str, Any]) -> None:
+        self.runtime_event = event
+        super().__init__(f"No usable observation within {event['timeout_seconds']:.3f}s "
+                         f"(elapsed {event['elapsed_seconds']:.3f}s); emergency stop requested")
+
+
+def add_runtime_guard_args(parser: argparse.ArgumentParser) -> None:
+    def timeout_seconds(value: str) -> float:
+        seconds = float(value)
+        if not math.isfinite(seconds) or seconds < 0:
+            raise argparse.ArgumentTypeError("must be finite and non-negative")
+        return seconds
+
+    parser.add_argument(
+        "--tcp-nodelay", action=argparse.BooleanOptionalAction, default=False,
+        help="Disable Nagle buffering for simulator commands (opt-in).",
+    )
+    parser.add_argument(
+        "--observation-timeout", type=timeout_seconds, default=0.0, metavar="SECONDS",
+        help="Abort on missing/stale observations and request braking; 0 disables. Requires low-jitter sync.",
+    )
 
 
 def split_json_lines_buffer(localbuffer: str) -> tuple[list[str], str]:
@@ -64,6 +92,7 @@ def coalesce_telemetry_messages(
 
 def add_control_fix_args(parser: argparse.ArgumentParser) -> None:
     """Register opt-in low-jitter sync & gated reversal-unwind CLI flags (defaults OFF)."""
+    add_runtime_guard_args(parser)
     parser.add_argument(
         "--low-jitter-sync",
         action=argparse.BooleanOptionalAction,
@@ -96,15 +125,22 @@ def add_control_fix_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def maybe_install_low_jitter_sync(env: Any, enabled: bool) -> LowJitterSyncController | None:
-    """Install `LowJitterSyncController` on a Donkey gym env if `enabled` and viewer is ready."""
-    if not enabled:
+def maybe_install_low_jitter_sync(
+    env: Any, enabled: bool, *, tcp_nodelay: bool = False, observation_timeout: float = 0.0,
+) -> LowJitterSyncController | None:
+    """Install requested sync/transport controls; defaults preserve SDK behavior."""
+    if not math.isfinite(observation_timeout) or observation_timeout < 0:
+        raise ValueError("observation_timeout must be finite and non-negative")
+    if observation_timeout and not enabled:
+        raise ValueError("--observation-timeout requires --low-jitter-sync")
+    if not enabled and not tcp_nodelay:
         return None
     unwrapped = getattr(env, "unwrapped", env)
     viewer = getattr(unwrapped, "viewer", None)
     if viewer is None or getattr(viewer, "handler", None) is None or getattr(viewer, "client", None) is None:
-        return None
-    return LowJitterSyncController(viewer, enabled=True).install()
+        raise ValueError("Requested runtime controls require a connected Donkey simulator")
+    return LowJitterSyncController(viewer, enabled=enabled, tcp_nodelay=tcp_nodelay,
+                                   observation_timeout=observation_timeout).install()
 
 
 def configure_env_control_fixes(env: Any, args: Any) -> LowJitterSyncController | None:
@@ -116,7 +152,11 @@ def configure_env_control_fixes(env: Any, args: Any) -> LowJitterSyncController 
             reversal_head_deg_threshold=float(getattr(args, "reversal_head_deg_threshold", 8.0)),
             reversal_min_last_steer=float(getattr(args, "reversal_min_last_steer", 0.30)),
         )
-    sync = maybe_install_low_jitter_sync(env, enabled=bool(getattr(args, "low_jitter_sync", False)))
+    sync = maybe_install_low_jitter_sync(
+        env, enabled=bool(getattr(args, "low_jitter_sync", False)),
+        tcp_nodelay=bool(getattr(args, "tcp_nodelay", False)),
+        observation_timeout=float(getattr(args, "observation_timeout", 0.0)),
+    )
     if sync is not None and hasattr(env, "attach_sync_controller"):
         env.attach_sync_controller(sync)
     return sync
@@ -136,11 +176,24 @@ class LowJitterSyncController:
     - Uses a pipe wakeup fd + zero-sleep `select()` for sub-millisecond socket sends.
     """
 
-    def __init__(self, sim_controller: Any, *, enabled: bool = False) -> None:
+    def __init__(self, sim_controller: Any, *, enabled: bool = False, record_timing: bool = False,
+                 tcp_nodelay: bool = False, observation_timeout: float = 0.0) -> None:
+        if not math.isfinite(observation_timeout) or observation_timeout < 0:
+            raise ValueError("observation_timeout must be finite and non-negative")
         self.sim_controller = sim_controller
         self.handler = sim_controller.handler
         self.client = sim_controller.client
         self.enabled = bool(enabled)
+        self.record_timing = bool(record_timing)
+        self.tcp_nodelay = bool(tcp_nodelay)
+        self.observation_timeout = float(observation_timeout)
+        self.runtime_events: list[dict[str, Any]] = []
+        self._observation_failure: ObservationTimeoutError | None = None
+        self._last_telemetry_mono_s = 0.0
+        self._socket_readable_s = 0.0
+        self._socket_recv_s = 0.0
+        self._message_sent_s = 0.0
+        self._frame_timing = {}
 
         self._cond = threading.Condition()
         self._send_lock = threading.Lock()
@@ -165,6 +218,8 @@ class LowJitterSyncController:
     def install(self) -> "LowJitterSyncController":
         if self._installed:
             return self
+        if self.tcp_nodelay:
+            self.client.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._installed = True
 
         # Swap client proc_msg thread cleanly without closing the connected TCP socket.
@@ -234,6 +289,8 @@ class LowJitterSyncController:
                 break
 
     def _wrapped_queue_message(self, msg: dict[str, Any]) -> None:
+        if self._observation_failure is not None and msg.get("msg_type") == "control":
+            raise self._observation_failure
         if not self.enabled:
             self._orig_queue_message(msg)
             return
@@ -243,6 +300,7 @@ class LowJitterSyncController:
         self._signal_wake()
 
     def _wrapped_reset(self) -> None:
+        self._observation_failure = None
         self._orig_reset()
         with self._cond:
             self._consumed_seq = self._telemetry_seq
@@ -259,6 +317,7 @@ class LowJitterSyncController:
         h.determine_episode_over()
 
     def _apply_telemetry_atomic(self, message: dict[str, Any]) -> None:
+        decode_start_s = time.perf_counter() if self.record_timing else 0.0
         h = self.handler
         img_string = message["image"]
         image = Image.open(BytesIO(base64.b64decode(img_string)))
@@ -315,6 +374,15 @@ class LowJitterSyncController:
                 h.determine_episode_over()
 
             h.time_received = time.time()
+            if self.observation_timeout:
+                self._last_telemetry_mono_s = time.monotonic()
+            if self.record_timing:
+                self._frame_timing = {
+                    "socket_readable_mono_s": self._socket_readable_s,
+                    "socket_recv_mono_s": self._socket_recv_s,
+                    "decode_start_mono_s": decode_start_s,
+                    "published_mono_s": time.perf_counter(),
+                }
             self._telemetry_seq += 1
             self._cond.notify_all()
 
@@ -332,15 +400,28 @@ class LowJitterSyncController:
             return self._orig_observe()
 
         h = self.handler
+        started = time.monotonic()
+        deadline = started + self.observation_timeout if self.observation_timeout else None
+        observe_start_s = time.perf_counter() if self.record_timing else 0.0
         with self._cond:
+            if self._observation_failure is not None:
+                raise self._observation_failure
             while self._consumed_seq == self._telemetry_seq:
                 if not self.enabled:
                     break
                 if self.client.aborted:
                     raise RuntimeError("Donkey simulator socket aborted while waiting for observation")
-                self._cond.wait(timeout=0.05)
+                remaining = deadline - time.monotonic() if deadline is not None else 0.05
+                if remaining <= 0:
+                    raise self._fail_observation_timeout(started)
+                self._cond.wait(timeout=min(0.05, remaining))
             if not self.enabled:
                 return self._orig_observe()
+            if deadline is not None:
+                now = time.monotonic()
+                stale = self._last_telemetry_mono_s and now - self._last_telemetry_mono_s >= self.observation_timeout
+                if now >= deadline or stale:
+                    raise self._fail_observation_timeout(self._last_telemetry_mono_s if stale else started)
             self._consumed_seq = self._telemetry_seq
             h.last_received = h.time_received
             observation = h.image_array
@@ -362,7 +443,34 @@ class LowJitterSyncController:
             }
             if h.image_array_b is not None:
                 info["image_b"] = h.image_array_b
+            if self.record_timing:
+                info["sync_timing"] = dict(self._frame_timing,
+                    last_message_sent_mono_s=self._message_sent_s,
+                    observe_start_mono_s=observe_start_s,
+                    observe_return_mono_s=time.perf_counter())
         return observation, reward, done, info
+
+    def _fail_observation_timeout(self, started: float) -> ObservationTimeoutError:
+        """Latch the failure and best-effort flush a stop, preserving partial-packet framing."""
+        if self._observation_failure is not None:
+            return self._observation_failure
+        now = time.monotonic()
+        event = {"kind": "observation_timeout", "timeout_seconds": self.observation_timeout,
+                 "elapsed_seconds": now - started, "mono_s": now,
+                 "stop_requested": True, "stop_flushed_to_socket": False,
+                 "stop_execution_acknowledged": False}
+        self._observation_failure = ObservationTimeoutError(event)
+        self.runtime_events.append(event)
+        with self._send_lock:
+            self.client.msg = json.dumps({"msg_type": "control", "steering": "0.0",
+                                          "throttle": "0.0", "brake": "1.0"})
+        self._signal_wake()
+        try:
+            self._flush_pending_send(self.client.s)
+            event["stop_flushed_to_socket"] = not self._has_pending_send()
+        except OSError as exc:
+            event["stop_error"] = str(exc)
+        return self._observation_failure
 
     def _has_pending_send(self) -> bool:
         with self._send_lock:
@@ -389,6 +497,8 @@ class LowJitterSyncController:
                 self._inflight_offset += sent
                 total_sent += sent
                 if self._inflight_offset >= len(self._inflight_bytes):
+                    if self.record_timing:
+                        self._message_sent_s = time.perf_counter()
                     self._inflight_bytes = b""
                     self._inflight_offset = 0
         return total_sent
@@ -450,6 +560,8 @@ class LowJitterSyncController:
                     self._flush_pending_send(sock)
 
                 if sock in readable and time.monotonic() >= self._recv_pause_until:
+                    if self.record_timing:
+                        self._socket_readable_s = time.perf_counter()
                     while True:
                         try:
                             chunk = sock.recv(1024 * 256)
@@ -457,6 +569,8 @@ class LowJitterSyncController:
                             break
                         if not chunk:
                             raise ConnectionAbortedError("Socket closed by simulator")
+                        if self.record_timing:
+                            self._socket_recv_s = time.perf_counter()
                         localbuffer += utf8_decoder.decode(chunk)
 
                     msgs, localbuffer = split_json_lines_buffer(localbuffer)

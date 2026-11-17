@@ -46,9 +46,9 @@ def reload_scene(
     ctrl.handler.loaded = False
     ctrl.handler.send_exit_scene()
     time.sleep(exit_settle)  # no exit signal exists — let the exit complete first
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     while not ctrl.handler.loaded:
-        if time.time() > deadline:
+        if time.monotonic() >= deadline:
             return False
         ctrl.handler.send_load_scene(scene)
         time.sleep(retry_every)

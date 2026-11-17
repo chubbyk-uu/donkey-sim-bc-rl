@@ -15,6 +15,7 @@ import pytest
 
 from rl.donkey_sync import (
     LowJitterSyncController,
+    ObservationTimeoutError,
     add_control_fix_args,
     coalesce_telemetry_messages,
     configure_env_control_fixes,
@@ -201,6 +202,144 @@ def test_low_jitter_sync_controller_coalescing_and_toggle() -> None:
         sync.close()
         s_cli.close()
         s_sim.close()
+
+
+def test_low_jitter_observe_survives_repeated_and_jumping_wall_clock(monkeypatch) -> None:
+    s_cli, s_sim = socket.socketpair()
+    handler = _FakeHandler()
+    client = _FakeClient(s_cli, handler)
+    sim_ctrl = type("SimCtrl", (), {"handler": handler, "client": client})()
+    sync = LowJitterSyncController(sim_ctrl, enabled=True, record_timing=True).install()
+    wall = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: wall[0])
+    worker = None
+    try:
+        # A fresh frame must unblock observe even when its wall timestamp is
+        # unchanged, jumps backwards, or jumps forwards by an hour.
+        for index, timestamp in enumerate([1000.0, 1000.0, 940.0, 4540.0], start=1):
+            wall[0] = timestamp
+            result = []
+            worker = threading.Thread(target=lambda: result.append(handler.observe()), daemon=True)
+            worker.start()
+            s_sim.sendall(_tel_line(index / 10, index))
+            worker.join(timeout=1.0)
+            assert not worker.is_alive(), "wall-clock change blocked a fresh observation"
+            observation, _, _, info = result[0]
+            assert int(observation[0, 0, 0]) == index
+            assert info["cte"] == pytest.approx(index / 10)
+            timing = info["sync_timing"]
+            assert timing["observe_return_mono_s"] >= timing["published_mono_s"]
+    finally:
+        client.aborted = True
+        client.do_process_msgs = False
+        if worker is not None:
+            worker.join(timeout=1.0)
+        if client.th is not None:
+            client.th.join(timeout=1.0)
+        sync.close()
+        s_cli.close()
+        s_sim.close()
+
+
+@pytest.fixture
+def tcp_control_env():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        client_socket = socket.create_connection(listener.getsockname(), timeout=1.0)
+        peer, _ = listener.accept()
+    peer.settimeout(1.0)
+    handler = _FakeHandler()
+    client = _FakeClient(client_socket, handler)
+    raw_env = _DummySimEnv()
+    raw_env.viewer = type("SimCtrl", (), {"handler": handler, "client": client})()
+    env = DonkeyVaeSACEnv(raw_env, vae=_DummyVisionEncoder())
+    try:
+        yield env, handler, client, peer
+    finally:
+        client.do_process_msgs = False
+        if client.th is not None:
+            client.th.join(timeout=1.0)
+        env.close()
+        client_socket.close()
+        peer.close()
+
+
+def test_runtime_guard_cli_sends_brake_and_latches_timeout(tcp_control_env):
+    env, handler, client, peer = tcp_control_env
+    parser = argparse.ArgumentParser()
+    add_control_fix_args(parser)
+    args = parser.parse_args(["--low-jitter-sync", "--tcp-nodelay", "--observation-timeout", "0.05"])
+    sync = configure_env_control_fixes(env, args)
+    assert client.s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == 1
+    peer.sendall(_tel_line(0.1, 12))
+    assert handler.observe()[3]["cte"] == pytest.approx(0.1)
+    with pytest.raises(ObservationTimeoutError) as failure:
+        handler.observe()
+    assert failure.value.runtime_event["kind"] == "observation_timeout"
+    assert failure.value.runtime_event["elapsed_seconds"] >= 0.05
+    assert failure.value.runtime_event["stop_execution_acknowledged"] is False
+    command = json.loads(peer.recv(4096).decode())
+    assert command == {"msg_type": "control", "steering": "0.0", "throttle": "0.0", "brake": "1.0"}
+    # A late fresh frame cannot silently resume driving after a timeout.
+    sync._apply_telemetry_atomic(json.loads(_tel_line(0.2, 23)))
+    with pytest.raises(ObservationTimeoutError):
+        handler.observe()
+    with pytest.raises(ObservationTimeoutError):
+        handler.queue_message({"msg_type": "control", "throttle": "0.5"})
+    assert len(sync.runtime_events) == 1
+    handler.reset()
+    sync._apply_telemetry_atomic(json.loads(_tel_line(0.3, 34)))
+    assert handler.observe()[3]["cte"] == pytest.approx(0.3)
+
+
+def test_runtime_guard_rejects_stale_unconsumed_frame(tcp_control_env):
+    env, handler, _, peer = tcp_control_env
+    sync = configure_env_control_fixes(env, argparse.Namespace(low_jitter_sync=True, observation_timeout=0.03))
+    sync._apply_telemetry_atomic(json.loads(_tel_line(0.1, 12)))
+    time.sleep(0.05)
+    with pytest.raises(ObservationTimeoutError):
+        handler.observe()
+    assert json.loads(peer.recv(4096))["brake"] == "1.0"
+
+
+def test_guard_disabled_accepts_delayed_frame(tcp_control_env):
+    env, handler, _, peer = tcp_control_env
+    sync = configure_env_control_fixes(env, argparse.Namespace(low_jitter_sync=True))
+    sender = threading.Timer(0.08, peer.sendall, args=(_tel_line(0.2, 23),))
+    sender.start()
+    try:
+        assert handler.observe()[3]["cte"] == pytest.approx(0.2)
+        assert sync.runtime_events == []
+    finally:
+        sender.join(timeout=1.0)
+
+
+def test_tcp_nodelay_can_be_enabled_without_sync(tcp_control_env):
+    env, _, client, _ = tcp_control_env
+    sync = configure_env_control_fixes(env, argparse.Namespace(tcp_nodelay=True))
+    assert not sync.enabled
+    assert client.s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == 1
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf"])
+def test_runtime_guard_rejects_invalid_timeout(value):
+    parser = argparse.ArgumentParser()
+    add_control_fix_args(parser)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--observation-timeout", value])
+
+
+def test_runtime_guard_requires_sync(tcp_control_env):
+    with pytest.raises(ValueError, match="requires --low-jitter-sync"):
+        configure_env_control_fixes(tcp_control_env[0], argparse.Namespace(observation_timeout=0.25))
+
+
+def test_runtime_mode_uses_only_original_head_and_control():
+    conditions, residual_keys = build_conditions("vision_baseline_runtime")
+    assert conditions == [("vision_baseline_sync", "__LIVE_VISION__", 0.0, 0)]
+    assert residual_keys == []
+    assert condition_control_config(conditions[0][0]) == {"sync_enabled": True, "reversal_unwind_scale": 1.0}
 
 
 class _DummySimEnv(gym.Env):

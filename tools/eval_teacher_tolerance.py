@@ -22,6 +22,8 @@ Design safeguards:
 from __future__ import annotations
 
 import argparse
+import gc
+import socket
 import json
 import subprocess
 import sys
@@ -37,7 +39,7 @@ from stable_baselines3 import SAC
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from rl.donkey_sync import LowJitterSyncController  # noqa: E402
+from rl.donkey_sync import LowJitterSyncController, ObservationTimeoutError, add_runtime_guard_args  # noqa: E402
 from rl.experiment import (  # noqa: E402
     bootstrap_mean_interval,
     paired_statistics,
@@ -58,6 +60,8 @@ from rl.geometry_encoder import (  # noqa: E402
     verify_cache_fingerprint,
 )
 from rl.track_state import TrackState  # noqa: E402
+from rl.timing_diagnostics import GCPauseRecorder  # noqa: E402
+from rl.recovery_collection import RecoveryCollectionConfig, RecoveryCollector  # noqa: E402
 from rl.train_vae_sac import (  # noqa: E402
     DonkeyVaeSACEnv,
     FrozenDinoGridEncoder,
@@ -389,7 +393,8 @@ def _paired_trajectory_delta(eps: list[dict], ref_name: str, cand_name: str) -> 
 
 def compute_paired_vs_baseline(all_episodes: list[dict], condition_names: list[str]) -> dict:
     """Compute paired layout-by-layout comparisons (overall and per split)."""
-    if "baseline" not in condition_names or len(condition_names) < 2:
+    reference = "baseline" if "baseline" in condition_names else "vision_baseline_sync"
+    if reference not in condition_names or len(condition_names) < 2:
         return {}
     out: dict = {}
     scopes = [
@@ -413,9 +418,9 @@ def compute_paired_vs_baseline(all_episodes: list[dict], condition_names: list[s
         p_stats = paired_statistics(formatted_for_exp)
         extra_pairs = []
         for cname in condition_names:
-            if cname == "baseline":
+            if cname == reference:
                 continue
-            pair = _paired_trajectory_delta(eps, "baseline", cname)
+            pair = _paired_trajectory_delta(eps, reference, cname)
             if pair is not None:
                 pair["mean_abs_cte_ratio_vs_baseline"] = pair.pop("mean_abs_cte_ratio")
                 extra_pairs.append(pair)
@@ -428,6 +433,7 @@ def compute_paired_vs_baseline(all_episodes: list[dict], condition_names: list[s
             ("vision_baseline", "vision_fixed_ctrl"),
             ("baseline", "vision_baseline"),
             ("teacher_fixed", "vision_fixed_ctrl"),
+            ("vision_baseline_sync", "vision_round_b"),
         ):
             if ref_c in condition_names and cand_c in condition_names:
                 pair = _paired_trajectory_delta(eps, ref_c, cand_c)
@@ -449,6 +455,25 @@ def build_conditions(mode: str) -> tuple[list[tuple[str, str | None, float, int]
         specs = [
             ("baseline", None, 0.0, 0),
             ("vision_proj15_lags_live", "__LIVE_VISION__", 0.0, 0),
+        ]
+    elif mode == "round_b_collect":
+        specs = [("teacher_recovery", None, 0.0, 0)]
+    elif mode == "vision_baseline_runtime":
+        specs = [("vision_baseline_sync", "__LIVE_VISION__", 0.0, 0)]
+    elif mode == "timing_gc_paired":
+        specs = [
+            ("timing_gc_stock", "__LIVE_VISION__", 0.0, 0),
+            ("timing_gc_deferred", "__LIVE_VISION__", 0.0, 0),
+        ]
+    elif mode == "timing_transport_paired":
+        specs = [
+            ("timing_tcp_default", "__LIVE_VISION__", 0.0, 0),
+            ("timing_tcp_nodelay", "__LIVE_VISION__", 0.0, 0),
+        ]
+    elif mode == "round_b_vision_paired":
+        specs = [
+            ("vision_baseline_sync", "__LIVE_VISION__", 0.0, 0),
+            ("vision_round_b", "__CANDIDATE_VISION__", 0.0, 0),
         ]
     elif mode == "vision_and_d0":
         specs = [
@@ -494,7 +519,7 @@ def build_conditions(mode: str) -> tuple[list[tuple[str, str | None, float, int]
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
-    pred_keys = sorted({k for _, k, _, _ in specs if k is not None and k != "__LIVE_VISION__"})
+    pred_keys = sorted({k for _, k, _, _ in specs if k is not None and k not in ("__LIVE_VISION__", "__CANDIDATE_VISION__")})
     return specs, pred_keys
 
 
@@ -502,7 +527,7 @@ def condition_control_config(condition_name: str) -> dict:
     """Return control-loop sync and bounded reversal unwind parameters per condition."""
     if condition_name in ("baseline", "vision_baseline"):
         return {"sync_enabled": False, "reversal_unwind_scale": 1.0}
-    if condition_name == "teacher_sync_only":
+    if condition_name in ("teacher_sync_only", "teacher_recovery", "vision_baseline_sync", "vision_round_b", "timing_gc_stock", "timing_gc_deferred", "timing_tcp_default", "timing_tcp_nodelay"):
         return {"sync_enabled": True, "reversal_unwind_scale": 1.0}
     if condition_name in ("teacher_fixed", "vision_fixed_ctrl"):
         return {"sync_enabled": True, "reversal_unwind_scale": 2.0}
@@ -552,6 +577,11 @@ def main() -> None:
         "--mode",
         choices=(
             "round_a_vision_paired",
+            "round_b_collect",
+            "round_b_vision_paired",
+            "vision_baseline_runtime",
+            "timing_gc_paired",
+            "timing_transport_paired",
             "vision_and_d0",
             "tolerance_d0_vs_d1",
             "teacher_fix_paired",
@@ -571,6 +601,7 @@ def main() -> None:
     parser.add_argument("--track-centerline", type=Path, default=Path("models/track_centerline/generated_track.npz"))
     parser.add_argument("--probe-dir", type=Path, default=Path("logs/probe_geometry_15d_v1"))
     parser.add_argument("--geometry-head", type=Path, default=Path("models/dinov2_geometry_15d/proj15_lags_ridge.pt"))
+    parser.add_argument("--candidate-geometry-head", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("logs/vision_proj15_and_d0_v1"))
     parser.add_argument("--layouts", type=int, default=4)
     parser.add_argument(
@@ -586,23 +617,51 @@ def main() -> None:
         help="Save full-episode camera frames + 15D labels + motion + history + timestamps to captures/*.npz (default: True for round_a_vision_paired).",
     )
     parser.add_argument("--max-episode-steps", type=int, default=2000)
+    parser.add_argument("--recovery-direction", choices=("balanced", "negative"), default="balanced",
+                        help="Training-data collection only: retain balanced kicks or target negative CTE")
+    parser.add_argument("--gc-policy", choices=("paired", "stock", "deferred"), default="paired",
+                        help="Timing diagnosis only: paired comparison or a single unchanged head/GC policy")
     parser.add_argument("--block-len", type=int, default=80)
     parser.add_argument("--order-seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    add_runtime_guard_args(parser)
     args = parser.parse_args()
+    if args.recovery_direction != "balanced" and args.mode != "round_b_collect":
+        parser.error("--recovery-direction applies only to round_b_collect")
+    recovery_config = RecoveryCollectionConfig(directions=(-1,) if args.recovery_direction == "negative" else (1, -1))
+    if args.mode == "timing_transport_paired" and args.tcp_nodelay:
+        parser.error("timing_transport_paired controls TCP_NODELAY per condition; omit --tcp-nodelay")
+    if (args.mode.startswith("timing_") or args.mode == "vision_baseline_runtime") and args.train_pool_layouts is None:
+        args.train_pool_layouts = 0
+    if args.mode == "round_b_vision_paired" and args.candidate_geometry_head is None:
+        parser.error("--candidate-geometry-head is required for paired visual-head evaluation")
+    if args.mode == "round_b_vision_paired" and args.train_pool_layouts is None:
+        args.train_pool_layouts = 0
+    if args.mode == "round_b_collect" and args.train_pool_layouts is None:
+        args.train_pool_layouts = args.layouts
+    if args.mode == "round_b_collect" and args.train_pool_layouts != args.layouts:
+        parser.error("Round B collection is training data only; --train-pool-layouts must equal --layouts")
+    if args.mode == "round_b_collect" and args.save_captures is False:
+        parser.error("Round B collection requires full captures")
+    if (args.output_dir / "metadata.json").exists():
+        parser.error(f"Output already contains a run: {args.output_dir}; choose a new directory")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
-    save_captures = (args.mode == "round_a_vision_paired") if args.save_captures is None else bool(args.save_captures)
+    save_captures = (args.mode in ("round_a_vision_paired", "round_b_collect", "round_b_vision_paired")) if args.save_captures is None else bool(args.save_captures)
     train_pool_cutoff = (args.layouts // 2) if args.train_pool_layouts is None else int(args.train_pool_layouts)
     captures_dir = args.output_dir / "captures"
     if save_captures:
         captures_dir.mkdir(parents=True, exist_ok=True)
 
-    cache_meta = verify_cache_fingerprint(args.probe_dir / "feature_cache.npz")
+    cache_meta = {} if args.mode.startswith(("round_b_", "timing_")) or args.mode == "vision_baseline_runtime" else verify_cache_fingerprint(args.probe_dir / "feature_cache.npz")
     track = TrackState.load(args.track_centerline)
     condition_specs, pred_keys = build_conditions(args.mode)
+    if args.mode == "timing_gc_paired" and args.gc_policy != "paired":
+        condition_specs = [s for s in condition_specs if s[0] == f"timing_gc_{args.gc_policy}"]
     condition_names = [c[0] for c in condition_specs]
+    if args.observation_timeout and any(not condition_control_config(c)["sync_enabled"] for c in condition_names):
+        parser.error("--observation-timeout requires a mode with low-jitter sync enabled in every condition")
 
     blocks = (
         load_aligned_residual_blocks(
@@ -629,6 +688,7 @@ def main() -> None:
 
     uses_live_vision = any(k == "__LIVE_VISION__" for _, k, _, _ in condition_specs)
     live_vision_enc: DinoGridLinearLag15Encoder | None = None
+    candidate_vision_enc: DinoGridLinearLag15Encoder | None = None
     if uses_live_vision:
         dino_enc = FrozenDinoGridEncoder(device=device, crop_top=0, projection=None)
         live_vision_enc = DinoGridLinearLag15Encoder(
@@ -637,6 +697,11 @@ def main() -> None:
             device=device,
             dino_encoder=dino_enc,
         )
+        if args.mode == "round_b_vision_paired":
+            candidate_vision_enc = DinoGridLinearLag15Encoder(
+                head_path=args.candidate_geometry_head, track=track,
+                device=device, dino_encoder=dino_enc,
+            )
         # Warm up GPU once before connecting/stepping so first-step latency is steady-state
         dummy_img = np.zeros((120, 160, 3), dtype=np.uint8)
         _ = dino_enc.grid_features(dummy_img[None])
@@ -656,8 +721,17 @@ def main() -> None:
             "retraining is excluded from final evaluation; locked_eval_holdout is never used for training."
         ),
     }
+    if args.mode == "round_b_collect":
+        split_plan["rule"] = "All newly collected layouts -> dagger_train_pool"
+        split_plan["policy"] = "New teacher-driven recovery collection; existing Round A locked holdout is never loaded."
+    elif args.mode == "round_b_vision_paired":
+        split_plan["policy"] = "Fresh paired visual-head evaluation; evaluation captures are never used for training."
 
     metadata = {
+        "runtime_guards": {"tcp_nodelay_requested": args.tcp_nodelay,
+                           "observation_timeout_seconds": args.observation_timeout},
+        "gc_thresholds": list(gc.get_threshold()),
+        "gc_policy": args.gc_policy if args.mode == "timing_gc_paired" else None,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "git_commit": get_git_commit(),
         "mode": args.mode,
@@ -683,14 +757,30 @@ def main() -> None:
             "teacher_sha256": sha256_file(args.teacher),
             "track_centerline": str(args.track_centerline),
             "track_centerline_sha256": sha256_file(args.track_centerline),
-            "oof_predictions": str(args.probe_dir / "oof_geometry_predictions_lags.npz"),
-            "oof_predictions_sha256": sha256_file(args.probe_dir / "oof_geometry_predictions_lags.npz"),
+            "oof_predictions": str(args.probe_dir / "oof_geometry_predictions_lags.npz") if not args.mode.startswith("round_b_") else None,
+            "oof_predictions_sha256": sha256_file(args.probe_dir / "oof_geometry_predictions_lags.npz") if not args.mode.startswith("round_b_") else None,
             "cache_fingerprint_sha256": cache_meta.get("fingerprint_sha256"),
             "geometry_head": str(args.geometry_head) if uses_live_vision else None,
             "geometry_head_sha256": live_vision_enc.head_sha256 if live_vision_enc is not None else None,
+            "candidate_geometry_head": str(args.candidate_geometry_head) if candidate_vision_enc is not None else None,
+            "candidate_geometry_head_sha256": candidate_vision_enc.head_sha256 if candidate_vision_enc is not None else None,
         },
         "n_aligned_blocks": len(blocks),
         "conditions": condition_names,
+        "condition_control_configs": {c: condition_control_config(c) for c in condition_names},
+        "baseline_control": {
+            "min_throttle": 0.2, "max_throttle": 0.7,
+            "max_steering": 1.0, "max_steering_diff": 0.1,
+            "n_command_history": 20,
+        },
+        "collection_config": RecoveryCollector(1, recovery_config).config_dict() if args.mode == "round_b_collect" else None,
+        "source_sha256": {
+            p: sha256_file(REPO / p) for p in (
+                "tools/eval_teacher_tolerance.py", "rl/recovery_collection.py",
+                "rl/train_vae_sac.py", "rl/donkey_sync.py", "rl/track_state.py",
+                "rl/timing_diagnostics.py",
+            )
+        },
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
@@ -747,10 +837,18 @@ def main() -> None:
         SPLIT_LOCKED_EVAL_HOLDOUT: [],
     }
     controller = env.env.unwrapped.viewer
-    sync_controller = LowJitterSyncController(controller, enabled=False).install()
+    sync_controller = LowJitterSyncController(controller, enabled=False,
+                                              record_timing=args.mode.startswith("timing_") or args.mode == "vision_baseline_runtime",
+                                              tcp_nodelay=args.tcp_nodelay,
+                                              observation_timeout=args.observation_timeout).install()
     scene = controller.handler.SceneToLoad
     ep_counter = 0
+    gc_recorder = GCPauseRecorder() if args.mode.startswith("timing_") else None
+    if gc_recorder is not None:
+        gc_recorder.install()
+        gc_recorder.start_writer(args.output_dir / "gc_events_live.jsonl")
 
+    ep_step_dicts = []
     try:
         for layout_idx in range(1, args.layouts + 1):
             split_name = assign_layout_split(
@@ -769,14 +867,22 @@ def main() -> None:
             rng.shuffle(order)
 
             for cond_idx in order:
+                ep_step_dicts = []
                 ep_counter += 1
                 cname, pkey, scale, d_steps = condition_specs[cond_idx]
+                if args.mode == "timing_transport_paired":
+                    controller.client.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, int(cname == "timing_tcp_nodelay"))
+                if gc_recorder is not None:
+                    gc.enable()
+                    gc_recorder.phase = "between_episodes"
+                    if cname == "timing_gc_deferred":
+                        gc.collect()
                 ctrl_cfg = condition_control_config(cname)
                 sync_controller.set_enabled(ctrl_cfg["sync_enabled"])
                 env.set_control_fixes(reversal_unwind_scale=ctrl_cfg["reversal_unwind_scale"])
-                if pkey == "__LIVE_VISION__":
-                    assert live_vision_enc is not None
-                    enc = live_vision_enc
+                if pkey in ("__LIVE_VISION__", "__CANDIDATE_VISION__"):
+                    enc = candidate_vision_enc if pkey == "__CANDIDATE_VISION__" else live_vision_enc
+                    assert enc is not None
                     enc.reset_episode()
                 else:
                     enc = PerturbedTrackStateEncoder(
@@ -791,6 +897,7 @@ def main() -> None:
                 env.set_observation(enc, latent_lags=())
 
                 obs, info = env.reset()
+                recovery_collector = RecoveryCollector(layout_idx, recovery_config) if args.mode == "round_b_collect" else None
                 sync_controller.reset_stats()
                 init_image_0 = np.array(env.last_raw_obs, dtype=np.uint8, copy=True)
                 init_true_state_0 = enc.last_true_state.copy()
@@ -839,14 +946,24 @@ def main() -> None:
 
                 t0 = time.perf_counter()
                 term_reason = "truncated"
+                gc_first_event = len(gc_recorder.events) if gc_recorder is not None else 0
+                if cname == "timing_gc_deferred":
+                    gc.disable()
 
                 while steps < args.max_episode_steps:
+                    if gc_recorder is not None:
+                        gc_recorder.step = steps + 1
+                        gc_recorder.phase = "policy"
                     decision_obs_rx_s = prev_obs_rx_s
                     decision_encode_done_s = prev_encode_done_s
                     hist_pre = env.command_history.reshape(-1).copy()
 
                     t_pol0 = time.perf_counter()
                     action, _ = teacher.predict(obs, deterministic=True)
+                    collection_note = {}
+                    teacher_action_before_intervention = np.asarray(action, dtype=np.float32).reshape(2).copy()
+                    if recovery_collector is not None:
+                        action, collection_note = recovery_collector.action(action, steps + 1, enc.last_true_state)
                     disturb_tag = None
                     if args.mode == "teacher_fix_recovery_stress":
                         action, stress_dur_s, disturb_tag = apply_recovery_stress(
@@ -858,7 +975,11 @@ def main() -> None:
                             sync_controller.pause_recv(stress_dur_s)
                     t_act_sent = time.perf_counter()
 
+                    if gc_recorder is not None:
+                        gc_recorder.phase = "env_step_and_encoder"
                     obs, reward, terminated, truncated, info = env.step(action)
+                    if gc_recorder is not None:
+                        gc_recorder.phase = "logging"
                     steps += 1
                     total_reward += float(reward)
 
@@ -951,6 +1072,9 @@ def main() -> None:
                         "step_dt_ms": step_dt_ms,
                         "reversal_unwind_active": bool(info.get("reversal_unwind_active", False)),
                         "disturbance": disturb_tag,
+                        "sync_timing": info.get("sync_timing"),
+                        "teacher_raw_action_before_intervention": teacher_action_before_intervention.tolist(),
+                        **collection_note,
                     })
 
                     if terminated:
@@ -960,8 +1084,14 @@ def main() -> None:
                         break
 
                 elapsed = time.perf_counter() - t0
+                control_gc_events = gc_recorder.events[gc_first_event:] if gc_recorder is not None else []
+                if gc_recorder is not None:
+                    gc_recorder.phase = "between_episodes"
+                    gc.enable()
                 laps = int(info.get("lap_count", 0))
                 completed = steps >= args.max_episode_steps and term_reason == "truncated"
+                if recovery_collector is not None:
+                    recovery_collector.finish(steps, term_reason, ctes_signed[-1])
 
                 # Post-episode batched counterfactual teacher query (zero in-loop latency!)
                 true_state_arr = np.stack(ep_true_state, axis=0)
@@ -1045,6 +1175,13 @@ def main() -> None:
                         decision_obs_to_act_ms=np.asarray(obs_to_act_ms_list, dtype=np.float32),
                         sim_wait_ms=np.asarray(sim_wait_ms_list, dtype=np.float32),
                         step_dt_ms=np.asarray(step_dt_ms_list, dtype=np.float32),
+                        recovery_phase=np.asarray([r.get("recovery_phase", "none") for r in ep_step_dicts]),
+                        intervention_id=np.asarray([r.get("intervention_id", 0) for r in ep_step_dicts], dtype=np.int32),
+                        target_signed_cte=np.asarray([r.get("target_signed_cte", 0.0) for r in ep_step_dicts], dtype=np.float32),
+                        teacher_raw_action_before_intervention=np.asarray(
+                            [r["teacher_raw_action_before_intervention"] for r in ep_step_dicts], dtype=np.float32
+                        ),
+                        recovery_events_json=np.array(json.dumps(recovery_collector.events if recovery_collector else [])),
                     )
                     capture_rel_path = f"captures/{cap_file.name}"
                     manifest_files[split_name].append(capture_rel_path)
@@ -1078,8 +1215,11 @@ def main() -> None:
                     "layout": layout_idx,
                     "split": split_name,
                     "condition": cname,
+                    "control_gc_events": control_gc_events,
+                    "tcp_nodelay": controller.client.s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY),
                     "sync_enabled": ctrl_cfg["sync_enabled"],
                     "reversal_unwind_scale": ctrl_cfg["reversal_unwind_scale"],
+                    "recovery_events": recovery_collector.events if recovery_collector else [],
                     "completed": completed,
                     "steps": steps,
                     "laps": laps,
@@ -1141,7 +1281,22 @@ def main() -> None:
                     f"enc={enc_p50:.2f}/{enc_p95:.2f}ms obs2actP95={obs_act_p95:.2f}ms ({elapsed:.1f}s)",
                     flush=True,
                 )
+    except ObservationTimeoutError as exc:
+        failure = dict(exc.runtime_event, episode=ep_counter, layout=layout_idx, condition=cname,
+                       completed=False, termination_reason="observation_timeout",
+                       returned_steps=len(ep_step_dicts))
+        (args.output_dir / "runtime_failure.json").write_text(json.dumps(failure, indent=2) + "\n")
+        if ep_step_dicts:
+            with telemetry_path.open("a") as stream:
+                stream.write("\n".join(json.dumps(row) for row in ep_step_dicts) + "\n")
+        metadata.update(status="failed", runtime_failure=failure)
+        (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+        raise
     finally:
+        if gc_recorder is not None:
+            gc.enable()
+            gc_recorder.close()
+            (args.output_dir / "gc_events.json").write_text(json.dumps(gc_recorder.events, indent=2) + "\n")
         sync_controller.close()
         env.close()
 

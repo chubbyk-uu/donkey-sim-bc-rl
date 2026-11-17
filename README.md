@@ -10,7 +10,39 @@ camera image → (crop) → encoder → SAC policy → steer / throttle
 Detailed experiment history and design decisions: [docs/experiment-log.md](docs/experiment-log.md)
 Chinese README: [README-CN.md](README-CN.md)
 
-**Status (2026-11-13): random-layout baselines, feature probes, and ground-truth state ceiling completed.** The project has working BC
+**Latest (2026-11-17):** The frozen camera-only student completed **24/24 fresh
+random layouts, 48,000 steps / 216 laps**, using images and its own command
+history only. Mean absolute CTE was 0.1912, maximum 1.6282, and mean speed
+2.5168 m/s. Input/action/image-replay audits pass. Keep it as a candidate
+baseline: this batch does not establish guaranteed reliability or superiority
+to another policy. See experiment log Stage 3.18 and
+`logs/visual_student_eval_24layouts_v1/`.
+
+**Longer episodes (2026-11-17):** The unchanged original student also completed
+**10/10 new random-light/tree-shadow layouts at 3,000 steps each**, 30,000 steps /
+140 laps, with no exit or runtime abort. Mean absolute CTE is 0.18467, maximum
+1.42320 (termination limit 2.0), and mean speed 2.54026 m/s. Report this batch
+separately from the 2,000-step evaluation. See Stage 3.23 and
+`logs/visual_student_eval_10layouts_3000_v1/`.
+
+**Experimental candidate (2026-11-17):** One bend-focused fine-tune from this baseline
+uses 3,000 new training decisions and 1,000 decisions from two separate new
+development layouts. Bend steering MAE drops 37.8%, while original-development
+MAE rises 1.4%; all preregistered offline gates pass. The new
+`models/visual_student_bend_recovery_v1/student.pt` then completed 4/4 fresh shared
+layouts alongside the original, but mean CTE rose 4.4%: startup improved 14.3%,
+cruise worsened 7.6%. It fails the mean-CTE screen and is **not promoted**.
+The 24/24 result above still belongs to `visual_student_no_motion_v1`.
+See Stages 3.20–3.21 and `logs/visual_student_bend_paired_4layouts_v1/`.
+
+Offline route-aligned cross replay (Stage 3.22) confirms a first-lap/later-lap
+tradeoff: candidate later-lap teacher-action MAE increases on both actors'
+recorded trajectories. Complete laps 1..8 matched over 24 road bins have
+candidate CTE +0.01203 on average, positive on all four layouts. No additional
+driving or training followed. Motion probes are deferred; the next proposal
+is baseline A/A repeatability calibration. See `logs/visual_student_cross_replay_v1/`.
+
+**Baseline snapshot (2026-11-13): random-layout baselines, feature probes, and ground-truth state ceiling completed.** The project has working BC
 baselines, a single generated-road VAE+SAC baseline, fixed-light loop deployments,
 a Mountain DINOv2 deployment, and a domain-randomization study for
 random light + tree shadows. The strongest fixed-light loop policies still use a
@@ -383,7 +415,185 @@ python rl/train_loop_vae_sac.py \
 
 ---
 
+## Camera-only student
+
+`models/visual_student_no_motion_v1/student.pt` is a separately trained
+deterministic student actor. Its runtime inputs are **camera-derived features
+and its own issued commands only**; no velocity, gyro, acceleration, pose, CTE,
+map or simulator state is passed to the actor. No encoder/IMU is currently used.
+
+The frozen original DINOv2 geometry head predicts 15 geometric features from
+images. Current and lag-2/lag-4 predictions form 45 values, joined with 40 issued
+command-history values: **85 inputs**. The geometry head already has temporal
+context, so complete context extends back eight steps. Reset padding is causal
+and identical in batch preparation and live inference. The existing 58D
+privileged teacher is used for offline labels/weight initialization only.
+
+The first fit uses 39,020 frames from successful full training-pool trajectories,
+with 19,384 validation frames from nine separate development layouts. Failed
+validation trajectories are retained. Its offline action-error gate passes,
+and its first camera-only closed-loop smoke completed **1/1 fresh layout,
+2,000 steps / 9 laps**, mean speed 2.506 m/s, mean absolute CTE 0.208 and maximum
+0.938. This is not a reliability estimate. The improvement over its adapted
+initialization is not evidence of superiority to the historical pure-vision RL
+policy. See `logs/visual_student_no_motion_v1/{results,input_contract_audit}.json`.
+
+The subsequent frozen four-layout screen on 2026-11-17 completed **4/4 layouts,
+8,000 steps / 36 laps**, with mean absolute CTE 0.1925, maximum 0.9540 and mean
+speed 2.5126 m/s. There were no `abs(CTE) >= 1` samples or runtime aborts.
+All 8,000 decision inputs/actions pass replay and issued-history checks; 444
+tail decisions reproduce from images/history with zero feature/action error.
+All four maximum CTE values occur in the first 250 steps, so startup remains
+an evaluation focus. Four successes do not establish a reliable completion
+rate or an improvement over another policy. Weights remain unchanged and
+experimental. See `logs/visual_student_screen_4layouts_v1/{audit,decision}.json`.
+
+A separate frozen 24-layout evaluation subsequently completed **24/24 layouts,
+48,000 steps / 216 laps**, mean absolute CTE 0.1912, maximum 1.6282, and mean
+speed 2.5168 m/s, with zero runtime aborts. Ten layouts reached `abs(CTE) >= 1`
+(60 frames total), then recovered and completed. Fifteen of 24 episode maxima
+occurred in the first 250 steps; the largest excursion occurred during cruise.
+All inputs/actions pass replay checks and 2,664 image-only tail decisions
+reproduce with zero feature/action error. The nominal Wilson 95% completion
+interval is 86.2%..100%, assuming independent trials. Keep this batch separate
+from the earlier smoke/screen; it is not a paired superiority test. Weights are
+unchanged, with no deployment replacement. Full artifacts:
+`logs/visual_student_eval_24layouts_v1/`; experiment log Stage 3.18.
+
+Offline inspection of all 14 large-offset excursions prioritizes student
+control-response diagnosis: pre-event steering MAE against the frozen teacher
+is 0.0912, retaining 0.0728 even after a one-step truth-geometry replacement.
+Ten excursion peaks share one bend. These fixed-trajectory interventions do
+not establish a physical cause or justify changing steering limits. That
+diagnostic stage made no model or runtime change; see Stage 3.19 and
+`logs/student_excursion_diagnosis_v1/`.
+
+The subsequent single bend-recovery fit keeps the same 85D input contract,
+frozen visual head and action limits. Fresh student-driven collection uses eight
+new layouts (six training, two development), 500 steps each, saving all camera
+frames. Privileged state is isolated for offline labels and sample weighting.
+The fit uses the original 39,020 training decisions plus 3,000 fresh decisions;
+the historical 24-layout evaluation is excluded. On the new development bend's
+113 decisions, mapped steering MAE falls 0.06368 -> 0.03962 and missed teacher
+unwind falls 14/26 -> 4/26. Original-development MAE rises 0.03987 -> 0.04042;
+wrong-direction decisions rise 114 -> 126 despite fewer missed unwinds.
+All seven offline gates pass; this is fixed-history action agreement, not
+candidate driving performance. Preserve the original model as the live-tested
+baseline. See Stage 3.20 and `logs/visual_student_bend_recovery_v1/`.
+
+The subsequent four-layout paired screen runs each student on the same scene,
+resetting only the car between actors, with balanced order and identical
+stateless actor warmup before connection. Both complete 4/4, 8,000 steps / 36
+laps. Candidate mean absolute CTE is 0.18945 vs original 0.18147 (+4.4%);
+startup is 0.18254 vs 0.21290 (-14.3%), while cruise is 0.19044 vs 0.17698
+(+7.6%). Every layout shows this startup/cruise tradeoff. The mean-CTE paired
+difference interval includes zero, so this small screen does not establish a
+population regression; it does fail the preregistered improvement condition.
+Keep the original baseline. All 16,000 full-image/input decisions pass replay;
+see Stage 3.21 and `logs/visual_student_bend_paired_4layouts_v1/`.
+
+Training entry point (default output paths already contain the first run):
+
+```bash
+python tools/train_visual_student.py
+```
+
+It performs one bounded fit, preserves existing exports, and accepts new
+`--output-dir` / `--export` paths for explicitly requested future runs. Student
+inputs and privileged teacher labels are saved in separate NPZ files.
+
+The dedicated evaluation entry point validates the input contract and frozen
+head hash and resets both levels of temporal history. When a live test is
+authorized and the simulator host is configured, use:
+
+```bash
+python rl/eval_visual_student.py --host "$DONKEY_SIM_HOST" --episodes 4 \
+  --output-dir logs/visual_student_closed_loop_v1
+```
+
+This enables low-jitter sync, TCP_NODELAY and a 100 ms observation-wait timeout by
+default. Ground truth is accessible to scoring/termination/logging only, not the
+student feature or actor APIs. The actor is a distinct `.pt` format; it cannot
+be replaced with a legacy SAC teacher `.zip`. No live test was launched as part
+of the first offline implementation. The subsequently authorized single-layout
+smoke and image-only replay audit are in `logs/visual_student_smoke_v1/`.
+
+## Runtime timing protection
+
+**Student input requirement (2026-11-16):** Only camera observations, wheel
+encoder/IMU measurements, and the controller's own command history are permitted
+as student control inputs. The geometry-head + frozen-teacher runs below still
+consume simulator velocity truth and are **privileged-motion reference runs**,
+not compliant student benchmarks. Historical 23/24 completion must not be reported
+as camera-only or encoder/IMU-only performance. Establish and verify the actual
+sensor path before further student training. See the sensor audit in the
+[experiment log](docs/experiment-log.md#stage-314-sensor-source-audit-and-student-input-requirement-2026-11-16).
+
+Normal RL training/evaluation entry points support these opt-in flags:
+
+```bash
+--low-jitter-sync --tcp-nodelay --observation-timeout 0.10
+```
+
+Low-jitter sync uses sequence-based frame wakeups and coalesces queued telemetry.
+TCP_NODELAY disables Nagle buffering on the client socket. Observation timeout is
+in **wall seconds measured with a monotonic clock**, requires low-jitter sync,
+and is disabled by default (`0`). The initial `0.10` threshold is an operational
+stop threshold, not a measured controller safety boundary. These flags do not
+change model weights, throttle limits, or steering limits. Existing entry-point
+defaults remain unchanged; do not compare results across different runtime flags
+without recording the difference.
+
+For a privileged-motion diagnostic reference using the original live vision head
+and frozen 60k teacher, the single-condition entry below enables sync. This
+command does not satisfy the student input requirement above:
+
+```bash
+python tools/eval_teacher_tolerance.py --mode vision_baseline_runtime \
+  --layouts 1 --max-episode-steps 2000 --tcp-nodelay \
+  --observation-timeout 0.10 --save-captures \
+  --output-dir logs/vision_baseline_guarded_v1
+```
+
+Use a new output directory for each run. Keep Windows Donkey Sim at
+`timeScale=2`, FPS limit `120`, random light and trees enabled, cones disabled.
+Keep display/window state and background load consistent; for unattended
+evaluations, disconnect remote streaming without locking or minimizing the
+simulator. This is a precaution, not a finding that remote desktop caused stalls.
+
+Missing observations or an unconsumed stale frame trigger a best-effort zero
+throttle/full handbrake command and raise `ObservationTimeoutError`. The run
+aborts; late frames cannot resume control until an explicit reset. Recorded
+evaluations save `runtime_failure.json` and mark the run failed, retaining
+completed episodes separately. Such runs must not be reported as complete
+model-only evaluations or silently removed from reliability counts.
+
+The guard operates in the WSL client while waiting for observations. Socket
+acceptance does not acknowledge braking in Unity. It cannot protect against
+the whole WSL VM freezing, a blocked policy/encoder before observe is called,
+or an unreachable/hung simulator. A command-age watchdog inside the Windows
+simulator is needed for those cases; this repository contains no Unity server
+source, so no server-side watchdog has been installed. Scene-reload deadlines
+and collection-rate measurements use monotonic clocks to tolerate wall-clock
+corrections.
+
+For training-data collection that specifically supplements negative offsets,
+`tools/eval_teacher_tolerance.py --mode round_b_collect` also accepts
+`--recovery-direction negative`. This retains the existing bounded steering
+intervention, unchanged teacher throttle/control limits, and full recovery
+labels; the default remains balanced directions. Collection layouts are
+training data and must stay separate from final evaluation layouts.
+
 ## Evaluation records and safe resume
+
+`python tools/compare_geometry_control.py --output-dir logs/geometry_control_compare_v1`
+compares the original and two recovery-trained geometry heads offline using the
+existing negative-recovery feature cache and the same held-out development
+layouts. It requires no simulator or training. Results include mapped steering
+errors, teacher-relative unwind/direction mismatches, continuous bias windows,
+and counterfactual geometry repairs. Histories stay fixed to the recorded
+post-command histories; these are action-agreement diagnostics, not recursive
+closed-loop completion estimates. Use a new output directory for each analysis.
 
 Both loop evaluation scripts write `metadata.json`, `results.json`, `episodes.csv`,
 and initial camera frames to a new directory under `logs/`. Metadata records actual

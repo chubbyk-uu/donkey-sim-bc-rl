@@ -2596,3 +2596,1455 @@ Addressing post-`v2` review findings before full 24-layout / Round B runs:
      and `validate_model_config()` compatibility for existing checkpoints.
    - **Deferred to next session (paused by user):** Running `--mode teacher_fix_paired_full --layouts 24`
      and 12-layout 5-condition stress evaluations under idle GPU before moving to Round B.
+
+### Stage 3.5: Round B — First Geometry Recovery Collection Batch (2026-11-16)
+
+**Scope decision:** Proceed with recovery supervision using the frozen `sdiff01 60k`
+teacher, low-jitter sync enabled, original `max_steering_diff=0.1`, and
+`reversal_unwind_scale=1.0` (acceleration disabled). The unfinished five-condition
+evaluation is deferred, not a prerequisite for collecting this batch. Neither the
+teacher nor the existing visual head was retrained or overwritten.
+
+`rl/recovery_collection.py` adds bounded steering interventions to the existing
+capture pipeline. `tools/eval_teacher_tolerance.py --mode round_b_collect` runs
+only `teacher_recovery`, always enables full captures, and assigns every newly
+loaded scene to `dagger_train_pool`. Existing Round A holdout data is not loaded.
+Collection does not require the old perception probe cache.
+
+**Collection procedure:**
+- Preserve the first 250 steps without interventions to cover startup/acceleration.
+- Start an intervention only when `|CTE| < 0.3`, `|heading| < 5 deg`, speed is at
+  least `1.8`, the 1.0/1.5-position lookahead lateral coordinates are small, and
+  the teacher's raw steering magnitude is below `0.35`.
+- Override raw steering to `+/-0.35` for at most 4 steps, preserving the teacher's
+  throttle and the original action mapping/rate limit. Alternate signed release
+  targets of `0.6, 1.0, 1.4 CTE`; these are release thresholds, not guaranteed
+  achieved offsets. Release earlier at `|CTE| >= 1.65` or `|heading| >= 15 deg`.
+- Return control to the unchanged teacher. A recovery requires 8 consecutive
+  observations with `|CTE| < 0.3` and `|heading| < 5 deg`; then wait 80 steps before
+  another intervention. Unfinished recoveries time out after 160 steps.
+
+**Calibration:** `logs/round_b_recovery_pilot_v1` used stronger/longer interventions
+(`0.65`, up to 8 steps) and both episodes ended at the CTE limit. After reducing
+interventions and adding the straight-road gate,
+`logs/round_b_recovery_pilot_v2` collected 3,368 frames over four scenes, with
+18/20 interventions recovered and 73 frames at `|CTE| >= 1`. Both calibration runs
+are excluded from the main batch manifest.
+
+**Main run:**
+
+```bash
+python tools/eval_teacher_tolerance.py --mode round_b_collect \
+  --layouts 12 --max-episode-steps 2000 --device cpu \
+  --output-dir logs/round_b_recovery_collect_v1
+python tools/summarize_recovery_collection.py logs/round_b_recovery_collect_v1
+```
+
+| Coverage / outcome | Count |
+|---|---:|
+| Newly loaded scenes / captured frames | 12 / 15,187 |
+| Unperturbed startup frames (steps 1..250) | 3,000 |
+| `0.5 <= |CTE| < 0.8` | 999 |
+| `0.8 <= |CTE| < 1.0` | 235 |
+| `1.0 <= |CTE| < 1.5` | 321 |
+| `1.5 <= |CTE| < 1.9` | 96 |
+| `|CTE| >= 1.9` | 23 |
+| Positive / negative frames with `|CTE| >= 1` | 294 / 146 |
+| Interventions / recovered / CTE-limit exits / horizon-censored | 104 / 94 / 9 / 1 |
+
+The 440 large-offset frames are `2.90%` of this collection. They are correlated
+trajectory samples, not 440 independent recovery trials; signed coverage is still
+uneven. These episodes deliberately contain perturbations, so the 9 terminal
+episodes are not a natural-driving completion benchmark. Speed P10/P50/P90 is
+`2.22 / 2.53 / 2.87`; there was no change to the throttle policy. Twelve initial
+RGB-frame hashes are distinct, confirming distinct captured appearances.
+
+**Artifacts and validation:**
+- `logs/round_b_recovery_collect_v1/captures/`: approximately `0.89 GB` of full
+  RGB images, same-frame 15D geometry labels, motion, histories, actual commands,
+  counterfactual teacher actions, phase/event IDs, and timestamps.
+- `coverage.json`: full-frame shape, CTE/geometry/motion consistency, command-history
+  alignment, unchanged nominal actions/throttle, and original steering-rate limit
+  checks passed. Same-frame teacher labels versus the next decision's teacher
+  action differ by at most `1.31e-6`.
+- `dataset_manifest.json`: capture hashes, scene groups, frozen teacher/head hashes,
+  calibration exclusions, and explicit `round_a_locked_holdout_used=false`.
+  `source/` preserves the exact five source files fingerprinted at run start.
+- The teacher SHA256 remains `8d7ca02cf1db3f9d5fe09b7a9e35db04ca7852df16ca413341a27225e14c3e6d`;
+  the existing head remains `80b3b1b343f01b8ec6b90f17fb5bdc34a531f3f7a08cc9f28d9f3e8048b59628`.
+- `pytest -q`: **47 passed**. New checks cover intervention release, bounded duration,
+  startup/corner gates, failed-event accounting, and frozen sync-only configuration.
+
+**Training contract:** `images[k]`, `true_geom[k]`, and `history_post[k]` describe the
+same post-step frame. `teacher_true_raw_action_on_frame[k]` labels that frame;
+`student_raw_action[k]` is the command that led to it, using the preceding frame.
+The `student_*` names are inherited capture fields: this run is teacher-driven
+with interventions, not a completed student-on-policy DAgger iteration. Heading
+and lookahead labels remain fitted-centerline estimates, with the limitations
+described earlier; CTE units are not metres.
+
+**Next:** Fit the same two-stage linear geometry head using training-pool data,
+with layout-separated internal validation and explicit reporting on large-offset
+and startup subsets. No new perception head or closed-loop improvement is claimed
+by this collection result.
+
+### Stage 3.6: Round B — Same-Architecture Geometry Head Retraining (2026-11-16)
+
+`tools/train_geometry_recovery.py` retains the frozen DINOv2-S 4x4 grid and the
+existing `6144 -> 15`, `(t,t-2,t-4) 45 -> 15` affine architecture. It combines the
+23,924-frame legacy feature cache, Round A **training-pool captures only**, and
+the new recovery collection. Before feature extraction/fitting, layouts 10..12
+of each capture run are assigned to internal validation. Both Round A conditions
+from the same layout stay in the same split. The original Round A locked holdout
+files are never opened; calibration collection runs are excluded.
+
+```bash
+python tools/train_geometry_recovery.py
+```
+
+Artifacts: `logs/round_b_geometry_train_v1/{training_manifest.json,feature_cache.npz,results.json,predictions.npz}`;
+candidate: `models/dinov2_geometry_15d_round_b_v1/proj15_lags_ridge.pt`.
+The baseline head is preserved at its original path. The manifest fingerprints
+all source captures, legacy cache, and baseline weights. Each full-episode capture
+includes its reset frame for correct lag context. Evaluation below uses the same
+valid-lag mask for both heads (first four frames of each sequence excluded).
+
+There are **69,008 fitting frames across 192 layout groups** and **15,589 internal
+validation frames across six groups** (15,553 valid-lag frames). All fitted weights
+and standardization parameters use the fitting set only. Five-fold grouped
+regularization selection and Stage-1 OOF predictions remain inside that fitting
+set; these are not final-test results. Fitting/export took **13.52 s**, excluding
+feature extraction and data preparation.
+
+| Internal validation subset | Frames | Baseline CTE MAE / P95 | Round B CTE MAE / P95 | Baseline / Round B heading P95 (deg) |
+|---|---:|---:|---:|---:|
+| All | 15,553 | 0.0534 / 0.1353 | 0.0396 / 0.0995 | 2.90 / 2.30 |
+| Cruise (`\|CTE\| < 0.5`) | 14,650 | 0.0516 / 0.1313 | 0.0377 / 0.0944 | 2.86 / 2.26 |
+| Startup (step <= 250) | 2,223 | 0.0481 / 0.1195 | 0.0412 / 0.1042 | 2.75 / 2.48 |
+| Large offset (`\|CTE\| >= 1`) | 117 | 0.1828 / 0.6244 | 0.1588 / 0.5672 | 6.84 / 5.84 |
+| Positive large offset | 80 | 0.2069 / 0.7004 | 0.1743 / 0.5824 | 7.11 / 6.86 |
+| Negative large offset | 37 | 0.1306 / 0.3350 | 0.1254 / 0.3667 | 4.74 / 4.02 |
+
+Overall CTE P95 improves by **26.4%**, but large-offset P95 improves by only
+**9.2%**, and negative-large-offset CTE P95 regresses. The small, correlated
+large-offset subset does not establish robust recovery. A fresh 8-layout paired
+natural-driving screen was then run, with the teacher, throttle/action
+mapping, sync enabled, and reversal acceleration disabled in **both** conditions.
+Only the visual head changes. Full captures are marked evaluation holdout.
+
+```bash
+python tools/eval_teacher_tolerance.py --mode round_b_vision_paired \
+  --candidate-geometry-head models/dinov2_geometry_15d_round_b_v1/proj15_lags_ridge.pt \
+  --layouts 8 --max-episode-steps 2000 --device cuda \
+  --output-dir logs/round_b_vision_paired_8layouts_v1
+```
+
+**Completed paired screen (16 episodes):**
+
+| Metric | Baseline head + sync | Round B head + sync |
+|---|---:|---:|
+| Completion | **8/8** | **7/8** |
+| Mean laps | 9.000 | 8.875 |
+| Mean episode `abs(CTE)` | 0.18005 | 0.18003 |
+| Mean speed | 2.531 | 2.533 |
+| Maximum `abs(CTE)` | 1.648 | 2.060 |
+| Frames at `abs(CTE) >= 1` | 37 | 53 |
+| Pooled perception CTE P95 | 0.1382 | **0.1003** |
+| Pooled perception heading P95 | 2.87 deg | **2.33 deg** |
+| Pooled encoder P50 / P95 | 4.25 / 4.96 ms | 4.27 / 5.10 ms |
+
+Online perception improvements agree with offline validation, but the fixed
+controller does not show better mean lateral tracking. The paired mean CTE
+difference is `-0.000016 CTE` (95% bootstrap interval `[-0.01630, +0.01530]`).
+The candidate does **not** pass the pre-agreed screen criterion of no fewer
+completions; this small screen also does not statistically establish an intrinsic
+model regression. All episodes and timing outliers are retained in the primary
+comparison, with no post-hoc exclusion of difficult runs.
+
+**Failure/timing observations (association, not an isolated causal test):**
+- Candidate L04 recovered from `CTE=-1.634` at step 1567. Its CTE prediction error
+  at that peak was only `+0.019`; a `72.33 ms` encoder stall at step 1515 preceded
+  the later oscillation (`72.95 ms` observation interval at step 1516).
+- Candidate L06 exited at step 1717 (`CTE=-2.060`). A `131.89 ms` observation
+  interval at step 1677 was followed by short/irregular intervals and oscillation.
+  At exit, CTE prediction error was `-0.105` and heading prediction error was
+  `-6.48 deg`; the failure cannot be reduced to CTE underestimation alone.
+- Baseline L08 also had large timing disturbances (maximum observation interval
+  `380.30 ms`, maximum encoder `193.39 ms`), reached `CTE=-1.648`, and recovered.
+  Timing disturbances therefore affect both conditions; the results neither
+  isolate timing as the sole cause nor identify the source of the stalls.
+
+`timing_diagnostics.json` retains per-episode peaks and their steps;
+`layout06_candidate_failure.png` plots CTE estimates, applied steering, and timing.
+`audit.json` confirms 8 complete pairs, identical sync-only control, preserved
+motion inputs, aligned histories/actions (maximum next-action difference
+`1.31e-6`), evaluation-only captures, and unchanged weight hashes. The original
+Round A locked holdout remains unused. Source snapshots are retained alongside
+both the training and evaluation runs. **50 pytest tests pass**, including checks
+for held-out file exclusion, layout grouping, batch/live lag equivalence, and
+paired-head control configuration.
+
+**Decision:** `decision.json` marks the Round B head **not promoted**. Preserve
+`models/dinov2_geometry_15d/proj15_lags_ridge.pt` as the baseline; retain the candidate
+(`SHA256 6fd7b4aabf25f86b9b8c932e812411034d64c3f0f2d23edaeb3f65ed4fa02657`)
+for diagnosis. Do not expand this candidate to the 24-layout final evaluation or
+claim a closed-loop improvement. Teacher weights and reversal settings were not
+changed. The remaining issue is distinguishing timing/feedback sensitivity from
+perception residual structure before choosing another training change.
+
+### Stage 3.7: Remote Desktop / Host Timing Diagnosis — Active Baseline (2026-11-16)
+
+At the user's request, pause further training and investigate whether remote
+desktop activity contributes to timing stalls. No remote service was stopped,
+no desktop session was disconnected, and no system/GPU settings were changed.
+
+**Process identification correction:** An initial search for only `Sunlogin|Oray`
+found the legacy `SunloginService` stopped and missed the active `AweSun.exe`
+processes. Windows GPU-engine counters identified PID 15512 as `AweSun`, using
+two VideoEncode engines (each roughly 2..3% in the initial snapshots), and
+`AweSunService` was running. AweSun is the branding on the
+[official English remote-desktop site](https://sunlogin.oray.com/en/).
+PID 15512 was created at `2026-11-16 11:06:26 +08:00` and was still alive during
+diagnosis, covering the earlier evaluation's time window. This establishes
+process presence, not continuous remote-streaming activity throughout that run.
+The attempted Service Control Manager event query returned no matching state
+events, so no historical stream-on/off conclusion is drawn from it.
+
+`tools/profile_remote_timing.py` adds a read-only diagnostic:
+- Uses the same recorded RGB frames and unchanged baseline geometry head at a
+  paced 25 ms period, including preprocessing, DINOv2, temporal head, CPU output,
+  and CUDA synchronization. It does not drive or query the simulator.
+- Independently samples selected Windows process CPU/memory counters and raw
+  per-engine GPU utilization approximately once per second. Records UTC times,
+  sampling cost, wake lateness, and skipped benchmark slots.
+- Never stops services or changes remote settings. The phase label is supplied
+  by the operator; observed remote VideoEncode activity is logged independently.
+
+```bash
+python tools/profile_remote_timing.py \
+  --output-dir logs/remote_timing_diagnosis_v1/remote_active \
+  --phase remote_active --duration 120
+```
+
+**Observed active baseline:** 4,801 perception calls; P50/P95/P99/max
+`4.22 / 5.18 / 5.88 / 9.07 ms`; zero calls above 25 ms and zero skipped slots.
+Wake-lateness P99/max was `0.197 / 0.250 ms`. All 122 Windows samples contained
+AweSun VideoEncode activity; the maximum observed utilization of an individual
+remote encode engine was 3%. The host sampler reported no errors; its wall-time
+cost P50/P95 was `353 / 358 ms` per roughly 1-second sample, asynchronously from
+perception. These coarse GPU counters cannot attribute individual millisecond
+stalls. Raw data and `summary.json` are in the run directory above.
+
+**Limits / pending comparison:** Remote streaming and fast perception coexist
+in this 2-minute recorded-frame benchmark. It neither establishes remote desktop
+as the cause of earlier stalls nor excludes a contribution under live rendering.
+Unity camera capture, TCP reception, actual driving, and historical host counters
+were not measured by this test. The subsequent disconnected/reconnected driving
+comparisons and their limits are recorded in Stage 3.8 below.
+
+### Stage 3.8: Bounded Runtime Diagnosis — Remote Session, TCP and WSL Clocks (2026-11-16)
+
+All driving below uses the original vision head and frozen 60k teacher, low-jitter
+sync enabled, steering difference limit 0.1, and reversal-unwind scale 1.0. No
+teacher retraining or candidate promotion was performed. Artifacts are under
+`logs/remote_root_cause_v1/`.
+
+| Run | Result | Timing evidence |
+| --- | --- | --- |
+| `gc_paired_remote_disconnected` | Stock and deferred GC both 3/3 x 2,000 steps | Encoder max 10.97 / 12.48 ms; observed GC max 2.09 ms, no generation-2 collections |
+| `continuous_remote_transition` | 10,000/10,000 steps, 48 laps | Despite its name, streaming stayed off throughout; observation interval max 26.39 ms |
+| `long_natural_gc` | Failed at step 3,709, 17 laps | Streaming active from the first host sample; observation interval 234.51 ms at step 3,336, encoder max 9.05 ms, GC max 1.15 ms |
+| `sync_stage_remote_connected` | 2/2 x 2,000 steps | Fine receive/decode/publish instrumentation installed; max interval 37.98 ms, earlier 234 ms stall not reproduced |
+| `transport_paired_remote_connected` | TCP default 1/2; TCP_NODELAY 2/2 | Two fresh layouts with reversed condition order; same model and controls |
+
+The disconnected runs total 22,000 steps. This sequential comparison makes remote
+activity a useful lead, not a controlled demonstration that AweSun caused the
+stall. In the connected failure, the 234 ms interval preceded the exit by 373
+steps; neither a sole cause of that exit nor a Windows GPU-driver cause is proven.
+The independent Linux heartbeat recorded no >3 ms wake delay around that event.
+It uses the same monotonic clock, so it cannot alone exclude a VM pause that also
+affects the clock. Later heartbeat records contain eight 3.0..4.4 ms delays.
+
+**Observed transport issue:** The SDK does not set TCP_NODELAY. A socket snapshot
+showed 184 queued send bytes, including 92 not yet transmitted, one unacknowledged
+segment, and approximately 20 ms TCP RTT despite sub-millisecond ICMP ping. This
+establishes small-command buffering; it does not establish the cause of the
+earlier 234 ms interval. During the paired run, 9/469 sampled default-condition
+socket snapshots contained unsent bytes (maximum 92), versus 0/250 sampled
+TCP_NODELAY snapshots. Sampling started after the first NODELAY episode, so only
+its second episode has queue coverage. Disabling Nagle did not materially change
+the sampled approximately 19.5 ms RTT. The default-condition failure in this run
+had no observation interval above 40 ms, so its outcome cannot validate a fix for
+the earlier large stall. Two pairs are insufficient for a reliability claim.
+
+Fine timings use `time.perf_counter()`. A message-sent timestamp means accepted
+by the local socket, not transmitted or processed by Unity. Publish-to-return
+frame age can include time before observe was called; actual observe handoff is
+`return - max(published, observe_start)`.
+
+**Clock check:** This machine uses the `tsc` clocksource; Python perf_counter and
+monotonic both use CLOCK_MONOTONIC, while time.time uses CLOCK_REALTIME.
+chronyd runs with `-x`, which disables clock adjustment despite the active NTP
+service status. Inspected user/system timers and Windows scheduled tasks showed
+no matching forced-time-sync task; this is not a complete audit of all host code.
+Ordinary wall-clock steps do not step CLOCK_MONOTONIC
+([Linux clock documentation](https://man7.org/linux/man-pages/man3/clock_settime.3.html)).
+Frequency correction and virtual-machine timing anomalies are separate concerns.
+
+`clock_probe_v1` sampled Linux realtime, monotonic, raw and boottime 12,031 times
+over 122 seconds, plus Windows UTC/QPC 1,094 times over 120 seconds. No Linux
+clock increment differed from monotonic by more than 0.025 ms; raw-versus-monotonic
+elapsed drift was 0.043 ms. Windows UTC-versus-QPC elapsed difference was 0.722 ms.
+This short non-driving sample did not reproduce the reported periodic clock
+jump. Windows-to-WSL arrival offsets include PowerShell startup and pipe latency
+and must not be interpreted directly as clock drift.
+
+A regression test simulates unchanged timestamps, a one-minute backward step,
+and a one-hour forward step while receiving real socket-pair telemetry. Enabled
+low-jitter observe continues to receive each fresh frame. This verifies the
+application's sequence-based wakeup behavior, not WSL or Unity clock correctness.
+GC callback records and the background writer are also covered; all 54 tests pass.
+
+**Hard stopping rule requested by the user:** One final original-model driving
+run, at most 4,000 steps and a 170-second process limit, with a concurrent
+132-second clock probe. No further conditions, retraining, or automatic
+extension. If a stall cannot be attributed with concurrent evidence, stop and
+report the root cause as unconfirmed. See `stopping_rule.json`; final artifacts
+are `clock_live_stopcheck_v1/` and `clock_live_stopcheck_clocks_v1/`.
+
+**Final stop check and decision:** The single final episode completed 4,000 steps
+and 19 laps in 100 seconds. Maximum observation interval was 34.54 ms, with no
+interval above 40 ms. Maximum |CTE| was 1.949, so completion does not demonstrate a
+large safety margin. Concurrent clock sampling covered the full driving run:
+13,023 Linux samples over 132 seconds, with no >1 ms discrepancy between clock
+increments; the largest was 0.037 ms. Raw-versus-monotonic elapsed drift was
+0.048 ms. Windows UTC/QPC elapsed difference was 0.566 ms across 1,186 samples.
+Neither the large stall nor a clock jump reproduced. The investigation stopped
+at the agreed limit. The historical 234 ms stall's root cause remains
+**unconfirmed**; do not label AweSun, WSL clock correction, GC, or Nagle as its
+proven cause. Preserve the original model/control baseline, keep TCP_NODELAY as a
+diagnostic condition, and do not launch additional diagnosis or retraining
+automatically. Machine-readable closure: `bounded_diagnosis_result.json`.
+
+### Stage 3.9: Opt-in Runtime Protection Implementation (2026-11-16)
+
+Following the bounded diagnosis, the user authorized preventive implementation,
+not further root-cause experiments or teacher training:
+
+- Shared training/evaluation flags now include `--tcp-nodelay` and
+  `--observation-timeout SECONDS`. Existing defaults remain unchanged. The
+  timeout requires low-jitter sync; invalid negative/non-finite values fail.
+- Observation waiting uses a monotonic deadline. A missing or already-stale
+  observation latches `ObservationTimeoutError`, requests zero throttle and full
+  handbrake, and prevents subsequent control commands/late frames from silently
+  resuming the run. Explicit reset clears the latch. The emergency send preserves
+  the existing partial-packet buffer; it never discards half a JSON message.
+- The request is best-effort. Diagnostics distinguish socket acceptance from
+  acknowledged execution, and do not claim that Unity actually braked. This is
+  a client observe-wait guard, not an independent Windows/Unity watchdog; it
+  cannot cover a whole-WSL freeze, a blocked policy/encoder before observe, or
+  an unreachable/hung simulator. No Unity server source is present in this repo.
+- Recorded evaluations save `runtime_failure.json` and a failed run status,
+  retaining previous completed episodes. The custom live evaluator also flushes
+  the interrupted episode's returned-step telemetry and records its context.
+  Do not silently exclude runtime-aborted runs from reliability reporting.
+- `vision_baseline_runtime` runs just the original live vision head and frozen
+  teacher, with low-jitter sync and no reversal acceleration. Its layouts default
+  to evaluation-only; it needs no residual-probe cache. Use explicit
+  `--tcp-nodelay --observation-timeout 0.10` for the documented protected recipe.
+  The 100 ms threshold is a starting operational cutoff, not a validated safe
+  controller error budget. README documents the command and fixed simulator
+  settings; no remote-service or display settings were changed automatically.
+- Scene-reload timeouts (production and standalone diagnostic) and frame
+  collection elapsed-time/rate calculations now use monotonic clocks.
+
+**Validation:** All 66 tests pass. New tests cover real localhost TCP_NODELAY,
+normal telemetry followed by silence and a brake request, a stale unconsumed
+frame, the latched failure/reset behavior, disabled-guard compatibility, invalid
+timeouts, wall-clock-independent scene-reload deadlines, separate runtime-failure
+records, and the single-condition baseline configuration. CLI help exposes the
+new flags/mode and `git diff --check` passes. No new live simulator experiment,
+Windows-side brake execution test, or model training was run for this change.
+
+### Stage 3.10: Live Runtime-Guard Acceptance (2026-11-16)
+
+`logs/runtime_guard_acceptance_v1/` contains a bounded two-case smoke test using
+the original live vision head and frozen teacher, timeScale 2/FPS 120, low-jitter
+sync, TCP_NODELAY, and a 100 ms observation timeout. The ignored run wrapper
+records the injected treatment; it does not change production defaults or weights.
+
+- **Normal:** 400/400 steps in 10 seconds, one lap, max |CTE| 0.656, no timeout.
+- **Injected missing observations:** Pause socket reception for 200 ms after the
+  220th control message. The guard fired after 100.145 ms and aborted the run
+  after 217 returned steps. `runtime_failure.json` reports the stop request
+  flushed to the socket and keeps execution acknowledgement false.
+- The wrapper observed subsequent telemetry for 0.7 seconds before normal error
+  cleanup: speed fell from 2.344 m/s to approximately zero and telemetry sequence
+  advanced by 24. This supports a physical stop in this test, without adding an
+  execution-acknowledgement protocol or testing a whole-WSL freeze.
+
+`acceptance_result.json` records the passed checks. Both cases retain the source
+versions verified against their recorded hashes. No further runtime root-cause
+experiments were launched.
+
+### Stage 3.11: Targeted Negative-Offset Recovery Data (2026-11-16)
+
+Added `RecoveryCollectionConfig.directions` and the collection-only CLI option
+`--recovery-direction negative`. Balanced directions remain the default. The
+negative mode cycles the same three release targets; steering magnitude 0.35,
+four-step kick cap, startup/straight-road gates, heading/CTE release guards,
+teacher throttle, action history and steering rate limit remain unchanged.
+Seven new tests cover negative direction scheduling and invalid signs; all
+73 tests pass. This changes collection actions, not the frozen teacher.
+
+One capped batch, `logs/round_b_negative_recovery_v1/`, collected six fresh
+training-only layouts, up to 1,500 steps each, with TCP_NODELAY and the 100 ms
+guard enabled. Saved simulator settings remained timeScale 2/FPS 120, random
+light/trees enabled, cones disabled. No runtime timeout occurred.
+
+| Coverage | Previous recovery batch | Added negative batch |
+| --- | --- | --- |
+| Frames | 15,187 | 7,698 |
+| Startup frames | 3,000 | 1,500 |
+| CTE <= -1 frames | 146 | 198 |
+| CTE >= +1 frames | 294 | 0 |
+| Interventions / recovered | 104 / 94 | 55 / 49 |
+| CTE-ended episodes | 9 | 2 |
+
+All full-frame/geometry/motion/history/action-alignment audits pass; maximum
+teacher-action timing-alignment error is 8.35e-7. Failed and horizon-truncated
+recoveries remain in the captures. Both batches together provide 344 negative
+large-offset frames. `coverage.json`, `dataset_manifest.json`, source snapshots,
+and the original split manifest preserve provenance; no prior locked evaluation
+capture is used for fitting.
+
+The pre-recorded collection target was 200 new negative frames; actual coverage
+is 198, 1% short. The batch stopped at its six-layout cap. The documented decision
+is to allow one unchanged-architecture offline fit with these samples, without
+collecting more layouts or relaxing the validation-performance gates. Validation
+remains grouped by layout (last three training-pool layouts of each capture run);
+existing internal validation is development data, not final independent evidence.
+
+**Single offline retraining result:**
+`logs/round_b_negative_geometry_train_v1/` combines the legacy feature cache with
+Round A training-pool captures and the two recovery batches. It fits the unchanged
+two-stage linear lag Ridge head on 72,917 frames and validates on 19,384 frames
+from nine held-out development layouts (19,336 valid lagged samples). The
+grouped fit itself took 5.38 seconds, excluding image feature extraction/cache
+construction. Source snapshots and input fingerprints are retained. The export
+is `models/dinov2_geometry_15d_negative_v1/proj15_lags_ridge.pt`; the teacher and
+original perception checkpoint hashes were verified unchanged.
+
+| Development subset | Frames | Original CTE P95 | New CTE P95 | Original / new heading P95 |
+| --- | --- | --- | --- | --- |
+| All | 19,336 | 0.13493 | 0.10040 | 2.983 / 2.354 deg |
+| Negative CTE <= -1 | 129 | 0.31297 | 0.31617 | 4.719 / 4.355 deg |
+| Positive CTE >= +1 | 80 | 0.70038 | 0.58530 | 7.111 / 7.021 deg |
+| Absolute CTE >= 1 | 209 | 0.50341 | 0.47537 | 5.421 / 5.164 deg |
+| Startup | 2,964 | 0.11933 | 0.10472 | 2.839 / 2.505 deg |
+
+**Decision: not promoted.** The pre-recorded gate requires at least 5% lower
+negative-large-offset CTE P95, with aggregate CTE/heading P95 degradation bounded
+to 10%. Aggregate metrics pass, but the target tail ratio is 1.010, exceeding
+0.95. The negative-tail difference is small and is not claimed statistically
+significant; it simply provides no evidence of the required improvement.
+No second fit, closed-loop candidate screening, or 24-layout evaluation was
+launched. Preserve the useful training captures and experimental head, keep the
+original runtime baseline, and retain `offline_gate.json` / `decision.json` as
+the explicit stopping decision. These offline results do not establish improved
+closed-loop completion or prove that additional data can never help.
+
+### Stage 3.12: Common-Layout Offline Control Comparison (2026-11-16)
+
+The user authorized Step 1 only: compare the three existing heads through the
+same frozen teacher, without driving, fitting, or changing the baseline.
+`tools/compare_geometry_control.py` consumes the Stage 3.11 feature cache and
+uses the same 19,336 valid-lag frames from nine development layouts / 12
+trajectories. Both retrained heads excluded these layouts from fitting. Original
+locked evaluation captures remain unopened. Artifacts are in
+`logs/geometry_control_compare_v1/`.
+
+**Replay semantics and audit:** At frame k, the 18D state is joined with its
+recorded **post-command** 40D history to query action k+1. Every head receives
+the same motion/history; only the 15D geometric inputs differ. Steering is
+mapped with max steering 1, max difference 0.1 (executed delta limit 0.19998),
+throttle 0.2..0.7, and no accelerated unwind. This is a one-step counterfactual
+on recorded trajectories, not a recursive rollout. True states/history were
+checked against each saved capture; maximum replayed true-teacher action
+difference from stored live labels was 1.20e-7. The mapper is tested against
+production behavior, including saturation and reversals.
+
+| Head | Mapped steering MAE | Mapped steering P95 | Negative-large-offset steering P95 | Missed teacher unwind / 612 eligible frames | Max absolute 20-step mean steering error |
+| --- | --- | --- | --- | --- | --- |
+| Original | 0.03756 | 0.20535 | 0.12026 | 66 | 0.11642 |
+| Round B | 0.03316 | 0.18299 | 0.09684 | 60 | 0.11198 |
+| Negative supplement | 0.03296 | 0.18252 | 0.07771 | 58 | 0.11911 |
+
+Steering values are normalized command units, not degrees. The negative-large
+subset contains 129 frames from six layouts/trajectories. Relative to the
+original head, the negative-supplement head lowers aggregate steering MAE by
+12.2% and negative-large steering P95 by 35.4%, even though its negative CTE
+P95 did not improve. Its per-layout macro MAE difference is -0.00439, with an
+exploratory paired-layout bootstrap interval [-0.00501, -0.00369]. These are
+development-set comparisons, not independent final-test confidence claims.
+
+**Risks retained:** Maximum continuous bias does not improve (0.119 vs 0.116),
+with the worst window at startup on negative-recovery layout 6, steps 10..29.
+Large-offset steering-change direction mismatches are 10 versus 9 frames;
+teacher-relative missed-unwind counts are small and correlated. Here unwind
+means the teacher reduces steering magnitude by >0.02 from |previous steering|
+>=0.3 while |CTE|>=0.5 or |heading|>=8 deg; it does not certify physical recovery.
+The true-state teacher is a reference controller, not an infallible expert.
+
+**Input-repair diagnostic:** Keeping the negative head's other inputs fixed,
+substituting true lookahead points lowers aggregate mapped steering MAE from
+0.03296 to 0.01158; substituting true heading lowers it to 0.02696. Substituting
+only true CTE leaves 0.03292. Thus CTE P95 alone is a poor selector for this
+controller. These are non-additive counterfactual interventions with correlated
+geometric inputs, not proof of independent physical causes.
+
+**Decision:** Preserve the historical Stage 3.11 CTE-gate result and all baseline
+weights. This new control-related evidence justifies nominating the negative
+head for one four-layout paired closed-loop screen using the unchanged teacher
+and identical runtime guards. No promotion or student-controller training is
+justified yet. That screen was **not started** during this offline-only step.
+`decision.json`, `report.json`, `per_layout.csv`, `worst_bias_windows.csv`, and
+validation-only `predictions.npz` retain the evidence and source snapshots.
+All 76 tests pass; new checks cover exact production mapping, sequence-safe bias
+windows, and teacher-relative direction/unwind masks. `git diff --check` passes.
+
+### Stage 3.13: Four-Layout Paired Screen of the Negative-Supplement Head (2026-11-16)
+
+The user authorized one fresh paired screen. Before execution,
+`logs/negative_head_paired_4layouts_v1/screen_plan.json` fixed four layouts, two
+conditions per layout, a 2,000-step episode cap and 540-second process deadline,
+with no automatic retries, fitting, expansion or promotion. Both conditions use
+the frozen original teacher, low-jitter sync, TCP_NODELAY, 100 ms observation
+timeout, steering difference 0.1, throttle 0.2..0.7, and no accelerated unwind.
+Saved simulator settings remained timeScale 2/FPS 120 with random light/trees on
+and cones off. Only the geometry head changes; `vision_round_b` in the artifacts
+denotes the **negative-supplement** checkpoint, not the earlier Round B head.
+
+```bash
+python tools/eval_teacher_tolerance.py --mode round_b_vision_paired \
+  --candidate-geometry-head models/dinov2_geometry_15d_negative_v1/proj15_lags_ridge.pt \
+  --layouts 4 --max-episode-steps 2000 --tcp-nodelay \
+  --observation-timeout 0.10 --save-captures \
+  --output-dir logs/negative_head_paired_4layouts_v1
+```
+
+All eight episodes completed: 16,000 total steps, 72 laps, zero runtime aborts.
+Source snapshots match the recorded hashes. Evaluation-only captures pass the
+motion/history/action-rate-limit audit, next-action alignment checks, and frozen
+teacher/head weight hash checks. Original Round A locked captures remain unused.
+
+| Metric | Original head | Negative-supplement head |
+| --- | --- | --- |
+| Completion / laps | 4/4 / 36 | 4/4 / 36 |
+| Mean absolute CTE | 0.17236 | 0.17165 |
+| Maximum absolute CTE | 0.96683 | 1.19103 |
+| Frames at absolute CTE >= 1 | 0 | 4 |
+| Mean speed (m/s) | 2.5372 | 2.5303 |
+| Pooled online perception CTE error P95 | 0.13705 | 0.09732 |
+| Pooled online heading error P95 (deg) | 2.9579 | 2.3622 |
+| Maximum encoder time (ms) | 10.83 | 82.27 |
+
+The paired mean absolute CTE difference is -0.000710 CTE (95% layout-bootstrap
+interval [-0.01303, +0.00762]), only a 0.4% point-estimate improvement. Layout 1
+favors the candidate; layouts 2..4 have slightly higher candidate mean CTE. The
+candidate's perception improvements persist online, but do not yield a clear
+lateral-tracking or completion benefit in this screen.
+
+**Timing caveat, without reopening diagnosis:** Candidate layout 4 logged an
+82.27 ms encoder call at step 1347; its CTE peak -1.191 occurred at step 1354.
+The 82.90 ms observation interval appears in the following control cycle. All
+these samples remain in primary metrics. This association does not identify
+the stall source or establish that the head caused the larger CTE peak. The
+100 ms observation-wait guard neither covers encoder work nor triggered here;
+its documented scope remains unchanged.
+
+**Decision:** Completion screening passes, but no clear closed-loop improvement
+is demonstrated. Keep the original head as the working baseline and retain the
+negative head as experimental; do not overwrite either checkpoint or infer
+reliable completion from four layouts. Do not automatically run further
+layouts, train a student controller, or reopen runtime root-cause work.
+`audit.json`, `decision.json`, `episodes.jsonl`, full captures, telemetry and
+`tolerance_results.json` retain the result. No production code changed for this
+screen; the previous 76-test validation remains applicable and
+`git diff --check` passes.
+
+### Stage 3.14: Sensor Source Audit and Student Input Requirement (2026-11-16)
+
+**User requirement:** Student control inputs may include the camera, wheel
+encoder measurements, IMU measurements and self-generated command history.
+Direct simulator linear velocity, position, true CTE, road-relative heading,
+map/centre-line lookahead, and other privileged state are not student inputs.
+Such state may remain isolated for teacher labels, evaluation and diagnostics.
+Existing geometry-head pipelines retain true velocity and therefore do not meet
+this requirement. Historical results remain valid privileged-motion references;
+they do not establish compliant student performance. Do not continue the proposed
+control-student fine-tuning with the old motion input contract.
+
+At the user's request, upstream GitHub files were retrieved through the configured
+HTTP proxy and pinned to commit `ec04c400f045222375ec82e649bb051fb17aad41`.
+The installed Windows `Assembly-CSharp.dll` was independently inspected as .NET IL;
+it was not modified or replaced. Evidence, source copies, assembly hash and the
+read-only inspection script are under `logs/sensor_interface_audit_v1/`.
+
+- In the local `Car` implementation, velocity is
+  `transform.InverseTransformDirection(rb.velocity)`. `TcpCarHandler` divides
+  `GetVelocity()` by 8 and sends its magnitude as `speed`; extended `vel_x/y/z`
+  use the same vector. Thus the existing speed is rigid-body truth, not a wheel
+  encoder. An earlier conversational claim that these components were necessarily
+  world-frame was inaccurate: `Car` converts them to body frame, whereas the
+  separate `UnityStandardCarAdapter.GetVelocity()` returns Rigidbody velocity
+  without this conversion. Runtime vehicle-adapter identity must be established
+  before asserting a universal coordinate convention.
+- `Car.GetGyro()` returns the stored `rb.angularVelocity`, with no body-frame
+  transformation in that update. `GetAccel()` is a finite difference of the
+  local velocity vector; it is not by itself a calibrated accelerometer specific
+  force model. `gyro_*` / `accel_*` fields exist, but their semantics must be
+  verified before using them as a body-mounted IMU. Simulated IMU signals can
+  legitimately originate in engine physics; the measurement model, frame and
+  units must represent the permitted sensor, without exposing pose/velocity as
+  extra policy features.
+- The local binary and upstream source contain `Odometry`, and TCP telemetry
+  can transmit `o.Label -> o.GetNumberRotations()` for configured components.
+  The upstream implementation estimates cumulative absolute rotations from wheel
+  mesh quaternion differences and explicitly warns that it is unreliable at
+  high wheel spin rates. It also loses rotation direction. This is distinct
+  from `speed`. Presence of this class does not prove that the current vehicle
+  has an enabled, usable encoder feed. The Python SDK/custom sync currently do
+  not preserve arbitrary odometry-label fields as policy observations.
+
+**Status:** Source audit only; no sensor adapter, compliant student, training,
+simulator driving or new performance claim was introduced. Next establish the
+active vehicle's raw encoder/IMU output, then implement a whitelisted sensor
+observation path without falling back to true velocity. The old teacher input
+layout cannot simply be relabelled as encoder/IMU data.
+
+### Stage 3.15: First Camera-Only Control Student — Offline Only (2026-11-16)
+
+The user authorized implementation of a student with **no simulator motion
+truth**, a 20-minute first-phase budget, one offline fit, and no simulator run.
+No encoder or IMU is used in this iteration. The original perception head and
+the true-state teacher remain frozen at their prior hashes.
+
+**Implementation:** `rl/visual_student.py` provides a separate image-only
+`VisualGeometryEncoder` and deterministic `VisualStudentActor`. The feature API
+accepts images only and never calls `TrackState.encode` or receives telemetry.
+Three predicted 15D geometric vectors at lags 0,2,4 plus 40 issued commands form
+85 student inputs. Since each geometric prediction already uses lagged DINO
+features, effective context extends back eight steps. Causal first-frame padding
+is reset per trajectory and matches the batch path. No future, cross-condition,
+cross-layout, missing-step or prior-episode frame is borrowed.
+
+The actor is 85->256->256->2 with ReLU hidden layers and tanh outputs. Compatible
+teacher geometry/history weights initialize it; the three teacher motion columns
+are discarded and new historical-geometry columns start at zero. This creates
+an adapted initialization, not a valid replacement for the teacher without
+training. The student has its own checkpoint format and enforces the 85D input
+contract plus geometry-head hash at load time. No critic or RL updates are used.
+
+`tools/train_visual_student.py` consumes existing cached image features and
+issued command histories, constructing student inputs before accessing teacher
+state. The label branch separately queries the frozen teacher on true state and
+the same post-command history at frame k, targeting command k+1. Student inputs
+and teacher labels are stored separately. The first fit uses full reset-aligned
+capture runs only; legacy tail-only records are not used. There are 39,020
+training frames after excluding 9,973 frames from failed training captures, and
+19,384 validation frames across the existing nine development layouts. Failed
+validation captures stay in the evaluation. No locked evaluation capture enters
+the fit. The 1..8-step startup padding remains included and explicitly marked.
+
+**One fit:** AdamW lr 1e-4, weight decay 1e-4, batch 512, at most 15 epochs, seed
+42. Loss is mapped steering MSE + 0.1 raw steering MSE + 0.5 mapped throttle MSE.
+Steering difference remains 0.1 (executed delta 0.19998), throttle 0.2..0.7, and
+accelerated unwind is disabled. Best development MAE selects epoch 14 of 15.
+Fitting/evaluation took 15.39 seconds; the entire offline job took 19.39 seconds,
+excluding implementation and tests. Artifacts:
+`logs/visual_student_no_motion_v1/`; export:
+`models/visual_student_no_motion_v1/student.pt`.
+
+| Same-layout development metric | Adapted initialization | Trained camera-only student |
+| --- | --- | --- |
+| Mapped steering MAE | 0.15281 | 0.03987 |
+| Mapped steering P95 | 0.39996 | 0.20339 |
+| Mapped throttle MAE | 0.07457 | 0.01931 |
+| Missed teacher unwind / 612 eligible frames | 418 | 71 |
+| Wrong steering-change direction / 1,743 eligible frames | 532 | 114 |
+
+The mapped-steering MAE ratio is 0.261, large-offset MAE ratio 0.255, and
+missed-unwind-rate change -0.567, passing the pre-recorded offline gates
+(<=0.8, <=1.1 and <=+0.02 respectively). Student negative-large steering
+MAE/P95 is 0.01144 / 0.06627 on 129 frames; aggregate large-offset MAE/P95 is
+0.02757 / 0.18699 on 209 frames. These small correlated subsets compare against
+the true-state teacher's actions, not an infallible recovery oracle.
+
+**Interpretation:** The student learned from the teacher without motion truth
+in its inputs. The roughly 74% MAE reduction is relative to its deliberately
+adapted initialization, not the old trained pure-vision RL policy. It is not a
+closed-loop improvement claim. Partial observability, startup bias and
+student-generated history distribution shift remain untested live risks.
+
+**Runtime entry prepared, not executed:** `rl/eval_visual_student.py` loads only
+this student format and the matching frozen visual head. Scoring/termination
+may use true CTE/speed; they are separate from policy inputs. Temporal state is
+reset at episode boundaries, and the existing runtime guards remain enabled.
+A mocked evaluation runs with image and scoring fields but no pose/velocity/
+gyro/acceleration fields, validating this separation without driving the sim.
+
+**Validation and stop:** Image-only feature/actor APIs, adversarial telemetry
+independence, nested live/cache padding, sequence breaks, teacher-weight transfer,
+checkpoint contract/hash enforcement, differentiable action mapping and the
+evaluation entry are tested. A real-data audit checks issued-history equality,
+teacher-label timing against stored live teacher labels, disjoint layout splits,
+and unchanged teacher/head weights. Saving/reloading reproduces student outputs.
+The label-alignment maximum difference is 2.39e-7; all 83 tests pass, including
+the mocked evaluation without pose/motion fields. Student maximum absolute
+20-step mean steering error is still 0.202 (initialization 0.329), so persistent
+control bias remains a live-test risk. `input_contract_audit.json` and
+`decision.json` retain these checks; `runtime_source/` separately snapshots the
+final runtime/evaluation implementation while `source/` preserves the fit code.
+The first-phase outcome is an experimental compliant student eligible for a
+separately authorized live screen; no automatic refit, DAgger, simulator run,
+promotion or replacement of the old policies occurred.
+
+### Stage 3.16: First Camera-Only Student Live Smoke and Replay Audit (2026-11-16)
+
+The user authorized the next step. One bounded smoke was pre-recorded in
+`logs/visual_student_smoke_v1/screen_plan.json`: one episode, at most 2,000 steps,
+100-second process deadline, no automatic retries, training or layout expansion.
+The initial launch stopped before simulator connection because EvalRecord
+requires a nonexistent output directory; the prewritten plan had already created
+the parent. The same smoke was then launched into a fresh `run/` subdirectory.
+This was a preflight path correction, not a repeated driving attempt.
+
+```bash
+python rl/eval_visual_student.py --host 172.25.240.1 --episodes 1 \
+  --max-episode-steps 2000 --output-dir logs/visual_student_smoke_v1/run
+```
+
+Only the camera-derived 85D feature/history vector enters the separately loaded
+student actor. No teacher model, encoder sensor, IMU, true motion, map or road
+state is used by the policy. The evaluator uses CTE/speed for scoring and
+termination only. Low-jitter sync, TCP_NODELAY and the 100 ms observation-wait
+guard are enabled; steering difference 0.1 and throttle 0.2..0.7 are unchanged.
+Saved simulator settings confirm timeScale 2/FPS 120, random light/trees on,
+cones off. The student and frozen head checkpoint hashes match Stage 3.15.
+
+**Result: 1/1 completed, 2,000 steps, 9 laps**, no exit or runtime timeout.
+Mean speed was **2.50565 m/s**, mean absolute CTE **0.20811**, maximum absolute
+CTE **0.93776** (CTE units, not metres). This is the first compliant camera-only
+student result; it is not the previous privileged-motion 23/24 result.
+
+For auditable input provenance, the evaluator now saves the exact 85D decision
+inputs and raw actions to `policy_inputs_episode_01.npz`. It also requests
+braking after the scored episode, before serializing images/results. A real-run
+offline audit verified:
+
+- All 2,000 input vectors contain the specified 45 visual values and 40 issued
+  commands; initial history is zero and every subsequent history equals the
+  actual preceding command sequence.
+- Production mapped actions agree with recorded executed commands to 2.99e-8;
+  batch actor replay agrees with recorded raw actions to 1.02e-6.
+- Replaying the last 120 exact camera frames, discarding eight warmup frames and
+  the final frame with no following decision, reproduces **111 decisions** using
+  only images and issued history. Maximum feature and action differences are
+  both **zero**. The scoring telemetry is not needed for this replay.
+
+`audit.json`, `audit_replay.py`, source snapshots, camera tail, actual decision
+inputs, telemetry, results and `decision.json` preserve the evidence. The mocked
+evaluator test also checks that saved policy inputs have 85 columns and no truth
+arrays. All 83 tests pass and `git diff --check` passes.
+
+**Decision:** Basic compliant driving smoke passes; no model promotion or
+superiority/high-completion-rate claim follows from one layout. No further live
+attempt, fitting or runtime root-cause investigation was launched automatically.
+
+### Stage 3.17: Frozen Camera-Only Student Four-Layout Screen (2026-11-17)
+
+The user authorized the proposed bounded four-layout evaluation. The plan is
+saved before driving in `logs/visual_student_screen_4layouts_v1/screen_plan.json`:
+four fresh scene loads, at most 2,000 steps each, a 360-second process deadline,
+no fitting, retries or automatic expansion. Preflight verified that student/head
+hashes and the five relevant runtime source files match the Stage 3.16 smoke.
+The saved simulator settings also match: timeScale 2, FPS 120, random light and
+trees on, cones off, useSeed 0. These are saved menu settings, not independent
+measurements of live engine state. Layout IDs denote scene loads, not reusable
+seeds, and this run has no paired comparator.
+
+```bash
+python rl/eval_visual_student.py --host "$DONKEY_SIM_HOST" --episodes 4 \
+  --max-episode-steps 2000 --output-dir logs/visual_student_screen_4layouts_v1/run
+```
+
+The existing student and original geometry head stay frozen. Runtime inputs
+remain 45 image-derived geometric features plus 40 self-issued command values;
+no teacher is loaded and no velocity truth, pose, map, encoder or IMU enters
+the actor. Ground truth remains isolated to scoring, termination and logging.
+Low-jitter sync, TCP_NODELAY, the 100 ms observation-wait guard, steering
+difference 0.1, throttle 0.2..0.7 and disabled accelerated unwind are unchanged.
+Each episode explicitly reloads the scene. No production code was changed.
+
+| Layout | Completed / steps | Laps | Mean absolute CTE | Max absolute CTE | Mean speed (m/s) | Max CTE step |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | Yes / 2,000 | 9 | 0.17877 | 0.95405 | 2.51614 | 79 |
+| 2 | Yes / 2,000 | 9 | 0.19576 | 0.95127 | 2.51849 | 75 |
+| 3 | Yes / 2,000 | 9 | 0.18435 | 0.94743 | 2.50256 | 77 |
+| 4 | Yes / 2,000 | 9 | 0.21109 | 0.89125 | 2.51332 | 176 |
+
+**Result:** 4/4 completed, 8,000 steps, 36 laps, pooled mean absolute CTE
+**0.19249**, maximum **0.95405**, pooled mean speed **2.51263 m/s**, zero samples
+at absolute CTE >= 1 and zero runtime aborts. Recorded evaluation elapsed time
+was 223.37 seconds. All four maximum CTE values occur in the first 250 steps;
+startup remains a useful target for larger evaluation, without inferring a
+specific failure mechanism from these successful runs. CTE is in simulator
+units, not metres.
+
+**Input and replay audit:** All 8,000 stored inputs have 85 columns, finite
+values and no truth arrays. Command histories reset to zero and exactly match
+the preceding issued commands. Production action mapping agrees with recorded
+commands to 2.99e-8; actor replay agrees with raw actions to 1.35e-6. Replaying
+each final 120-image tail, excluding eight context frames and the final frame
+without a subsequent decision, reproduces 111 decisions per episode: **444
+image-only decisions with zero feature and action error**. Student/head and
+encoder tensor hashes match the smoke; all captured source hashes match current
+files. Only initial images and final 120 images per episode are retained;
+decision inputs, actions and scoring telemetry cover all steps.
+
+**Timing:** Encoder P95 is 4.81..4.87 ms across episodes, maximum 10.65 ms.
+Policy P95 is 0.50..0.57 ms. The first policy call at layout 1, step 1 took
+212.03 ms at near-zero speed; it remains in the recorded metrics. The existing
+100 ms guard covers observation waiting, not policy/encoder work, so absence of
+an abort does not assert that every part of the control cycle stayed below
+100 ms. No timing root-cause investigation was launched.
+
+Artifacts include `run/{metadata,results}.json`, `run/telemetry.jsonl`, per-episode
+`policy_inputs_episode_*.npz`, image tails/source snapshots, `audit_replay.py`,
+`audit.json`, `decision.json` and console logs. The real-run input/action/image
+replay audit passes; all seven focused tests in `tests/test_visual_student.py`
+pass, and `git diff --check` passes. The full historical suite was not rerun.
+
+**Decision:** The four-layout completion screen passes. Keep the student
+experimental; no checkpoint or baseline was replaced, and no further live run
+or training was launched. Four successes are a small sample (nominal Wilson
+95% completion interval approximately 51%..100%, assuming independent trials),
+not proof of high reliability or superiority to the historical vision policy.
+A larger frozen evaluation is the proposed next step, with startup excursions
+and runtime tails retained in the primary metrics.
+
+
+### Stage 3.18: Frozen Camera-Only Student 24-Layout Evaluation (2026-11-17)
+
+The user authorized the proposed 24-new-layout evaluation after Stage 3.17.
+`logs/visual_student_eval_24layouts_v1/eval_plan.json` was saved before driving:
+24 fresh scene loads, at most 2,000 steps each, a 1,800-second process deadline,
+no training, retries, parameter changes or automatic expansion. This batch is
+reported independently of the earlier one-layout smoke and four-layout screen.
+There is no paired comparator, and layout IDs are load identifiers rather than
+reproducible seeds. Original locked training/evaluation captures were not used
+for fitting or model selection in this task.
+
+Preflight matched both student/head checkpoint hashes and every runtime source
+hash to the four-layout screen. Saved simulator settings match: timeScale 2,
+FPS 120, random light and trees on, cones off, useSeed 0. These remain saved menu
+values rather than independently measured live engine settings.
+
+```bash
+python rl/eval_visual_student.py --host "$DONKEY_SIM_HOST" --episodes 24 \
+  --max-episode-steps 2000 --output-dir logs/visual_student_eval_24layouts_v1/run
+```
+
+Runtime sources remain camera-derived features and self-issued commands only:
+45 visual values plus 40 command-history values. No teacher is loaded; no
+velocity truth, pose, map, wheel encoder or IMU enters the actor. Ground truth
+is scoring, termination and logging only. Low-jitter sync, TCP_NODELAY, the
+100 ms observation-wait guard, steering difference 0.1, throttle 0.2..0.7 and
+disabled accelerated unwind remain unchanged. Each episode reloads the scene.
+
+| Layout | Completed / steps | Laps | Mean absolute CTE | Max absolute CTE | Mean speed (m/s) | Max CTE step |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | Yes / 2,000 | 9 | 0.16881 | 0.96403 | 2.53025 | 76 |
+| 2 | Yes / 2,000 | 9 | 0.19414 | 1.08611 | 2.51464 | 1420 |
+| 3 | Yes / 2,000 | 9 | 0.21647 | 0.98435 | 2.51680 | 813 |
+| 4 | Yes / 2,000 | 9 | 0.18241 | 0.94586 | 2.52134 | 1416 |
+| 5 | Yes / 2,000 | 9 | 0.21881 | 1.43441 | 2.52805 | 396 |
+| 6 | Yes / 2,000 | 9 | 0.17088 | 1.34689 | 2.50948 | 181 |
+| 7 | Yes / 2,000 | 9 | 0.21224 | 1.62820 | 2.52898 | 1474 |
+| 8 | Yes / 2,000 | 9 | 0.18689 | 0.87360 | 2.50933 | 75 |
+| 9 | Yes / 2,000 | 9 | 0.17235 | 0.92485 | 2.50425 | 75 |
+| 10 | Yes / 2,000 | 9 | 0.19022 | 0.93475 | 2.49805 | 78 |
+| 11 | Yes / 2,000 | 9 | 0.20139 | 1.03583 | 2.54188 | 76 |
+| 12 | Yes / 2,000 | 9 | 0.19110 | 1.05718 | 2.53482 | 178 |
+| 13 | Yes / 2,000 | 9 | 0.17978 | 0.87859 | 2.51910 | 1427 |
+| 14 | Yes / 2,000 | 9 | 0.18352 | 0.98477 | 2.49538 | 77 |
+| 15 | Yes / 2,000 | 9 | 0.18474 | 1.23281 | 2.51796 | 181 |
+| 16 | Yes / 2,000 | 9 | 0.20816 | 0.99907 | 2.52478 | 711 |
+| 17 | Yes / 2,000 | 9 | 0.17460 | 0.98767 | 2.52265 | 76 |
+| 18 | Yes / 2,000 | 9 | 0.18771 | 0.97220 | 2.52564 | 1414 |
+| 19 | Yes / 2,000 | 9 | 0.19916 | 1.11288 | 2.50474 | 181 |
+| 20 | Yes / 2,000 | 9 | 0.19158 | 0.90340 | 2.52331 | 74 |
+| 21 | Yes / 2,000 | 9 | 0.18049 | 1.34892 | 2.48676 | 175 |
+| 22 | Yes / 2,000 | 9 | 0.20206 | 0.99877 | 2.52020 | 176 |
+| 23 | Yes / 2,000 | 9 | 0.17881 | 0.94400 | 2.50855 | 77 |
+| 24 | Yes / 2,000 | 9 | 0.21163 | 1.11720 | 2.51588 | 1000 |
+
+**Result:** **24/24 completed, 48,000 steps, 216 laps** (9 laps per episode),
+pooled mean absolute CTE **0.19116**, maximum **1.62820**, pooled mean speed
+**2.51678 m/s**, zero exits and zero runtime aborts. Recorded evaluation elapsed
+time was **1,328.48 seconds (22.14 minutes)**. CTE uses simulator units, not metres.
+The nominal Wilson 95% completion interval is **86.2%..100%**, assuming independent
+trials; 24 successes do not establish guaranteed reliability or a superiority
+claim relative to a different policy or historical unpaired layouts.
+
+**Startup and recovery diagnostics:** 15/24 episode maxima occur in the first
+250 steps. Pooled mean absolute CTE is 0.21264 during those startup steps and
+0.18810 afterward. Ten layouts contain 60 total samples at absolute CTE >= 1,
+forming 14 contiguous excursions (8 beginning at startup, 6 afterward). Every
+excursion is followed by a recorded sample below absolute CTE 0.5 and the
+episode completes. This is descriptive evidence of recovery on these runs,
+not a guarantee for future disturbances. The largest excursion is layout 7,
+step 1474, CTE +1.62820; the next sample below 0.5 is step 1481. Thus remaining
+tracking excursions are not confined to startup. Exact image tails cover only
+the final 120 steps of each episode, so most early excursion images are not
+available; full decision inputs/actions and scoring telemetry remain available.
+
+**Input and replay audit:** All 48,000 finite decision inputs have 85 columns
+and no truth arrays. Histories start at zero each episode and exactly match
+issued commands. Production mapping agrees with logged commands to 2.99e-8;
+actor replay agrees with all logged raw actions to 1.68e-6. Replaying the final
+120 exact images per episode, excluding eight context frames and the final
+frame without a following decision, reproduces **2,664 image-only decisions
+with zero feature and action error**. Checkpoint hashes, encoder tensor hashes,
+source snapshots and current runtime source hashes all match prior evidence.
+Scoring telemetry is unnecessary for the image-to-action replay.
+
+**Timing:** Pooled encoder P50/P95/P99/max is 4.11/4.80/5.92/12.70 ms; policy
+P50/P95/P99 is 0.406/0.538/0.795 ms. The first policy call at layout 1, step 1
+is the only policy sample above 50 ms, taking **205.12 ms** at near-zero speed.
+All encoder samples are below 50 ms. Environment-step time P99/max is
+26.61/33.79 ms. The first-call spike remains in primary records, without a
+causal attribution or runtime retuning. The 100 ms guard only covers observation
+waiting, not policy/encoder work; no abort does not imply every processing
+stage stayed below 100 ms.
+
+**Artifacts and validation:** `eval_plan.json`, `run/{metadata,results}.json`,
+`run/telemetry.jsonl`, 24 `policy_inputs_episode_*.npz` files, initial images,
+image tails, source snapshots, console logs, `audit_replay.py`, `audit.json`,
+`analyze_results.py`, `diagnostics.json`, `per_episode.csv` and `decision.json`
+are under `logs/visual_student_eval_24layouts_v1/`. Both post-run audit and
+descriptive-diagnostic scripts completed successfully. No production code or
+weights changed; the previously passing seven focused student tests were not
+repeated. Whitespace checks and artifact integrity are recorded in
+`validation.json`.
+
+**Decision:** The frozen camera-only student passes this bounded 24-layout
+evaluation and remains a candidate baseline. Preserve the checkpoint; do not
+automatically train, expand layouts, alter runtime settings, replace deployment
+models or infer superiority from the historical privileged-motion 23/24 result.
+The next proposed work is offline inspection of startup and cruise excursion
+inputs/actions before choosing a targeted control-training change.
+
+
+### Stage 3.19: Offline Diagnosis of Camera-Only Student Excursions (2026-11-17)
+
+The user authorized starting the recommended offline inspection first. This
+stage examines all 14 contiguous absolute-CTE>=1 excursions in Stage 3.18,
+without driving, fitting, runtime edits or checkpoint changes. Artifacts are
+under `logs/student_excursion_diagnosis_v1/`. `analyze.py` records input hashes
+and a diagnostic plan before computation; `summarize.py` derives group summaries.
+The initial script preflight used the wrong historical metadata key and stopped
+before analysis; it was corrected from `args` to `artifacts`, retaining both
+attempts in the console log. This was not a simulator attempt or model fit.
+
+**Alignment and isolation:** Decision k uses camera frame k-1 and its preceding
+issued-command history. Its predicted geometry is compared with telemetry k-1,
+not the telemetry returned after command k. Stored lag-2/4 geometry matches its
+earlier decision inputs exactly. All 48,000 actor outputs and mapped commands
+replay within the existing 2e-5 / 1e-6 tolerances. True CTE is telemetry CTE;
+reference heading/lookahead are reconstructed with the original hash-verified
+fitted centre line and TrackState implementation. SDK `car` order was checked
+as `(roll, pitch, yaw)`. Truth and the frozen 60k teacher are used only in this
+separate offline diagnostic; no truth enters the live student input path.
+
+Each event has a window from 35 decisions before through 20 after its returned
+CTE peak. The primary comparison uses the 15 decisions immediately before
+absolute CTE first reaches 1: 210 distinct decisions, with no duplicated samples
+across events. The teacher receives the same recorded preceding command history
+and the same production mapping. The visual-teacher diagnostic additionally
+has the old privileged true-motion inputs, so its comparison with the student
+does not isolate imitation error from partial observability.
+
+| Pre-event subset | Events / decisions | CTE prediction MAE | Heading MAE (deg) | Student vs true-state teacher steering MAE | Visual + true-motion teacher MAE | Student MAE after true-geometry replacement |
+| --- | --- | --- | --- | --- | --- | --- |
+| All | 14 / 210 | 0.06129 | 1.44968 | 0.09117 | 0.03786 | 0.07281 |
+| Startup (<=250) | 8 / 120 | 0.04913 | 1.18483 | 0.11745 | 0.02838 | 0.09619 |
+| Cruise | 6 / 90 | 0.07751 | 1.80281 | 0.05614 | 0.05050 | 0.04165 |
+
+Steering values are normalized commands, not angles. Geometry replacement is
+performed at all three student geometry lags, preserving actual issued history.
+The first five decisions are excluded from aggregate comparisons because their
+complete lagged true geometry cannot be reconstructed from saved telemetry.
+These are single-decision interventions on fixed trajectories; true geometry
+can be out of distribution for a student trained on visual predictions. They
+are neither recursive rollouts nor proof of a causal improvement.
+
+**Findings:**
+- Ten of 14 excursion peaks occur at centre-line indices 306..312 near the same
+  bend, including seven startup events and three later-lap events. The repeated
+  steps 175..181 therefore identify a repeated route segment, not evidence of
+  a timer or reset-padding bug. The direct eight-step padding context has
+  already expired, although earlier trajectory differences can still matter.
+- Startup pre-event action disagreement is larger despite smaller measured
+  geometric error than the cruise subset. Replacing all geometry reduces the
+  all-event teacher-relative steering MAE by about 20%, leaving substantial
+  disagreement. Across all eligible decisions, replacing CTE alone barely
+  changes MAE (0.05222 -> 0.05220); replacing lookahead lowers it to 0.03920.
+  CTE error alone is insufficient to select the next intervention.
+- In the 210 pre-event decisions, the teacher reduces steering magnitude by
+  >0.02 on 45 eligible frames, where previous |steer|>=0.3 and |CTE|>=0.5 or
+  |heading|>=8 degrees. The student fails to reduce magnitude by >0.02 on
+  20 of these frames. This teacher-relative definition is not a physical
+  recovery certificate. Several startup peaks show student steering 0.23..0.40
+  higher than the mapped teacher reference.
+- The largest excursion (layout 7, peak step 1474) differs from the repeated
+  startup case. At steps 1468..1472 both student and true-state teacher request
+  strong negative raw steering and produce the same rate-limited commands on
+  the recorded history. Thus neither a purely perceptual explanation nor a
+  universal student-only explanation fits all events. The original steering
+  limit remains unchanged; replay does not establish that loosening it helps.
+- Across event windows, maximum policy/encoder/environment-step times are
+  1.19/7.66/29.21 ms. The approximately 205 ms first-call policy spike at step 1
+  is outside these windows. No long inference stall accompanies these selected
+  windows; timing causality and server-side frame timing remain unproven.
+
+**Limits and evidence:** No excursion-time camera images were retained, since
+all events precede each episode's last-120-image capture. Saved predictions,
+issued histories, telemetry and actor inputs support this diagnosis; lighting
+or image content at the excursions cannot be visually inspected. Fourteen
+selected events, ten sharing a bend, are not independent trials for significance
+claims. The fitted-map heading/lookahead reference is the historical teacher
+observation, not a new independent road-geometry measurement.
+
+`report.json`, `summary.json`, `events.csv`, `aligned_windows.csv`,
+`per_episode_metrics.csv`, 14 `event_*.png` plots and `excursion_locations.png`
+preserve the diagnosis. `largest_excursion_raw_targets.json` retains the
+additional teacher raw-action check for steps 1465..1476. Source snapshots,
+`analysis_plan.json` and `audit.json` preserve provenance. All input artifacts,
+model files and runtime sources remain unchanged. Three focused production
+mapping/reference-metric tests pass; the full suite was not rerun.
+
+**Decision:** Prioritize student control-response/temporal-state diagnosis and
+fresh training-pool coverage of this bend over another generic CTE-head refit.
+The present evidence does not distinguish insufficient supervision from missing
+observable motion context, nor justify new sensors or relaxed steering limits.
+Any future student fit should use fresh training-pool trajectories and be
+judged on fresh evaluation layouts; this batch remains diagnostic data. The
+candidate baseline is preserved. First-call warmup remains a separate proposed
+runtime improvement; no warmup change, new training or live run was made here.
+
+
+### Stage 3.20: Fresh Student-Driven Bend Data and One Control Fine-Tune (2026-11-17)
+
+The user authorized targeted collection and a small student fit after Stage 3.19.
+`logs/visual_student_bend_recovery_v1/plan.json` was recorded before driving:
+eight new layout loads, 500-step cap, layouts 1..6 training and 7..8 development,
+then one fine-tune from the original camera-only student. No candidate live
+screen, automatic refit or baseline promotion is part of this step. The existing
+straight-line kick collector would not target the observed bend/history issue;
+instead, the frozen student drives naturally and a frozen teacher labels its
+visited states offline (one DAgger-style supplement, no takeovers or kicks).
+
+**Collection:** `tools/collect_visual_student_recovery.py` retains the baseline
+85D camera/self-command inputs, original visual head, steering difference 0.1,
+throttle 0.2..0.7, disabled accelerated unwind, low-jitter sync, TCP_NODELAY and
+100 ms observation-wait timeout. Each episode reloads the scene. Preflight
+matched baseline/head hashes and saved simulator settings: timeScale 2, FPS 120,
+random light/trees on, cones off, useSeed 0. Saved menu values do not independently
+prove live engine state.
+
+The actor receives only the camera/history observation and is called before
+privileged label-state construction. No teacher is loaded during collection.
+`student_inputs_*.npz` contain observations/raw actions only; pre-action state
+and map indices go into separate `label_state_*.npz` files. Every full camera
+sequence is saved, including reset (501 images for 500 decisions). Truth remains
+available for scoring, termination and isolated offline labels. Braking precedes
+archive serialization and is also requested in cleanup.
+
+```bash
+python tools/collect_visual_student_recovery.py --host "$DONKEY_SIM_HOST" \
+  --output-dir logs/visual_student_bend_recovery_v1/collection \
+  --episodes 8 --train-layouts 6 --max-episode-steps 500
+python tools/finetune_visual_student_recovery.py
+```
+
+Collection completed **8/8 x 500 steps, 4,000 decisions / 16 laps**, with zero
+runtime aborts, in **148.55 seconds**. These are original-student collection
+results, not new-candidate driving results. Both training (layout 6, max absolute
+CTE 1.022) and development (layout 8, 1.192) contain natural large-offset samples.
+All trajectories, including any failures if present, stay in their assigned
+whole-layout split. No extra layouts or retries were launched.
+
+**Collection audit:** All 4,000 camera decisions replay with zero feature error.
+Command history resets and exactly matches issued commands; actor replay and
+production mapping pass. State and map indices reconstructed from preceding
+telemetry exactly match separate label records for decisions 2..500; the first
+uses reset state. Checkpoint hashes remain unchanged. The mocked collector test
+checks pre-action alignment and actor-before-label ordering.
+
+**One fit:** `tools/finetune_visual_student_recovery.py` warm-starts the trained
+student, retaining its 85->256->256->2 architecture and frozen visual head.
+Original masks/groups are preserved: 39,020 old + 3,000 fresh = **42,020 training
+decisions**; **19,384 old development** and **1,000 fresh development** decisions,
+with **113 fresh bend decisions**. Previous 24-layout evaluation trajectories,
+diagnosis windows and locked evaluation captures are excluded from fitting.
+Original failed-training exclusions are retained; fresh failures would remain.
+
+Teacher labels use true state and exact preceding issued history offline.
+All old labels replay to 1.20e-7. Student features are read before this separate
+label branch. Inputs, teacher state/labels and training selection/weights are
+saved in separate files. Base weights are old=1, new=2, new bend (centre-line
+indices 270..345)=8, multiplied by 2 for eligible teacher-unwind decisions;
+validation weights are zero. Truth-based supervised example weighting does not
+become an actor input.
+
+AdamW: lr 2e-5, weight decay 1e-4, nominal batch 512, seed 42, at most 10 epochs /
+180 seconds. Loss is weighted mapped steering MSE + 0.1 raw steering MSE + 0.5
+mapped throttle MSE. One fit finishes 10 epochs in **2.99 seconds**, including
+final evaluation/export. The preregistered equal-weight score of old-development
+and fresh-bend MAE ratios selects epoch 10. New export:
+`models/visual_student_bend_recovery_v1/student.pt`; its SHA256 is retained in
+`fit/results.json` and `decision.json`.
+
+| Development subset | Decisions | Original steering MAE / P95 | Candidate steering MAE / P95 | Missed teacher unwind, original -> candidate |
+| --- | --- | --- | --- | --- |
+| Old development | 19,384 | 0.03987 / 0.20339 | 0.04042 / 0.20511 | 71/612 -> 37/612 |
+| Old large-offset | 209 | 0.02757 / 0.18699 | 0.02839 / 0.15905 | 8/87 -> 5/87 |
+| Fresh development | 1,000 | 0.06705 / 0.26661 | 0.05516 / 0.24090 | 23/55 -> 5/55 |
+| Fresh development bend | 113 | 0.06368 / 0.23946 | 0.03962 / 0.16228 | 14/26 -> 4/26 |
+
+These are mapped command units and fixed-history teacher agreement, not physical
+angles, candidate CTE or recursive rollouts. Fresh-bend MAE drops **37.8%** and
+fresh-all MAE **17.7%**; old-all MAE rises **1.4%** and old-large MAE **3.0%**.
+Old-development wrong-direction frames increase **114 -> 126** despite fewer
+missed unwinds. This tradeoff is retained: control does not improve uniformly.
+Two fresh development layouts and correlated bend frames are limited evidence,
+and these layouts also participate in epoch selection.
+
+All seven preregistered gates pass: >=50 fresh bend decisions; fresh-bend MAE
+ratio <=0.90; fresh-all/old-all ratios <=1.05; old-large ratio <=1.10;
+missed-unwind-rate increase <=0.02 on old and fresh development. No thresholds
+were changed after the run. Teacher unwind is a reference action definition,
+not a guaranteed recovery label.
+
+**Validation/artifacts:** `audit_fit.py` independently reloads the candidate and
+reproduces all saved development metrics/actions (maximum action difference
+zero), checks exact features against camera-only archives, original masks,
+disjoint layout groups, zero validation weights and unchanged teacher/head/
+baseline hashes. `collection_audit.json`, `fit_audit.json`, full camera sequences,
+input/label/selection NPZs, `fit/{training_manifest,results}.json`, source
+snapshots, console logs, `plan.json` and `decision.json` preserve the run under
+`logs/visual_student_bend_recovery_v1/`. All **86 tests pass**, including new
+collector alignment, training-weight isolation and retention-gate tests.
+Whitespace/integrity checks are recorded in `validation.json`.
+
+**Decision:** Preserve the original 24/24-tested student as the baseline and the
+new weights as an offline-qualified experimental candidate. No candidate live
+run, second fit, promotion, new sensor or control-limit change occurred. Next
+propose a bounded fresh-layout closed-loop comparison against the original
+student with identical control/runtime settings, explicitly checking the
+old-development regression. The candidate does not inherit the baseline's
+24/24 completion result.
+
+
+### Stage 3.21: Shared-Layout Closed-Loop Screen of the Bend Student (2026-11-17)
+
+The user authorized the next closed-loop comparison. Before driving,
+`logs/visual_student_bend_paired_4layouts_v1/plan.json` fixed four fresh layout
+loads, two actors per layout, 2,000-step cap, 900-second process deadline, no
+retries, automatic expansion, fitting or promotion. The original student and
+Stage 3.20 candidate use the same original frozen geometry head. Preflight
+matched all three checkpoint hashes and saved simulator settings to prior runs.
+This evaluation uses fresh scenes, not the eight training/development scenes.
+
+**Paired entry and protocol:** `rl/eval_visual_students_paired.py` reloads the
+scene once per layout and sets wrapper scene reload to zero; between actors it
+only resets the vehicle. The image encoder's internal lag context, outer visual
+lags and command histories reset per episode. First-run order is balanced:
+layout 1 candidate first, 2 baseline first, 3 candidate first, 4 baseline first
+(order seed 42, not a simulator seed). The endpoint protocol and saved initial
+views support scene pairing; simulator seeds are not independently verified.
+
+Both actors receive one stateless 85-zero prediction **before connection**.
+This common warmup avoids putting the known first-call spike into only one
+actor's live episode. It issues no command and changes no visual/history cache.
+Warmup took 437.44 ms for baseline and 0.55 ms for candidate before connection;
+both are ready before driving. This is an explicit shared evaluation protocol
+change from historical single-student runs; those entry defaults are unchanged.
+No inference/wait samples are removed from the scored episode records.
+
+All live control inputs remain the same 85 camera/self-command features. No
+teacher is loaded and no encoder/IMU, motion truth or map enters either actor.
+Truth is scoring, termination and logging only. Both use steering difference
+0.1, throttle 0.2..0.7, disabled accelerated unwind, low-jitter sync, TCP_NODELAY
+and 100 ms observation-wait timeout. Saved simulator settings remain timeScale 2,
+FPS 120, random light/trees on, cones off, useSeed 0 (saved menu values, not an
+independent live-engine measurement).
+
+```bash
+python rl/eval_visual_students_paired.py --host "$DONKEY_SIM_HOST" \
+  --layouts 4 --max-episode-steps 2000 \
+  --output-dir logs/visual_student_bend_paired_4layouts_v1/run
+```
+
+| Metric | Original baseline | Bend candidate |
+| --- | --- | --- |
+| Completion / steps / laps | 4/4 / 8,000 / 36 | 4/4 / 8,000 / 36 |
+| Mean absolute CTE | 0.18147 | 0.18945 |
+| Maximum absolute CTE across all episodes | 1.22731 | 1.16355 |
+| Startup mean absolute CTE (first 250 steps) | 0.21290 | 0.18254 |
+| Cruise mean absolute CTE (remaining steps) | 0.17698 | 0.19044 |
+| Frames with absolute CTE >=1 | 13 | 10 |
+| Mean speed (m/s) | 2.51291 | 2.52299 |
+
+All eight episodes complete with no exit or runtime abort, **16,000 steps / 72
+laps total**, evaluation elapsed **450.68 seconds**. CTE values are simulator
+units, not metres. Both models complete nine laps per episode.
+
+| Layout | Original / candidate mean absolute CTE | Candidate minus original | Original / candidate max absolute CTE |
+| --- | --- | --- | --- |
+| 1 | 0.16429 / 0.18985 | +0.02556 | 1.01158 / 0.94147 |
+| 2 | 0.20110 / 0.20497 | +0.00386 | 1.00396 / 1.08042 |
+| 3 | 0.18332 / 0.17995 | -0.00337 | 1.22731 / 1.08662 |
+| 4 | 0.17716 / 0.18303 | +0.00588 | 0.92677 / 1.16355 |
+
+**Interpretation:** Startup mean CTE decreases **14.3%** and cruise mean CTE
+increases **7.6%**, with both directions occurring on every layout. Whole-episode
+mean CTE increases **4.4%**. The paired mean difference is **+0.007983 CTE**,
+with exploratory 95% layout-bootstrap interval **[-0.001059, +0.020138]**. This
+small screen does not statistically establish a population regression, and it
+does not demonstrate an overall improvement. Candidate global maximum is lower,
+but per-layout maxima improve on only two of four layouts; mean per-layout peak
+difference is +0.02561. Thirteen vs ten large-offset samples are too few to infer
+recovery reliability. Candidate speed is approximately 0.4% higher; this does
+not isolate a cause of the tracking tradeoff.
+
+The pre-recorded checks are: no fewer completions (passes), paired mean CTE
+improvement (fails), no more absolute-CTE>=1 frames (passes). Thus the candidate
+**fails the screen**. This preserves the offline improvements from Stage 3.20
+without mistaking them for whole-episode closed-loop improvement.
+
+**Replay/provenance audit:** Every initial and returned image is saved; each
+2000-decision episode has 2001 camera frames. All **16,000 decision inputs**
+reconstruct from the full camera sequences plus actual issued history with
+**zero feature error**, including both levels of startup padding. Raw actor
+replay error is at most 1.46e-6; mapped commands agree to 2.99e-8. Command-history
+resets, lag-2/4 equality and scoring metrics are checked per episode. Both
+checkpoints, geometry-head/encoder tensor hashes, current runtime source hashes
+and captured source hashes remain unchanged. Initial image mean pixel differences
+within each pair are 0.076..0.186 on the 0..255 scale; views are similar, not
+bit-identical. Scene identity is supported by the reload/reset protocol rather
+than a newly claimed deterministic seed mechanism.
+
+**Timing:** Baseline/candidate policy P99 is 0.529/0.537 ms, max 1.39/1.24 ms;
+encoder P99 is 5.83/5.82 ms, max 9.10/8.81 ms. Environment-step maxima are
+33.83/29.21 ms. Shared actor warmup occurs outside the recorded live episodes;
+no live first-call outlier or wait-guard abort occurs. The 100 ms guard's scope
+remains observation waiting, not all computation.
+
+`audit_results.py`, `audit.json`, `decision.json`, `paired_results.png`,
+`plot_results.py`, per-episode full camera/input archives, telemetry, source
+snapshots, `run/{metadata,results}.json` and `plan.json` preserve the comparison.
+All data are evaluation-only and excluded from fitting. The paired-entry tests
+verify balanced ordering, missing/duplicate-pair rejection, one reload per pair,
+per-episode history resets and execution with no pose/motion fields. All **88
+tests pass**; whitespace and integrity checks are in `validation.json`.
+
+**Decision:** Keep `visual_student_no_motion_v1` as the baseline. Preserve the
+bend candidate as experimental and do not expand it to a larger evaluation,
+refit automatically or promote it. Any further fine-tune should first strengthen
+cruise-retention criteria and examine this startup/cruise tradeoff. The four-layout
+comparison provides a concrete reason to retain the original, without claiming
+that the candidate is universally inferior.
+
+
+### Stage 3.22: Route/Lap Alignment and Bidirectional Actor Replay (2026-11-17)
+
+The user authorized the planned bounded offline diagnosis. No new simulator
+run or driving-model fit was made. Inputs are all eight complete Stage 3.21
+trajectories (four shared layouts, 16,000 scored decisions), not only selected
+excursions. Both actors, teacher and fitted map remain frozen. Artifacts:
+`logs/visual_student_cross_replay_v1/`.
+
+`analyze.py` writes `plan.json` and fingerprints evaluation input/camera archives,
+telemetry, model files and centre line before analysis. Each actor receives
+exactly the same saved 85D camera/history vector for a given trajectory row.
+No command history is swapped independently of its images. Teacher state is
+reconstructed from the preceding telemetry row, matching the existing teacher
+contract; first decisions lack saved reset telemetry and are omitted from
+reference comparisons (8 exclusions, **15,992 reference decisions**). All
+16,000 own-actor action replays and actual command mappings pass. The teacher
+is a reference controller, not an optimal physical recovery oracle.
+
+**Road/lap alignment:** Each scored frame is projected onto the original fitted
+centre line and assigned to one of 24 equal arc-index bins. Lap labels use the
+recorded lap counter, not a 250-step cutoff. Every road bin and normal pass is
+included. First recorded lap 0 may be partial in general; here both actors have
+coverage in all 24 bins on all four layouts. Equal weights are applied per
+observed lap/bin and then per layout; correlated frames are not independent
+statistical trials. Physical speed is retained as a covariate, not controlled
+or used as an actor input.
+
+Candidate-minus-baseline CTE after this alignment is **-0.02156** for first
+recorded laps (negative on all four layouts), **+0.01059** for later laps
+(positive on 3/4). The first-250-step result is therefore not merely an
+artifact of comparing different road coverage. As a coverage sensitivity
+check, matching only complete later laps **1..8**, all 24 bins, produces paired
+deltas **+0.03081, +0.00346, +0.00133, +0.01251**, mean **+0.01203**. This latter
+estimate excludes incomplete final laps without filtering outcomes. Both
+estimates retain the first-lap/later-lap tradeoff; neither establishes a
+population effect from four layouts.
+
+**Cross replay:** Both actors are queried on both recorded trajectory sources,
+with the actual preceding commands for that source. Mapped steering MAE against
+the same true-state teacher is averaged equally over layouts:
+
+| Recorded input source | Phase | Original actor | Candidate actor |
+| --- | --- | --- | --- |
+| Original trajectories | First recorded lap | 0.08558 | 0.06980 |
+| Original trajectories | Later laps | 0.04754 | 0.04840 |
+| Candidate trajectories | First recorded lap | 0.07828 | 0.07084 |
+| Candidate trajectories | Later laps | 0.05207 | 0.05482 |
+
+Candidate improves first-lap agreement on both sources, but worsens later-lap
+agreement on both. On original-source later laps, its error increases in 3/4
+layouts; on candidate-source later laps it increases in 4/4. Thus later-lap
+regression is visible even on the original actor's recorded inputs. The evidence
+does not support attributing it solely to the candidate's command history.
+Images, geometry, histories and teacher labels all differ between source
+trajectories; the table is fixed-history single-decision replay, not a recursive
+rollout or a causal decomposition of the closed-loop CTE difference.
+
+**Recovery counts versus persistent error:** On original-source later laps,
+missed teacher unwinds drop **27/163 -> 11/163**, while the mean per-layout
+maximum absolute 20-step mean signed steering error increases **0.13911 ->
+0.15750**. On candidate-source later laps, the corresponding counts are
+**13/157 -> 5/157**, and persistent error **0.17121 -> 0.19547**. Fewer missed
+unwinds do not establish better continuous tracking. All persistence windows
+are contiguous within an episode/subset and never bridge missing segments.
+
+**Both output functions changed:** Given identical original-source later-lap
+inputs, candidate-minus-original mean throttle is **+0.001119**, with mean
+absolute change 0.003421. On candidate-source inputs the mean difference is
++0.001067. Mapped steering absolute changes are about 0.01365/0.01350.
+Later-lap steering is rate-limited on roughly 57% of decisions. These measurements
+show that the intervention was not isolated to steering; they do not establish
+that throttle or rate limits caused the observed tracking differences.
+
+**Dynamic-information probe decision:** The recorded trigger required candidate
+later-lap MAE to improve on original trajectories but worsen on its own
+trajectories (macro means and at least 3/4 layout signs each). This did not occur:
+later-lap MAE worsens on both sources. No probe is fitted. The current comparison
+already exposes a cruise-retention problem under unchanged original inputs;
+input observability can still limit both models, and its adequacy is not proved.
+
+**Evidence and validation:** `report.json`, `cross_replay.csv`,
+`all_passes_route_bins.csv`, `paired_route_bins.csv`, `action_changes.csv`,
+`diagnostic_arrays.npz`, `route_comparison.png`, source snapshots/hashes,
+`audit.json` and `validation.json` preserve the result. An initial route
+aggregation omitted the trajectory-source filter and yielded identical values;
+the sanity check exposed this, the source filter was corrected, and the initial
+report is retained separately. `validate.py` independently recomputes every
+source-specific route cell and macro replay metric from CSVs, computes the
+complete-lap sensitivity check, verifies recorded scoring means and unchanged
+input/model/runtime source hashes. All **five relevant mapping/paired-evaluation
+tests pass**; the full previously passing 88-test suite was not repeated because
+production code is unchanged. Whitespace checks pass.
+
+**Reason ranking and next minimal experiment:** The evidence prioritizes a
+first-lap versus later-lap training/selection tradeoff and continuous-error
+retention over an immediate sensor or network change. Trajectory-distribution
+changes and throttle/steering coupling remain contributors to investigate, not
+isolated causes. Preserve the original baseline and do not automatically fit
+again. `next_experiment_proposal.json` describes an unexecuted A/A calibration:
+four fresh layouts, two identical-original actor runs per layout, 2,000-step
+cap, the same shared-scene/reset/warmup protocol. It measures run-to-run
+variability before interpreting another small-effect change; four pairs are
+only a descriptive calibration and do not define acceptable degradation. A
+subsequent steering-only intervention with the original throttle function could
+isolate joint-output changes if warranted. Neither experiment is launched here.
+
+
+### Stage 3.23: Original Student, Ten Fresh Layouts at 3,000 Steps (2026-11-17)
+
+The user explicitly requested ten new random layouts with a 3,000-step cap,
+after deciding to retain the original student and end speculative optimization.
+This is the requested longer-horizon check only; no A/A experiment, candidate
+trial, fitting or automatic follow-up is included. The initial time estimate was
+14..16 minutes including scene loading, saving and checks.
+
+Preflight matched the original student/head hashes and existing runtime sources
+to the 24-layout run. Saved simulator settings match: randomLight=1,
+generateTrees=1, useSeed=0, cones disabled, timeScale=2, FPS=120. These are saved
+menu values rather than independent measurements of live engine state. Layouts
+are fresh scene reloads, not reproducible seeds. `eval_plan.json` was saved before
+driving, with ten episodes, 3,000-step cap and 1,200-second process deadline.
+
+```bash
+python rl/eval_visual_student.py --host "$DONKEY_SIM_HOST" --episodes 10 \
+  --max-episode-steps 3000 \
+  --output-dir logs/visual_student_eval_10layouts_3000_v1/run
+```
+
+The model remains `models/visual_student_no_motion_v1/student.pt` (original
+SHA256 b00d7252e7a54041b7f34bba065188e02aaba13e606e5b332c21258e2532e6b2).
+The 85D actor input remains camera-derived geometry and its own issued-command
+history only. No teacher, encoder sensor, IMU, true motion, pose or map is used
+for control. Truth is scoring/termination/logging only. The existing single-
+student entry is unchanged: steering difference 0.1, throttle 0.2..0.7,
+unwind acceleration disabled, low-jitter sync, TCP_NODELAY, 100 ms observation-
+wait guard, scene reload every episode. No new actor prewarm was added.
+
+| Layout | Steps | Laps | Mean absolute CTE | Max absolute CTE | Mean speed (m/s) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 3,000 | 14 | 0.18630 | 1.13358 | 2.54918 |
+| 2 | 3,000 | 14 | 0.19478 | 1.42320 | 2.53160 |
+| 3 | 3,000 | 14 | 0.16517 | 0.82645 | 2.53290 |
+| 4 | 3,000 | 14 | 0.18142 | 1.00877 | 2.53515 |
+| 5 | 3,000 | 14 | 0.17412 | 0.97588 | 2.53743 |
+| 6 | 3,000 | 14 | 0.18565 | 1.11976 | 2.53924 |
+| 7 | 3,000 | 14 | 0.19708 | 0.95695 | 2.55303 |
+| 8 | 3,000 | 14 | 0.19286 | 0.96245 | 2.54815 |
+| 9 | 3,000 | 14 | 0.17650 | 1.04630 | 2.53076 |
+| 10 | 3,000 | 14 | 0.19283 | 0.89887 | 2.54520 |
+
+**Result: 10/10 completed**, every episode **3,000 steps / 14 laps**,
+**30,000 steps / 140 laps total**, zero exits and zero runtime aborts. Mean
+absolute CTE is **0.18467**, maximum **1.42320**, below the **2.0 CTE termination
+limit**. There are 27 samples at absolute CTE >=1. Mean speed is **2.54026 m/s**.
+CTE uses simulator units, not metres. Completion denotes reaching the step cap
+without termination, not an independent assertion about every wheel/road edge.
+
+Recorded evaluation elapsed time is **793.58 seconds (13m14s)**; metadata
+start-to-finish timestamps span about **13m26s**, including metadata/setup
+overhead. The process exits normally. This longer-cap batch is reported
+separately from the historical 24 layouts x 2,000 steps, without pooling their
+completion rates or interpreting unpaired CTE differences as improvement.
+
+**Audit:** All 30,000 finite 85D inputs and raw actions pass issued-history,
+steering/throttle-limit, scoring and action-replay checks. Maximum raw-action
+replay error is 1.48e-6; each episode's final 120 saved images reproduce 111
+camera/history decisions after context exclusion: **1,110 decisions with zero
+feature and image-to-action error**. Student/head and encoder tensor hashes,
+source snapshots and current runtime source hashes match prior evidence.
+
+Artifacts are in `logs/visual_student_eval_10layouts_3000_v1/`: `eval_plan.json`,
+`run/{metadata,results}.json`, telemetry, per-episode policy input archives,
+initial images, final camera tails, source snapshots, `audit_replay.py`,
+`audit.json`, `decision.json` and console logs. No production code or weights
+changed; the existing tests were not repeated. Real-run replay/integrity and
+whitespace checks are recorded in `validation.json`.
+
+**Decision:** User-requested extended verification passes. Retain the original
+student; no additional experiment, training or optimization is started.

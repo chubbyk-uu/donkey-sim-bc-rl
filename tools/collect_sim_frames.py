@@ -117,7 +117,7 @@ def main() -> None:
     last_cte = 0.0
     cte_integral = 0.0
     obs, info = env.reset(seed=args.seed)
-    start_time = time.time()
+    start_time = time.monotonic()
 
     with manifest_path.open("w", encoding="utf-8") as manifest:
         while frame_count < args.frames:
@@ -175,7 +175,7 @@ def main() -> None:
                     time.sleep(args.step_delay)
 
             if frame_count % 500 == 0 or frame_count >= args.frames:
-                elapsed = max(time.time() - start_time, 1e-6)
+                elapsed = max(time.monotonic() - start_time, 1e-6)
                 print(
                     f"frames={frame_count}/{args.frames} episode={episode} "
                     f"last_ep_steps={episode_step} rate={frame_count / elapsed:.1f} fps"

@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import json
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -7,6 +8,8 @@ import gymnasium as gym
 import numpy as np
 import pytest
 import torch
+
+from rl.donkey_sync import ObservationTimeoutError
 from stable_baselines3 import SAC
 
 from rl.experiment import (
@@ -75,6 +78,41 @@ def test_records_partial_results_on_failure_and_writes_strict_json(tmp_path):
     assert (args.output_dir / "episodes.csv").is_file()
     with pytest.raises(FileExistsError):
         EvalRecord(args, {"vae": args.vae_model})
+
+
+def test_runtime_failure_is_distinct_from_completed_episode_results(tmp_path):
+    args = arguments(tmp_path)
+    args.vae_model.write_bytes(b"test")
+    event = {"kind": "observation_timeout", "timeout_seconds": 0.1, "elapsed_seconds": 0.11,
+             "stop_requested": True, "stop_execution_acknowledged": False}
+    with pytest.raises(ObservationTimeoutError):
+        with EvalRecord(args, {"vae": args.vae_model}) as record:
+            record.episode({"episode": 1, "termination_reason": "time_limit"})
+            raise ObservationTimeoutError(event)
+    metadata = json.loads((args.output_dir / "metadata.json").read_text())
+    assert metadata["status"] == "failed"
+    assert metadata["runtime_failure"] == event
+    assert json.loads((args.output_dir / "runtime_failure.json").read_text()) == event
+    results = json.loads((args.output_dir / "results.json").read_text())
+    assert results["episodes"] == [{"episode": 1, "termination_reason": "time_limit"}]
+
+
+@pytest.mark.parametrize("module_name", ["rl.train_vae_sac", "tools.test_scene_reload"])
+def test_scene_reload_timeout_ignores_wall_clock(module_name, monkeypatch):
+    module = importlib.import_module(module_name)
+    clock = SimpleNamespace(now=0.0)
+
+    def sleep(seconds):
+        clock.now += seconds
+
+    def wall_time():
+        raise AssertionError("timeout must not depend on wall-clock corrections")
+
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep, time=wall_time))
+    controller = SimpleNamespace(handler=SimpleNamespace(loaded=False, send_exit_scene=Mock(), send_load_scene=Mock()))
+    assert module.reload_scene(controller, "test", timeout=1.0, exit_settle=0, retry_every=0.4) is False
+    assert 1.0 <= clock.now < 1.5
+    assert controller.handler.send_load_scene.call_count == 3
 
 
 class TinyEnv(gym.Env):
